@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"th-abc-123"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"item_type":"reasoning","text":"internal chain of thought that must not be surfaced"}}
+{"type":"item.started","item":{"item_type":"command_execution","command":"pytest -q"}}
+{"type":"item.completed","item":{"item_type":"command_execution","command":"pytest -q","exit_code":0}}
+{"type":"item.completed","item":{"item_type":"file_change","changes":[{"kind":"add","path":"tests/test_ws.py"},{"kind":"update","path":"main.py"}]}}
+{"type":"item.completed","item":{"item_type":"assistant_message","text":"Updated the WSS client and added a test."}}
+{"type":"turn.completed","usage":{"input_tokens":18000,"cached_input_tokens":1000,"output_tokens":200}}

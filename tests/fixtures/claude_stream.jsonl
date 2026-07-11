@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"sess-xyz-9","tools":["Read","Edit","Bash"],"model":"claude"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading "}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"the file."}}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"main.py"}}]},"session_id":"sess-xyz-9"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"File updated"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done. Updated main.py."}]},"session_id":"sess-xyz-9"}
+{"type":"result","subtype":"success","result":"Done. Updated main.py.","session_id":"sess-xyz-9","total_cost_usd":0.012,"usage":{"input_tokens":1200,"cache_read_input_tokens":300,"output_tokens":80},"num_turns":2,"is_error":false}
