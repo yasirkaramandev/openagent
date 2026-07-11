@@ -27,19 +27,27 @@ class ProviderService:
         base_url: str | None = None,
         anthropic_base_url: str | None = None,
         api_key: str | None = None,
+        key_env: str | None = None,
         region: str | None = None,
         workspace_id: str | None = None,
         extra_headers: dict[str, str] | None = None,
         store_key: bool = True,
     ) -> ProviderConnection:
-        """Register a provider and store its key in the OS keychain (spec §30)."""
+        """Register a provider and store its key in the OS keychain (spec §30).
+
+        ``key_env`` references an environment variable instead of storing a secret (nothing is
+        persisted). Otherwise ``api_key`` is written to the OS keychain.
+        """
 
         preset = get_preset(provider_type)
         resolved_protocol = protocol or (preset.protocol if preset else Protocol.OPENAI_CHAT)
-        credential = CredentialRef(type=CredentialType.KEYCHAIN, service="openagent",
-                                   account=f"provider/{name}")
-        if not api_key and preset and not preset.needs_key:
-            credential = CredentialRef(type=CredentialType.NONE)
+        if key_env:
+            credential = CredentialRef(type=CredentialType.ENV, env_var=key_env)
+        else:
+            credential = CredentialRef(type=CredentialType.KEYCHAIN, service="openagent",
+                                       account=f"provider/{name}")
+            if not api_key and preset and not preset.needs_key:
+                credential = CredentialRef(type=CredentialType.NONE)
 
         provider = ProviderConnection(
             id=f"provider_{name}",

@@ -19,12 +19,14 @@ class DiscoveryService:
     async def discover(self, persist: bool = True) -> list[CliInstallation]:
         """Detect installed CLIs and (optionally) record them."""
 
-        found = await discover_installed()
-        if persist:
-            for install in found:
-                install = await self._augment_auth(install)
+        detected = await discover_installed()
+        augmented: list[CliInstallation] = []
+        for install in detected:
+            install = await self._augment_auth(install)
+            augmented.append(install)
+            if persist:
                 self.repos.clis.upsert(install)
-        return found
+        return augmented
 
     def list(self) -> list[CliInstallation]:
         return self.repos.clis.list()
