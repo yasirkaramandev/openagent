@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# OpenAgent runtime state
+.openagent/
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
