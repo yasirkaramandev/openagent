@@ -33,6 +33,30 @@ This repository uses OpenAgent to discover and run external AI agents.
 """
 
 
+def _sanitize(text: str) -> str:
+    """Neutralize agent-supplied text so it cannot break the generated document (item 14).
+
+    Every user field (name, title, description, tags) renders on a single markdown line inside the
+    marker-delimited block. Untrusted text is:
+
+    * collapsed to one line (no injected headings/list items via newlines);
+    * defanged of HTML-comment syntax and the OPENAGENT markers, so it can never inject a comment
+      or forge/truncate the ``OPENAGENT:AGENTS:START/END`` sentinels the regenerator splits on;
+    * stripped of backticks so inline-code spans stay balanced.
+
+    The SQLite DB remains the source of truth for the real values; this only guards the rendering.
+    """
+
+    if not text:
+        return text
+    text = " ".join(text.split())
+    text = text.replace("<!--", "< !--").replace("-->", "-- >")
+    text = text.replace("OPENAGENT:AGENTS:START", "OPENAGENT-AGENTS-START")
+    text = text.replace("OPENAGENT:AGENTS:END", "OPENAGENT-AGENTS-END")
+    text = text.replace("`", "'")
+    return text
+
+
 def render_agents_block(agents: Sequence[AgentProfile]) -> str:
     if not agents:
         body = "\n_No agents registered yet. Add one with `openagent add`._\n"
@@ -40,13 +64,13 @@ def render_agents_block(agents: Sequence[AgentProfile]) -> str:
         parts: list[str] = [""]
         for agent in sorted(agents, key=lambda a: a.name):
             runtime = _runtime_label(agent)
-            tags = ", ".join(f"`{t}`" for t in agent.tags) or "—"
-            parts.append(f"### {agent.title or agent.name}")
+            tags = ", ".join(f"`{_sanitize(t)}`" for t in agent.tags) or "—"
+            parts.append(f"### {_sanitize(agent.title) or _sanitize(agent.name)}")
             parts.append("")
-            parts.append(f"- Name: `{agent.name}`")
+            parts.append(f"- Name: `{_sanitize(agent.name)}`")
             parts.append(f"- Runtime: `{runtime}`")
             parts.append(f"- Tags: {tags}")
-            parts.append(f"- Description: {agent.description or '—'}")
+            parts.append(f"- Description: {_sanitize(agent.description) or '—'}")
             parts.append("")
         body = "\n".join(parts)
     return f"{OPENAGENT_MD_START}\n{body}\n{OPENAGENT_MD_END}\n"
