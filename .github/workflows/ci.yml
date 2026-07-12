@@ -85,14 +85,15 @@ jobs:
           python -m pip install "textual==${{ matrix.textual }}"
           python -c "import textual; print('textual', textual.__version__)"
 
-      - name: Select-sentinel + Add-Agent interaction tests
+      - name: Add-Agent wizard + Select-sentinel interaction tests
         run: >
           pytest -q
           tests/unit/test_select_utils.py
           tests/unit/test_agent_service_validation.py
+          tests/unit/test_wizard_state.py
           tests/unit/test_tui_add_agent.py
-          tests/unit/test_tui_add_agent_interaction.py
           tests/unit/test_tui_provider.py
+          tests/unit/test_tui_modals.py
 
   # Cross-platform smoke: install, build, entrypoint, and the platform-sensitive smoke tests
   # (path handling, process management, keyring fallback, TUI import/startup).
