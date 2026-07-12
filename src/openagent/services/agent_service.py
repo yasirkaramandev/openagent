@@ -68,8 +68,69 @@ class AgentService:
             tags=tags or [], system_prompt=system_prompt, permission_profile=permission_profile,
         )
         self.repos.agents.upsert(agent)
-        self.sync_openagent_md()
+        try:
+            self.sync_openagent_md()
+        except Exception:
+            # Keep the agent row and OPENAGENT.md consistent: if the doc write fails, don't leave a
+            # persisted agent the file doesn't mention (item 3).
+            self.repos.agents.delete(name)
+            raise
         return agent
+
+    def create_with_new_provider(
+        self,
+        *,
+        provider_name: str,
+        provider_type: str,
+        model: str,
+        api_key: str | None = None,
+        key_env: str | None = None,
+        credential_source: str | None = None,
+        protocol: object = None,
+        base_url: str | None = None,
+        anthropic_base_url: str | None = None,
+        region: str | None = None,
+        workspace_id: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        **agent_fields: object,
+    ) -> AgentProfile:
+        """Atomically connect a new provider *and* create an agent that binds it (item 3).
+
+        Order and rollback:
+
+        1. Pre-validate the agent (name/model/profile, name uniqueness) **before** any write, so an
+           invalid agent never creates a dangling provider.
+        2. Create the provider (credential validated + fail-closed inside ``ProviderService.add``).
+        3. Create the agent. If that fails for *any* reason — duplicate name slipping through, an
+           OPENAGENT.md write error, a repository error — the provider row and its freshly written
+           keychain secret are rolled back, so the system is left exactly as it started.
+        """
+
+        from ..core.models import Protocol  # local import avoids widening the module surface
+
+        agent_name = _require_str(agent_fields.get("name"), "agent name is required")
+        _require_str(model, "API agent requires a valid model id")
+        get_profile(str(agent_fields.get("permission_profile") or "safe-edit"))
+        if self.repos.agents.get(agent_name):
+            raise AgentError(f"agent {agent_name!r} already exists")
+        if self.app.providers.get(provider_name):
+            raise AgentError(f"a provider named {provider_name!r} already exists")
+
+        provider = self.app.providers.add(
+            name=provider_name, provider_type=provider_type,
+            protocol=protocol if isinstance(protocol, Protocol) else None,
+            base_url=base_url, anthropic_base_url=anthropic_base_url,
+            api_key=api_key, key_env=key_env, credential_source=credential_source,
+            region=region, workspace_id=workspace_id, extra_headers=extra_headers,
+        )
+        try:
+            return self.create(
+                runtime_type=RuntimeType.API_AGENT, provider=provider_name, model=model,
+                **agent_fields,  # type: ignore[arg-type]
+            )
+        except Exception:
+            self.app.providers.rollback(provider)
+            raise
 
     def update(
         self,

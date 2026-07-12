@@ -6,6 +6,8 @@ between two markers so regeneration never disturbs hand-written prose around it.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -55,17 +57,39 @@ def render_document(agents: Sequence[AgentProfile]) -> str:
 
 
 def write_openagent_md(path: Path, agents: Sequence[AgentProfile]) -> None:
-    """Create or update ``OPENAGENT.md`` in place, preserving prose outside the markers."""
+    """Create or update ``OPENAGENT.md`` in place, preserving prose outside the markers.
+
+    The write is **atomic** (temp file + ``os.replace``): a failure mid-write never leaves a
+    half-updated document, and the previous content survives if the write fails. Only the block
+    between the two markers is regenerated; hand-written prose outside them is preserved.
+    """
 
     block = render_agents_block(agents)
+    content: str | None = None
     if path.exists():
         text = path.read_text(encoding="utf-8")
         if OPENAGENT_MD_START in text and OPENAGENT_MD_END in text:
             before = text.split(OPENAGENT_MD_START)[0]
             after = text.split(OPENAGENT_MD_END, 1)[1]
-            path.write_text(before + block + after, encoding="utf-8")
-            return
-    path.write_text(render_document(agents), encoding="utf-8")
+            content = before + block + after
+    if content is None:
+        content = render_document(agents)
+    _atomic_write(path, content)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".openagent-md-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:  # pragma: no cover - best effort cleanup
+            pass
+        raise
 
 
 def _runtime_label(agent: AgentProfile) -> str:

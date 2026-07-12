@@ -152,6 +152,18 @@ class ProviderService:
     def get(self, name: str) -> ProviderConnection | None:
         return self.repos.providers.get_by_name(name)
 
+    def rollback(self, provider: ProviderConnection) -> None:
+        """Unconditionally undo a just-created provider (row + any keychain secret).
+
+        Used by the atomic create-provider-and-agent transaction (item 3); unlike :meth:`remove`
+        it does **not** run the in-use guard, because the partner agent creation failed and the
+        provider must be removed regardless.
+        """
+
+        if provider.credential.type is CredentialType.KEYCHAIN:
+            self.credentials.delete_secret(provider.credential)
+        self.repos.providers.delete(provider.id)
+
     def agents_using(self, name: str) -> Sequence[str]:
         """Names of agents whose runtime binds to the provider connection ``name``."""
 

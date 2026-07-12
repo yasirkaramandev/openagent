@@ -274,13 +274,19 @@ class AddAgentScreen(Screen):
             if not model:
                 errors.append("API agents need a model id")
                 self._field_error("err-model", "required")
-            provider = self._resolve_api_provider(errors)
-            if errors:
-                return self._summary(errors)
-            agent = oa.agents.create(
-                name=name, runtime_type=RuntimeType.API_AGENT, provider=provider,
-                model=model, **common,
-            )
+            mode = selected_string(self.query_one("#api-mode", Select))
+            if mode == "new":
+                agent = self._create_with_new_connection(name, model, common, errors)
+                if agent is None:
+                    return self._summary(errors)
+            else:
+                provider = self._resolve_api_provider(errors)
+                if errors:
+                    return self._summary(errors)
+                agent = oa.agents.create(
+                    name=name, runtime_type=RuntimeType.API_AGENT, provider=provider,
+                    model=model, **common,
+                )
 
         self.notify(f"agent '{agent.name}' created — OPENAGENT.md updated", severity="information")
         # Return to the Agents list, which reloads and now shows the new agent.
@@ -288,23 +294,28 @@ class AddAgentScreen(Screen):
         self.app.open_section("agents")  # type: ignore[attr-defined]
 
     def _resolve_api_provider(self, errors: list[str]) -> str | None:
-        """Return the provider-connection name to bind, persisting a new connection if needed.
+        """Return the *existing* saved provider-connection name to bind.
 
-        Existing path → the selected saved connection. New path → create the connection through
-        :class:`ProviderService` (storing any key in the keychain) and return its name. On a missing
-        required field, appends to ``errors`` and returns ``None`` so the caller aborts before
-        touching the service layer.
+        The new-connection path is handled atomically by :meth:`_create_with_new_connection`.
+        """
+
+        provider = selected_string(self.query_one("#provider", Select))
+        if not provider:
+            errors.append("choose a provider connection (or connect a new API)")
+            self._field_error("err-provider", "required")
+        return provider
+
+    def _create_with_new_connection(
+        self, name: str, model: str, common: dict, errors: list[str]
+    ):
+        """Connect a new provider *and* create the agent as one atomic transaction (item 3).
+
+        On any failure — invalid credential, duplicate name, OPENAGENT.md write error — nothing is
+        left behind (no provider row, no keychain secret, no half-written doc); the error is shown
+        inline and the form stays open. Returns the created agent, or ``None`` on failure.
         """
 
         oa = self.app.oa  # type: ignore[attr-defined]
-        mode = selected_string(self.query_one("#api-mode", Select))
-        if mode != "new":
-            provider = selected_string(self.query_one("#provider", Select))
-            if not provider:
-                errors.append("choose a provider connection (or connect a new API)")
-                self._field_error("err-provider", "required")
-            return provider
-
         p = self._new_conn_params()
         if not p["name"]:
             errors.append("connection name is required")
@@ -317,18 +328,23 @@ class AddAgentScreen(Screen):
         if errors:  # e.g. missing model — don't persist a connection we're about to reject
             return None
         try:
-            oa.providers.add(
-                name=p["name"], provider_type=p["provider_type"], protocol=p["protocol"],
+            agent = oa.agents.create_with_new_provider(
+                provider_name=p["name"], provider_type=p["provider_type"], protocol=p["protocol"],
                 base_url=p["base_url"], region=p["region"], workspace_id=p["workspace_id"],
                 api_key=p["api_key"], key_env=p["key_env"], credential_source=p["cred"],
+                model=model, name=name, **common,
             )
         except ProviderValidationError as exc:
             errors.append(str(exc))
             self._status(f"[red]✗ {exc}[/red]")
             self._field_error("err-conn", "credential invalid")
             return None
+        except _EXPECTED_ERRORS as exc:
+            errors.append(str(exc))
+            self._field_error("err-name", "could not create")
+            return None
         self.notify(f"provider '{p['name']}' connected", severity="information")
-        return p["name"]
+        return agent
 
     def _test_connection(self) -> None:
         p = self._new_conn_params()
