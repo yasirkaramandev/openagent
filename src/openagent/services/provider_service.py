@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ..core.models import CredentialRef, CredentialType, Protocol, ProviderConnection, RemoteModel
+from ..credentials.redaction import register_secret
 from ..providers.base import HealthResult
 from ..providers.factory import build_adapter, get_preset, resolve_base_url
 
@@ -84,6 +85,9 @@ class ProviderService:
 
     def adapter_for(self, provider: ProviderConnection):
         api_key = self.credentials.resolve(provider.credential)
+        # Register the concrete key so it is scrubbed from every artifact/log even when its format
+        # has no recognizable prefix (spec §30).
+        register_secret(api_key)
         return build_adapter(provider, api_key)
 
     async def test(self, name: str) -> HealthResult:

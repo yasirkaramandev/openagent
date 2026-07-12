@@ -43,10 +43,19 @@ class ToolContext:
     approval_gate: ApprovalGate
     run_id: str = ""
     emit: EventSink | None = None
+    #: Extra environment variables injected into command subprocesses for *this* run only. Empty by
+    #: default: an API agent's commands never inherit provider keys or the parent environment
+    #: (spec §7). Populate only with credentials a specific operation explicitly needs.
+    command_env: dict[str, str] = field(default_factory=dict)
 
-    def request_approval(self, action: str, detail: str) -> bool:
-        outcome = self.approval_gate.decide(ApprovalRequest(self.run_id, action, detail))
-        return outcome.value == "accepted"
+    def request_approval(
+        self, action: str, detail: str, *, command: str = "", reason: str = ""
+    ) -> bool:
+        request = ApprovalRequest(
+            run_id=self.run_id, action=action, detail=detail,
+            command=command or detail, reason=reason, workspace=str(self.workspace_root),
+        )
+        return self.approval_gate.decide(request).value == "accepted"
 
     def resolve_path(self, relative: str) -> Path:
         """Resolve ``relative`` inside the workspace, rejecting escapes and symlink breakouts.

@@ -1,8 +1,16 @@
-"""Secret redaction for logs and events (spec §30).
+"""Secret redaction for artifacts, logs, events, and UI output (spec §30).
 
-Every string written to ``logs.txt`` / ``events.jsonl`` passes through :func:`redact` first so API
-keys never land on disk. Patterns cover the common shapes: ``sk-...``, ``Bearer ...``,
-``api_key=...``, ``Authorization: ...`` and ``*_API_KEY=...``.
+Every string written to a run artifact (``request.json`` — including the user prompt — ``result.json``,
+``events.jsonl``, ``logs.txt``, ``changes.diff``, ``output.md``, ``handoff.md``…) and every line the
+TUI/CLI print passes through :func:`redact` first so secrets never land on disk or screen.
+
+Two layers:
+
+* **Pattern-based** — common key shapes (``sk-...``, ``Bearer ...``, ``api_key=...``,
+  ``Authorization: ...``, GitHub tokens…).
+* **Exact registered values** — because some providers (e.g. several Chinese providers) issue keys
+  with no recognizable prefix, callers register the concrete key value at runtime with
+  :func:`register_secret`; the exact string is then scrubbed anywhere it appears.
 """
 
 from __future__ import annotations
@@ -25,6 +33,25 @@ _PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bgh[posru]_[A-Za-z0-9]{16,}"),
 ]
 
+#: Exact secret values registered at runtime (values, not references). Long strings only — short
+#: values would over-match and corrupt output.
+_REGISTERED: set[str] = set()
+_MIN_REGISTER_LEN = 8
+
+
+def register_secret(secret: str | None) -> None:
+    """Register an exact secret value to scrub from all output (spec §30).
+
+    Required for provider keys whose format has no recognizable prefix. Safe to call repeatedly.
+    """
+
+    if secret and len(secret) >= _MIN_REGISTER_LEN:
+        _REGISTERED.add(secret)
+
+
+def clear_registered_secrets() -> None:
+    _REGISTERED.clear()
+
 
 def redact(text: str) -> str:
     """Return ``text`` with secret-looking substrings replaced by ``[REDACTED]``."""
@@ -32,6 +59,10 @@ def redact(text: str) -> str:
     if not text:
         return text
     result = text
+    # Exact registered values first (covers prefixless keys the patterns can't match).
+    for secret in sorted(_REGISTERED, key=len, reverse=True):
+        if secret in result:
+            result = result.replace(secret, REDACTED)
     for pattern in _PATTERNS:
         result = pattern.sub(_replace, result)
     return result

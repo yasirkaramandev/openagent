@@ -85,19 +85,28 @@ class Transport:
             return response.json()
 
     async def stream_sse(self, path: str, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        """POST and yield decoded SSE ``data:`` JSON objects (retries only before first byte)."""
+        """POST and yield decoded SSE ``data:`` JSON objects.
+
+        A stream is only safe to replay **before the first event is yielded**. Once any event has
+        been delivered to the caller, a mid-stream disconnect would duplicate text, tool calls, and
+        file changes on replay — so we do not retry; we raise ``CONNECTION_LOST`` and let the caller
+        surface a clear error (spec §44). Retries before the first event use exponential backoff.
+        """
 
         attempt = 0
+        received_event = False
         while True:
             try:
                 async with self.client().stream("POST", path, json=payload) as response:
                     if response.status_code >= 400:
                         body = (await response.aread()).decode("utf-8", errors="replace")
                         retry_after = _retry_after(response)
-                        if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
+                        # Header errors arrive before any event, so retrying is still safe.
+                        if (response.status_code in _RETRY_STATUSES and attempt < self.max_retries
+                                and not received_event):
                             await self._sleep(attempt, retry_after)
                             attempt += 1
-                            break  # retry outer loop
+                            continue  # retry outer loop
                         raise TransportError(
                             classify_http_status(response.status_code), body,
                             status=response.status_code,
@@ -114,9 +123,16 @@ class Transport:
                         except json.JSONDecodeError:
                             continue
                         if isinstance(obj, dict):
+                            received_event = True
                             yield obj
                     return
             except (httpx.TimeoutException, httpx.TransportError) as exc:
+                # If we already yielded events, replaying the request would double-apply its effects.
+                if received_event:
+                    raise TransportError(
+                        ErrorType.CONNECTION_LOST,
+                        f"stream disconnected after partial output; not retried ({exc})",
+                    ) from exc
                 if attempt >= self.max_retries:
                     raise TransportError(ErrorType.TIMEOUT, str(exc)) from exc
                 await self._sleep(attempt, None)

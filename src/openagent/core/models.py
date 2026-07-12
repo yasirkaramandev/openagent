@@ -217,6 +217,12 @@ class Run(BaseModel):
     provider_session_id: str | None = None
     session_id: str | None = None
     pid: int | None = None
+    #: OS process start time captured with the PID — verifies identity before a later kill (spec §45).
+    pid_started_at: float | None = None
+    #: Worktree isolation strategy actually used: ``auto`` | ``none`` | ``copy``.
+    worktree_strategy: str = "auto"
+    #: How many turns this run has had (1 = initial; incremented by resume/message, spec §32).
+    turns: int = 1
     started_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime | None = None
     exit_code: int | None = None

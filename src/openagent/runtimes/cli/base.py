@@ -14,8 +14,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ...core.events import NormalizedEvent
+from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
+
+#: The terminal event types every CLI adapter must resolve a run to exactly one of (spec §6.2).
+TERMINAL_EVENT_TYPES = frozenset({
+    EventType.RUN_COMPLETED.value,
+    EventType.RUN_FAILED.value,
+    EventType.RUN_CANCELLED.value,
+})
 
 
 @dataclass
@@ -74,6 +81,49 @@ def find_executable(*names: str) -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def is_terminal_event(event: NormalizedEvent) -> bool:
+    etype = event.type if isinstance(event.type, str) else event.type.value
+    return etype in TERMINAL_EVENT_TYPES
+
+
+def finalize_terminal_event(
+    *,
+    run_id: str,
+    source: str,
+    exit_code: int | None,
+    cancelled: bool,
+    emitted_terminal: bool,
+    stderr: str = "",
+) -> NormalizedEvent | None:
+    """Guarantee exactly one terminal event per run (spec §6.2, §43).
+
+    Called after the subprocess exits. If the adapter's own mapping already produced a terminal
+    event, returns ``None``. Otherwise:
+
+    * a cancellation-in-progress → ``run.cancelled``;
+    * any other exit with no terminal event → ``run.failed`` (a non-zero exit, or a zero exit that
+      still never produced a success event, is a failure — never a silent "completed").
+    """
+
+    if emitted_terminal:
+        return None
+    if cancelled:
+        return NormalizedEvent(
+            run_id=run_id, type=EventType.RUN_CANCELLED, source=source,
+            data={"reason": "cancelled by user", "exit_code": exit_code},
+        )
+    detail = "clean exit but no success event" if exit_code in (0, None) else f"exit code {exit_code}"
+    return NormalizedEvent(
+        run_id=run_id, type=EventType.RUN_FAILED, source=source,
+        data={
+            "error_type": "command_failed",
+            "exit_code": exit_code,
+            "message": f"CLI produced no successful result ({detail})",
+            "stderr": (stderr or "")[-2000:],
+        },
+    )
 
 
 def detect_version(executable: str) -> str | None:

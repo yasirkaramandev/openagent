@@ -1,8 +1,10 @@
 """Run orchestration (spec §27, §28, §35, §45).
 
-Ties everything together: allocate a run id, snapshot + create an isolated worktree, dispatch to the
-API loop or a CLI adapter, stream normalized events to ``events.jsonl`` (+ SQLite index), collect the
-diff/tests, write the standard artifact bundle, and set the final status.
+Ties everything together: allocate a run id, snapshot + create an isolated workspace (per the chosen
+strategy), dispatch to the API loop or a CLI adapter, stream normalized events to ``events.jsonl``
+(+ SQLite index), collect the diff/tests, write the standard artifact bundle, and set the final
+status. PID and session ids are persisted the moment they arrive so a run is recoverable and
+cancellable across restarts.
 """
 
 from __future__ import annotations
@@ -18,14 +20,14 @@ from ..core.models import AgentProfile, Run, RunStatus, RuntimeType
 from ..core.permissions import get_profile
 from ..reporting.artifacts import ArtifactWriter, RunArtifacts, TestSummary
 from ..runtimes.api_agent.loop import run_api_agent
-from ..runtimes.cli.base import CliRunRequest
+from ..runtimes.cli.base import CliAdapter, CliRunRequest
 from ..runtimes.cli.registry import build_cli_adapter
 from ..security.approvals import ApprovalGate
-from ..security.process import is_pid_alive
+from ..security.process import is_pid_alive, pid_identity, terminate_pid_tree
 from ..storage.event_log import EventLog
 from ..tools.base import ToolContext
 from ..tools.registry import ToolExecutor
-from ..workspaces.worktree import WorktreeManager
+from ..workspaces.worktree import NONE, STRATEGIES, WorktreeManager
 
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
 EventHook = Callable[[NormalizedEvent], None]
 
 _ACTIVE = {RunStatus.QUEUED, RunStatus.STARTING, RunStatus.RUNNING, RunStatus.WAITING_APPROVAL}
+_TERMINAL = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.ORPHANED}
 
 
 class RunError(RuntimeError):
@@ -47,28 +50,44 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _status_value(run: Run) -> str:
+    return run.status if isinstance(run.status, str) else run.status.value
+
+
 class RunService:
     def __init__(self, app: OpenAgentApp) -> None:
         self.app = app
         self.repos = app.repos
         self.paths = app.paths
+        #: Live CLI adapters keyed by run_id, so cancel() reaches the *same* instance that owns the
+        #: subprocess (spec §45). Absent after a restart → cancel falls back to PID termination.
+        self._cli_adapters: dict[str, CliAdapter] = {}
+        #: Runs a cancel was requested for — prevents overwriting ``cancelled`` with ``completed``.
+        self._cancelled: set[str] = set()
 
     # ------------------------------------------------------------------ CRUD
 
     def create(
         self, *, agent_name: str, prompt: str, worktree: str = "auto",
-        permission_profile: str | None = None,
+        permission_profile: str | None = None, confirm_in_place: bool = False,
     ) -> Run:
         agent = self.repos.agents.get(agent_name)
         if not agent:
             raise RunError(f"agent {agent_name!r} not found")
         profile = permission_profile or agent.permission_profile
-        get_profile(profile)  # validate
+        prof = get_profile(profile)  # validate
+        if worktree not in STRATEGIES:
+            raise RunError(f"unknown worktree strategy {worktree!r}; choose from {STRATEGIES}")
+        if worktree == NONE and prof.can_edit_files and not confirm_in_place:
+            raise RunError(
+                "worktree 'none' runs a file-editing agent directly in your project with no "
+                "isolation; pass explicit confirmation to proceed"
+            )
         run = Run(
             id=_new_run_id(), agent=agent_name, prompt=prompt,
             workspace=str(self.paths.project_root), permission_profile=profile,
+            worktree_strategy=worktree,
         )
-        run.worktree = worktree  # strategy marker until the workspace is created
         self.repos.runs.upsert(run)
         return run
 
@@ -85,13 +104,14 @@ class RunService:
         if not agent:
             raise RunError(f"agent {run.agent!r} not found")
 
-        strategy = run.worktree or "auto"
+        strategy = run.worktree_strategy or "auto"
         run.status = RunStatus.STARTING
         self.repos.runs.upsert(run)
 
         wt = WorktreeManager(self.paths.project_root, self.paths.worktrees_dir)
-        workspace = wt.create(run.id, use_worktree=strategy != "none")
+        workspace = wt.create(run.id, strategy=strategy)
         run.worktree = str(workspace.root)
+        run.worktree_strategy = workspace.strategy
         run.branch = workspace.branch
         run.base_commit = workspace.base_commit
         run.status = RunStatus.RUNNING
@@ -103,13 +123,14 @@ class RunService:
         writer.write_request(run)
         art = RunArtifacts()
         if workspace.lower_safety:
-            art.warnings.append("Ran in a non-git copy (lower safety): changes are not versioned.")
+            art.warnings.append(_lower_safety_warning(workspace))
 
         state: dict[str, Any] = {"terminal": None}  # RunStatus | None
 
         def sink(event: NormalizedEvent) -> None:
             saved = event_log.append(event)
             _capture(saved, art, run, state)
+            self._persist_progress(saved, run)
             if on_event is not None:
                 on_event(saved)
 
@@ -127,12 +148,12 @@ class RunService:
             run.failure_type = run.failure_type or "unknown"
             art.warnings.append(f"runtime error: {exc}")
 
-        # Collect diff + changed files from the worktree.
+        # Collect diff + changed files from the workspace (works for git worktrees and copies).
         art.diff = wt.diff(workspace)
         art.files_changed = wt.changed_files(workspace)
         run.files_changed = art.files_changed
 
-        final = state["terminal"] or RunStatus.COMPLETED
+        final = self._resolve_final(run, state)
         run.status = final
         run.completed_at = _now()
         if not art.summary and final is RunStatus.COMPLETED:
@@ -141,13 +162,30 @@ class RunService:
 
         # Emit our own terminal event only if the runtime didn't already.
         if state.get("emitted_terminal") is not True:
-            term_type = EventType.RUN_COMPLETED if final is RunStatus.COMPLETED else EventType.RUN_FAILED
-            sink(NormalizedEvent(run_id=run.id, type=term_type, source="openagent",
+            sink(NormalizedEvent(run_id=run.id, type=_terminal_event_type(final), source="openagent",
                                  data={"status": final.value}))
 
         writer.write_status(run)
         writer.write_results(run, art)
         return run
+
+    def _resolve_final(self, run: Run, state: dict) -> RunStatus:
+        """Never silently default an unknown terminal state to completed (spec §43)."""
+
+        if run.id in self._cancelled or state.get("terminal") is RunStatus.CANCELLED:
+            return RunStatus.CANCELLED
+        terminal = state.get("terminal")
+        if terminal is None:
+            run.failure_type = run.failure_type or "no_terminal_event"
+            return RunStatus.FAILED
+        return terminal
+
+    def _persist_progress(self, event: NormalizedEvent, run: Run) -> None:
+        """Persist the run the moment a PID or session id arrives (spec §45 orphan/cancel/resume)."""
+
+        etype = event.type if isinstance(event.type, str) else event.type.value
+        if etype in (EventType.RUN_STARTED.value, EventType.SESSION_CREATED.value):
+            self.repos.runs.upsert(run)
 
     async def _run_api(self, run, agent, root: Path, sink, art, state) -> None:
         provider = self.repos.providers.get_by_name(agent.runtime.provider or "")
@@ -165,7 +203,10 @@ class RunService:
 
         ctx = ToolContext(
             workspace_root=root, profile=profile,
-            approval_gate=ApprovalGate(auto_approve=not profile.require_approval_for_destructive),
+            approval_gate=ApprovalGate(
+                auto_approve=not profile.require_approval_for_destructive, emit=tool_emit,
+                run_id=run.id,
+            ),
             run_id=run.id, emit=tool_emit,
         )
         executor = ToolExecutor(ctx)
@@ -189,14 +230,16 @@ class RunService:
 
     async def _run_cli(self, run, agent: AgentProfile, root: Path, sink, state) -> None:
         adapter = build_cli_adapter(agent.runtime.cli or "")
+        self._cli_adapters[run.id] = adapter
         request = CliRunRequest(
             run_id=run.id, prompt=run.prompt, workspace=root,
             permission_profile=run.permission_profile,
         )
-        async for event in adapter.start_run(request):
-            sink(event)
-            if event.data.get("pid") and run.pid is None:
-                run.pid = event.data["pid"]
+        try:
+            async for event in adapter.start_run(request):
+                sink(event)
+        finally:
+            self._cli_adapters.pop(run.id, None)
 
     # ------------------------------------------------------------------ resume / cancel
 
@@ -212,40 +255,124 @@ class RunService:
 
         run_dir = self.paths.run_dir(run.id)
         event_log = EventLog(run_dir, index=self.repos.event_index)
-        state: dict[str, Any] = {"terminal": None}
-        art = RunArtifacts()
+        turn_state: dict[str, Any] = {"terminal": None}
+
+        # Mark the run active again while resuming; append (never truncate) the event log.
+        run.status = RunStatus.RUNNING
+        run.turns += 1
+        run.completed_at = None
+        self.repos.runs.upsert(run)
 
         def sink(event: NormalizedEvent) -> None:
             saved = event_log.append(event)
-            _capture(saved, art, run, state)
+            _capture(saved, run=run, art=None, state=turn_state)
+            self._persist_progress(saved, run)
             if on_event is not None:
                 on_event(saved)
 
         adapter = build_cli_adapter(agent.runtime.cli or "")
+        self._cli_adapters[run.id] = adapter
+        workspace_root = Path(run.worktree or run.workspace)
         request = CliRunRequest(
-            run_id=run.id, prompt=prompt, workspace=Path(run.worktree or run.workspace),
+            run_id=run.id, prompt=prompt, workspace=workspace_root,
             permission_profile=run.permission_profile, session_id=run.provider_session_id,
         )
         sink(NormalizedEvent(run_id=run.id, type=EventType.SESSION_RESUMED, source="openagent",
-                             data={"session_id": run.provider_session_id}))
-        async for event in adapter.resume_run(run.provider_session_id, prompt, request):
-            sink(event)
-        run.status = state["terminal"] or RunStatus.COMPLETED
+                             data={"session_id": run.provider_session_id, "turn": run.turns}))
+        try:
+            async for event in adapter.resume_run(run.provider_session_id, prompt, request):
+                sink(event)
+        except Exception as exc:  # noqa: BLE001
+            turn_state["terminal"] = RunStatus.FAILED
+            run.failure_type = run.failure_type or "unknown"
+            sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_FAILED, source="openagent",
+                                 data={"message": f"resume error: {exc}"}))
+        finally:
+            self._cli_adapters.pop(run.id, None)
+
+        self._finalize_resume(run, prompt, turn_state)
+        return run
+
+    def _finalize_resume(self, run: Run, prompt: str, turn_state: dict) -> None:
+        """Rebuild cumulative artifacts from the full event log after a resume turn (spec §32)."""
+
+        # Cumulative artifacts: replay the whole event log so earlier turns' work is preserved even
+        # if this turn failed (a failed resume must never erase prior successful artifacts).
+        art, _ = self._rebuild_artifacts(run)
+
+        wt = WorktreeManager(self.paths.project_root, self.paths.worktrees_dir)
+        ws = self._reconstruct_workspace(run)
+        art.diff = wt.diff(ws)
+        art.files_changed = wt.changed_files(ws)
+        run.files_changed = art.files_changed
+
+        if run.id in self._cancelled or turn_state.get("terminal") is RunStatus.CANCELLED:
+            final = RunStatus.CANCELLED
+        elif turn_state.get("terminal") is None:
+            final = RunStatus.FAILED
+            run.failure_type = run.failure_type or "no_terminal_event"
+        else:
+            final = turn_state["terminal"]
+        run.status = final
         run.completed_at = _now()
         self.repos.runs.upsert(run)
-        return run
+
+        run_dir = self.paths.run_dir(run.id)
+        writer = ArtifactWriter(run_dir)
+        writer.write_turn(run, prompt, art)
+        writer.write_status(run)
+        writer.write_results(run, art)
+
+    def _rebuild_artifacts(self, run: Run) -> tuple[RunArtifacts, dict]:
+        """Fold the full ``events.jsonl`` back into a cumulative :class:`RunArtifacts`."""
+
+        art = RunArtifacts()
+        state: dict[str, Any] = {"terminal": None}
+        event_log = EventLog(self.paths.run_dir(run.id))
+        for event in event_log.read():
+            _capture(event, art, run, state)
+        return art, state
+
+    def _reconstruct_workspace(self, run: Run):
+        from ..workspaces.worktree import Workspace, is_git_repo
+
+        root = Path(run.worktree or run.workspace)
+        return Workspace(
+            run_id=run.id, root=root, source=self.paths.project_root,
+            is_git=is_git_repo(root), strategy=run.worktree_strategy,
+            branch=run.branch, base_commit=run.base_commit,
+        )
 
     async def cancel(self, run_id: str) -> None:
         run = self.get(run_id)
         if not run:
             return
-        agent = self.repos.agents.get(run.agent)
-        if agent and agent.runtime.type in (RuntimeType.CLI, RuntimeType.CLI.value) and agent.runtime.cli:
-            adapter = build_cli_adapter(agent.runtime.cli)
+        if run.status in _TERMINAL or _status_value(run) in {s.value for s in _TERMINAL}:
+            return  # idempotent: already finished
+        self._cancelled.add(run_id)
+
+        adapter = self._cli_adapters.get(run_id)
+        if adapter is not None:
+            # Same process: kill the tree; the running executor will finalize (emit run.cancelled).
             await adapter.cancel(run_id)
+            run.status = RunStatus.CANCELLED
+            run.completed_at = _now()
+            self.repos.runs.upsert(run)
+            return
+
+        # Cross-process / after restart: terminate by PID with identity verification, then finalize.
+        terminate_pid_tree(run.pid, run.pid_started_at)
+        run_dir = self.paths.run_dir(run_id)
+        EventLog(run_dir, index=self.repos.event_index).append(
+            NormalizedEvent(run_id=run_id, type=EventType.RUN_CANCELLED, source="openagent",
+                            data={"reason": "cancelled by user"})
+        )
         run.status = RunStatus.CANCELLED
         run.completed_at = _now()
+        run.failure_type = run.failure_type or "user_cancelled"
         self.repos.runs.upsert(run)
+        if run_dir.exists():
+            ArtifactWriter(run_dir).write_status(run)
 
     # ------------------------------------------------------------------ maintenance
 
@@ -254,6 +381,8 @@ class RunService:
 
         recovered: list[str] = []
         for run in self.repos.runs.list_active():
+            if run.id in self._cli_adapters:
+                continue  # still running in this process
             if not is_pid_alive(run.pid):
                 run.status = RunStatus.ORPHANED
                 run.completed_at = _now()
@@ -277,31 +406,55 @@ class RunService:
         return path.read_text(encoding="utf-8")
 
 
-def _capture(event: NormalizedEvent, art: RunArtifacts, run: Run, state: dict) -> None:
+def _terminal_event_type(status: RunStatus) -> EventType:
+    return {
+        RunStatus.COMPLETED: EventType.RUN_COMPLETED,
+        RunStatus.CANCELLED: EventType.RUN_CANCELLED,
+    }.get(status, EventType.RUN_FAILED)
+
+
+def _lower_safety_warning(workspace) -> str:
+    if workspace.in_place:
+        return "Ran in place (worktree 'none'): edits were applied directly to your project."
+    return "Ran in a non-git copy (lower safety): changes are not versioned."
+
+
+def _capture(event: NormalizedEvent, art: RunArtifacts | None, run: Run, state: dict) -> None:
     etype = event.type if isinstance(event.type, str) else event.type.value
     data = event.data
-    if etype == EventType.SESSION_CREATED.value and data.get("provider_session_id"):
+    if etype == EventType.RUN_STARTED.value and data.get("pid"):
+        run.pid = data["pid"]
+        run.pid_started_at = data.get("create_time") or pid_identity(data["pid"])
+    elif etype == EventType.SESSION_CREATED.value and data.get("provider_session_id"):
         run.provider_session_id = data["provider_session_id"]
     elif etype == EventType.MESSAGE_COMPLETED.value and data.get("text"):
-        art.summary = data["text"]
+        if art is not None:
+            art.summary = data["text"]
     elif etype == EventType.TEST_COMPLETED.value:
-        art.tests = TestSummary(
-            ran=True, passed=data.get("passed"), exit_code=data.get("exit_code"),
-            command=data.get("command", ""),
-        )
+        if art is not None:
+            art.tests = TestSummary(
+                ran=True, passed=data.get("passed"), exit_code=data.get("exit_code"),
+                command=data.get("command", ""),
+            )
     elif etype in (EventType.FILE_CREATED.value, EventType.FILE_MODIFIED.value,
                    EventType.FILE_DELETED.value):
-        verb = etype.split(".")[1]
-        art.changes.append(f"{verb} {data.get('path', '')}".strip())
+        if art is not None:
+            verb = etype.split(".")[1]
+            art.changes.append(f"{verb} {data.get('path', '')}".strip())
     elif etype in (EventType.COMMAND_COMPLETED.value, EventType.LOG.value):
-        if data.get("stderr"):
-            art.log_lines.append(str(data["stderr"]))
-        if data.get("command"):
-            art.log_lines.append(f"$ {data['command']} -> exit {data.get('exit_code')}")
+        if art is not None:
+            if data.get("stderr"):
+                art.log_lines.append(str(data["stderr"]))
+            if data.get("command"):
+                art.log_lines.append(f"$ {data['command']} -> exit {data.get('exit_code')}")
     elif etype == EventType.USAGE_UPDATED.value:
-        art.usage = {k: data.get(k) for k in ("input_tokens", "cached_input_tokens", "output_tokens")}
+        if art is not None:
+            art.usage = {k: data.get(k) for k in ("input_tokens", "cached_input_tokens", "output_tokens")}
     elif etype == EventType.RUN_COMPLETED.value:
         state["terminal"] = RunStatus.COMPLETED
+        state["emitted_terminal"] = True
+    elif etype == EventType.RUN_CANCELLED.value:
+        state["terminal"] = RunStatus.CANCELLED
         state["emitted_terminal"] = True
     elif etype == EventType.RUN_FAILED.value:
         state["terminal"] = RunStatus.FAILED

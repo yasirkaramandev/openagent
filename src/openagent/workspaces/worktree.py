@@ -1,20 +1,33 @@
 """Worktree management (spec §28).
 
-Default behavior (``--worktree auto``): for a git repo, snapshot the current commit, create a fresh
-branch ``openagent/run_<id>`` and a git *worktree* under ``.openagent/worktrees/run_<id>``, run the
-agent there, then let the user apply / merge / discard. Real ``git`` is invoked as a subprocess so
-git's own behavior is preserved (spec §4).
+Three explicit isolation strategies:
 
-Non-git projects fall back to a temporary directory copy, flagged as **lower safety** so the UI can
-warn (spec §28).
+* ``auto`` — a git repo gets an isolated git *worktree* (branch ``openagent/run_<id>``); a non-git
+  project falls back to an isolated directory **copy**, flagged lower-safety.
+* ``none`` — run directly in the current project directory (no isolation). File-editing agents
+  require explicit confirmation before this is used (enforced by the caller).
+* ``copy`` — always an isolated directory copy, regardless of git.
+
+For copies (and non-git ``none`` runs) there is no git to diff against, so changed/created/deleted
+files and a unified diff are computed by comparing the workspace to the untouched source tree.
 """
 
 from __future__ import annotations
 
+import difflib
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+_IGNORE_DIRS = {".git", ".openagent", ".venv", "node_modules", "__pycache__", ".mypy_cache",
+                ".pytest_cache", ".ruff_cache", "dist", "build"}
+_MAX_DIFF_BYTES = 400_000
+
+AUTO = "auto"
+NONE = "none"
+COPY = "copy"
+STRATEGIES = (AUTO, NONE, COPY)
 
 
 class GitError(RuntimeError):
@@ -46,13 +59,18 @@ class Workspace:
     root: Path            # where the agent runs (worktree dir, or copy, or the repo itself)
     source: Path          # the user's project root
     is_git: bool
+    strategy: str = AUTO
     branch: str | None = None
     base_commit: str | None = None
-    is_copy: bool = False  # True when using the non-git temp-copy fallback
+    is_copy: bool = False   # True when using an isolated directory copy
+    in_place: bool = False  # True for strategy "none" (runs in the source tree directly)
+    #: For copies: content hashes of the source tree at creation, used to compute a diff afterwards.
+    baseline: dict[str, str] = field(default_factory=dict)
 
     @property
     def lower_safety(self) -> bool:
-        return self.is_copy
+        # A copy is unversioned; running in place mutates the user's tree directly.
+        return self.is_copy or self.in_place
 
 
 class WorktreeManager:
@@ -60,59 +78,139 @@ class WorktreeManager:
         self.project_root = project_root
         self.worktrees_dir = worktrees_dir
 
-    def create(self, run_id: str, *, use_worktree: bool = True) -> Workspace:
-        """Prepare an isolated workspace for ``run_id``."""
+    def create(self, run_id: str, *, strategy: str = AUTO, use_worktree: bool | None = None) -> Workspace:
+        """Prepare an isolated workspace for ``run_id`` using an explicit strategy.
+
+        ``use_worktree`` is a back-compat shim: ``False`` maps to ``strategy="none"``.
+        """
+
+        if use_worktree is False:
+            strategy = NONE
+        if strategy not in STRATEGIES:
+            raise ValueError(f"unknown worktree strategy {strategy!r}; choose from {STRATEGIES}")
 
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+        git = is_git_repo(self.project_root)
 
-        if is_git_repo(self.project_root) and use_worktree:
-            base_commit = _git(["rev-parse", "HEAD"], self.project_root).strip()
-            branch = f"openagent/{run_id}"
-            target = self.worktrees_dir / run_id
-            _git(["worktree", "add", "-b", branch, str(target), base_commit], self.project_root)
+        if strategy == NONE:
             return Workspace(
-                run_id=run_id, root=target, source=self.project_root,
-                is_git=True, branch=branch, base_commit=base_commit,
+                run_id=run_id, root=self.project_root, source=self.project_root,
+                is_git=git, strategy=NONE, in_place=True,
+                baseline={} if git else self._snapshot(self.project_root),
             )
 
-        # Non-git fallback: temp copy (lower safety).
+        if strategy == AUTO and git:
+            return self._git_worktree(run_id)
+
+        # strategy == COPY, or AUTO on a non-git project → isolated copy (lower safety).
+        return self._copy_workspace(run_id, git)
+
+    def _git_worktree(self, run_id: str) -> Workspace:
+        base_commit = _git(["rev-parse", "HEAD"], self.project_root).strip()
+        branch = f"openagent/{run_id}"
+        target = self.worktrees_dir / run_id
+        _git(["worktree", "add", "-b", branch, str(target), base_commit], self.project_root)
+        return Workspace(
+            run_id=run_id, root=target, source=self.project_root,
+            is_git=True, strategy=AUTO, branch=branch, base_commit=base_commit,
+        )
+
+    def _copy_workspace(self, run_id: str, git: bool) -> Workspace:
         target = self.worktrees_dir / run_id
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(
             self.project_root, target,
-            ignore=shutil.ignore_patterns(".git", ".openagent", ".venv", "node_modules", "__pycache__"),
+            ignore=shutil.ignore_patterns(*_IGNORE_DIRS),
         )
         return Workspace(
-            run_id=run_id, root=target, source=self.project_root,
-            is_git=is_git_repo(self.project_root), is_copy=True,
+            run_id=run_id, root=target, source=self.project_root, is_git=git,
+            strategy=COPY, is_copy=True, baseline=self._snapshot(self.project_root),
         )
 
     # ------------------------------------------------------------------ inspection
 
     def changed_files(self, ws: Workspace) -> list[str]:
-        if not ws.is_git or ws.is_copy:
-            return []
-        out = _git(["status", "--porcelain"], ws.root)
-        files = []
-        for line in out.splitlines():
-            if line.strip():
-                files.append(line[3:].strip())
-        return files
+        if self._uses_git_diff(ws):
+            out = _git(["status", "--porcelain"], ws.root)
+            files = []
+            for line in out.splitlines():
+                if line.strip():
+                    files.append(line[3:].strip())
+            return sorted(files)
+        return sorted(self._compare(ws)[0])
 
     def diff(self, ws: Workspace) -> str:
-        """Combined diff of tracked changes + newly added files in the worktree."""
+        """Combined diff of the run's changes."""
 
-        if not ws.is_git or ws.is_copy:
-            return ""
-        _git(["add", "-A", "-N"], ws.root)  # intent-to-add so new files show in diff
-        return _git(["diff"], ws.root)
+        if self._uses_git_diff(ws):
+            _git(["add", "-A", "-N"], ws.root)  # intent-to-add so new files show in diff
+            return _git(["diff"], ws.root)
+        return self._text_diff(ws)
+
+    def _uses_git_diff(self, ws: Workspace) -> bool:
+        # Git diff works for a real worktree, and for an in-place run inside a git repo.
+        return ws.is_git and not ws.is_copy
+
+    # ------------------------------------------------------------------ copy diffing
+
+    def _snapshot(self, root: Path) -> dict[str, str]:
+        """Map workspace-relative path → content digest for every text/binary file under ``root``."""
+
+        import hashlib
+
+        snap: dict[str, str] = {}
+        for path in self._walk(root):
+            try:
+                snap[str(path.relative_to(root))] = hashlib.sha1(path.read_bytes()).hexdigest()
+            except OSError:  # pragma: no cover - unreadable file
+                continue
+        return snap
+
+    def _walk(self, root: Path):
+        import os
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
+            for name in filenames:
+                yield Path(dirpath) / name
+
+    def _compare(self, ws: Workspace) -> tuple[list[str], list[str], list[str]]:
+        """Return (changed, created, deleted) relative paths for a copy/in-place run."""
+
+        after = self._snapshot(ws.root)
+        before = ws.baseline
+        created = [p for p in after if p not in before]
+        deleted = [p for p in before if p not in after]
+        modified = [p for p in after if p in before and after[p] != before[p]]
+        changed = sorted({*created, *deleted, *modified})
+        return changed, sorted(created), sorted(deleted)
+
+    def _text_diff(self, ws: Workspace) -> str:
+        changed, created, deleted = self._compare(ws)
+        chunks: list[str] = []
+        for rel in changed:
+            src = ws.source / rel
+            dst = ws.root / rel
+            before = _read_text(src) if rel not in created else ""
+            after = _read_text(dst) if rel not in deleted else ""
+            if before is None or after is None:  # binary; note the change without a body
+                chunks.append(f"Binary file {rel} changed\n")
+                continue
+            diff = difflib.unified_diff(
+                before.splitlines(keepends=True), after.splitlines(keepends=True),
+                fromfile=f"a/{rel}", tofile=f"b/{rel}",
+            )
+            chunks.append("".join(diff))
+        return ("".join(chunks))[:_MAX_DIFF_BYTES]
 
     # ------------------------------------------------------------------ disposition
 
     def discard(self, ws: Workspace) -> None:
-        """Remove the worktree/copy and its branch (spec §28)."""
+        """Remove the worktree/copy and its branch (spec §28). No-op for in-place runs."""
 
+        if ws.in_place:
+            return
         if ws.is_copy:
             if ws.root.exists():
                 shutil.rmtree(ws.root, ignore_errors=True)
@@ -129,9 +227,9 @@ class WorktreeManager:
                 pass
 
     def commit_all(self, ws: Workspace, message: str) -> str | None:
-        """Commit everything in the worktree; returns the new commit sha (git only)."""
+        """Commit everything in the worktree; returns the new commit sha (git worktree only)."""
 
-        if not ws.is_git or ws.is_copy:
+        if not ws.is_git or ws.is_copy or ws.in_place:
             return None
         _git(["add", "-A"], ws.root)
         status = _git(["status", "--porcelain"], ws.root)
@@ -139,3 +237,10 @@ class WorktreeManager:
             return None
         _git(["commit", "-m", message], ws.root)
         return _git(["rev-parse", "HEAD"], ws.root).strip()
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None

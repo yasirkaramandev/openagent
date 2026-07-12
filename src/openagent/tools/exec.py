@@ -1,7 +1,15 @@
 """Command-execution tools (spec §2.1, §27, §29).
 
-Every command is screened by the command policy first, then run inside the workspace with a bounded
-timeout. Output is truncated to keep events small.
+Every command is screened by the command policy, then run inside the workspace with:
+
+* a **minimal environment** — never the parent process's environment, so provider keys, GitHub
+  tokens, AWS keys, ``DATABASE_URL`` and other secrets can't leak into a child (spec §7);
+* ``shell=False`` and a structured argv by default — the executable allowlist is the boundary;
+* a bounded timeout that terminates the whole process tree on expiry;
+* truncated output to keep events small.
+
+Shell-operator commands and off-allowlist executables are a *separate, higher-risk* path that only
+runs after an explicit approval (the policy returns ``APPROVAL``).
 """
 
 from __future__ import annotations
@@ -9,6 +17,7 @@ from __future__ import annotations
 import subprocess
 
 from ..security.command_policy import Decision, evaluate
+from ..security.process import minimal_environment, run_capture
 from .base import ToolContext, ToolError, ToolResult
 
 _MAX_OUTPUT = 20_000
@@ -20,17 +29,25 @@ def _run(ctx: ToolContext, command: str, timeout: int) -> subprocess.CompletedPr
     if policy.decision is Decision.DENY:
         raise ToolError(f"command denied by policy: {policy.reason}")
     if policy.decision is Decision.APPROVAL:
-        if not ctx.request_approval("run_command", f"{command}\n({policy.reason})"):
+        detail = f"{command}\n({policy.reason})"
+        if not ctx.request_approval("run_command", detail, command=command, reason=policy.reason):
             raise ToolError(f"command not approved: {policy.reason}")
     if ctx.emit:
         ctx.emit("command.started", {"command": command, "cwd": str(ctx.workspace_root)})
+
+    # Minimal environment only: the parent env (and any secrets in it) is never inherited. A run may
+    # inject specific credentials via ``ctx.command_env`` for one operation; nothing else leaks.
+    env = minimal_environment(ctx.command_env)
+    # ``shell=False`` with the screened argv unless approval was granted for a shell-operator command.
+    argv: list[str] | str = command if policy.needs_shell else list(policy.argv)
     try:
-        return subprocess.run(
-            command, shell=True, cwd=str(ctx.workspace_root),
-            capture_output=True, text=True, timeout=timeout, check=False,
+        return run_capture(
+            argv, cwd=ctx.workspace_root, env=env, timeout=timeout, shell=policy.needs_shell,
         )
     except subprocess.TimeoutExpired as exc:
         raise ToolError(f"command timed out after {timeout}s") from exc
+    except FileNotFoundError as exc:
+        raise ToolError(f"executable not found: {exc}") from exc
 
 
 def run_command(ctx: ToolContext, command: str, timeout: int = _DEFAULT_TIMEOUT) -> ToolResult:

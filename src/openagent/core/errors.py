@@ -27,6 +27,8 @@ class ErrorType(str, Enum):
     WORKSPACE_CONFLICT = "workspace_conflict"
     USER_CANCELLED = "user_cancelled"
     TIMEOUT = "timeout"
+    #: The stream dropped after we had already yielded events — not safe to replay (spec §44).
+    CONNECTION_LOST = "connection_lost"
     UNKNOWN = "unknown"
 
 

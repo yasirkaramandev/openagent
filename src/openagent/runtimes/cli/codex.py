@@ -22,7 +22,9 @@ from .base import (
     CliCapabilities,
     CliRunRequest,
     detect_version,
+    finalize_terminal_event,
     find_executable,
+    is_terminal_event,
 )
 
 SOURCE = "codex-cli"
@@ -94,21 +96,24 @@ class CodexAdapter:
         await proc.start()
         yield NormalizedEvent(
             run_id=request.run_id, type=EventType.RUN_STARTED, source=SOURCE,
-            data={"pid": proc.pid},
+            data={"pid": proc.pid, "create_time": proc.create_time},
         )
+        emitted_terminal = False
         try:
             async for line in proc.stream_stdout():
                 obj = _parse_line(line)
                 if obj is None:
                     continue
                 for event in map_codex_event(obj, request.run_id):
+                    emitted_terminal = emitted_terminal or is_terminal_event(event)
                     yield event
             code = await proc.wait()
-            if code != 0 and code is not None:
-                yield NormalizedEvent(
-                    run_id=request.run_id, type=EventType.LOG, source=SOURCE,
-                    data={"level": "warning", "exit_code": code, "stderr": proc.stderr[-2000:]},
-                )
+            final = finalize_terminal_event(
+                run_id=request.run_id, source=SOURCE, exit_code=code,
+                cancelled=proc.cancelled, emitted_terminal=emitted_terminal, stderr=proc.stderr,
+            )
+            if final is not None:
+                yield final
         finally:
             self._processes.pop(request.run_id, None)
 
