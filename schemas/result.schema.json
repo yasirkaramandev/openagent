@@ -3,7 +3,7 @@
   "title": "OpenAgent result.json",
   "description": "The machine-readable summary of a completed run (spec §35).",
   "type": "object",
-  "required": ["run_id", "status", "agent", "summary", "files_changed", "tests"],
+  "required": ["run_id", "status", "agent", "turns", "summary", "files_changed", "tests"],
   "properties": {
     "run_id": { "type": "string" },
     "status": {
@@ -11,6 +11,7 @@
       "enum": ["completed", "failed", "cancelled", "orphaned"]
     },
     "agent": { "type": "string" },
+    "turns": { "type": "integer", "minimum": 1 },
     "summary": { "type": "string" },
     "files_changed": { "type": "array", "items": { "type": "string" } },
     "tests": {
@@ -28,7 +29,8 @@
       "properties": {
         "input_tokens": { "type": ["integer", "null"] },
         "cached_input_tokens": { "type": ["integer", "null"] },
-        "output_tokens": { "type": ["integer", "null"] }
+        "output_tokens": { "type": ["integer", "null"] },
+        "provider_cost": { "type": ["number", "null"] }
       }
     },
     "session_id": { "type": ["string", "null"] }
