@@ -99,3 +99,40 @@ def test_claude_usage_and_cost():
     usage = next(e for e in events if e.type == "usage.updated")
     assert usage.data["input_tokens"] == 1200
     assert usage.data["cost_usd"] == 0.012
+
+
+# ------------------------------------------------------- claude result success/failure (item 7)
+
+def _result_type(obj: dict) -> str:
+    events = map_claude_event({"type": "result", **obj}, "run_1")
+    terminals = [e.type for e in events if e.type in ("run.completed", "run.failed")]
+    assert len(terminals) == 1, f"expected exactly one terminal event, got {terminals}"
+    return terminals[0]
+
+
+def test_claude_result_success_subtype_completes():
+    assert _result_type({"subtype": "success", "result": "ok", "is_error": False}) == "run.completed"
+
+
+def test_claude_result_explicit_error_fails():
+    assert _result_type(
+        {"subtype": "error_during_execution", "is_error": True, "result": "boom"}
+    ) == "run.failed"
+
+
+def test_claude_result_missing_is_error_is_not_completed():
+    # No subtype and no is_error field: ambiguous -> must NOT count as completed.
+    assert _result_type({"result": "who knows"}) == "run.failed"
+
+
+def test_claude_result_unknown_subtype_fails():
+    assert _result_type({"subtype": "weird_new_state", "result": "?"}) == "run.failed"
+
+
+def test_claude_result_malformed_fails():
+    # A result object with nothing usable at all.
+    assert _result_type({}) == "run.failed"
+
+
+def test_claude_result_is_error_false_without_subtype_completes():
+    assert _result_type({"is_error": False, "result": "done"}) == "run.completed"

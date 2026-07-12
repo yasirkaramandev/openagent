@@ -188,11 +188,29 @@ def _map_result(obj: dict[str, Any], ev) -> list[NormalizedEvent]:
                  cached_input_tokens=usage.get("cache_read_input_tokens", 0),
                  output_tokens=usage.get("output_tokens", 0),
                  cost_usd=obj.get("total_cost_usd"))]
-    if obj.get("subtype") == "success" or not obj.get("is_error"):
-        events.append(ev(EventType.RUN_COMPLETED, result=obj.get("result", "")))
-    else:
-        events.append(ev(EventType.RUN_FAILED, message=obj.get("result", "failed")))
+    events.append(_result_terminal(obj, ev))
     return events
+
+
+def _result_terminal(obj: dict[str, Any], ev) -> NormalizedEvent:
+    """Decide the terminal event for a Claude ``result`` object — fail closed (item 7).
+
+    Success is only accepted when Claude *explicitly* says so: ``subtype == "success"``, or
+    ``is_error is False``. A missing ``is_error``, an error subtype, an unknown/absent subtype, or
+    a malformed result all map to a failure — an ambiguous result is never counted as completed.
+    """
+
+    subtype = obj.get("subtype")
+    is_error = obj.get("is_error")
+    if subtype == "success" or is_error is False:
+        return ev(EventType.RUN_COMPLETED, result=obj.get("result", ""))
+    if is_error is True or (isinstance(subtype, str) and subtype.startswith("error")):
+        return ev(EventType.RUN_FAILED, error_type="claude_error",
+                  message=obj.get("result") or f"claude reported {subtype or 'error'}")
+    # Neither an explicit success nor an explicit error: treat the ambiguous/malformed result as a
+    # failure rather than silently completing.
+    return ev(EventType.RUN_FAILED, error_type="ambiguous_result",
+              message="claude result was ambiguous (no explicit success/is_error)")
 
 
 def _content_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
