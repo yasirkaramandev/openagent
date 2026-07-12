@@ -87,6 +87,23 @@ async def test_failed_resume_preserves_earlier_artifacts(app: OpenAgentApp, tmp_
     assert "did the thing" in result_json["summary"]
 
 
+async def test_success_event_with_nonzero_exit_makes_run_failed(
+    app: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """End-to-end: a CLI that emits a success event but exits 1 yields a FAILED run (item 6)."""
+
+    adapter = FakeCliAdapter(write_fake_script(tmp_path), mode="success_exit1")
+    monkeypatch.setattr("openagent.services.run_service.build_cli_adapter",
+                        lambda cli, executable=None: adapter)
+    run = app.runs.create(agent_name="fake-coder", prompt="go", worktree="auto")
+    result = await app.runs.execute(run)
+    assert result.status == RunStatus.FAILED
+    # Exactly one terminal event in the log.
+    events = app.runs.output(run.id, "events")
+    terminals = sum(events.count(t) for t in ("run.completed", "run.failed", "run.cancelled"))
+    assert terminals == 1, events
+
+
 async def test_pid_and_session_persisted_immediately(app: OpenAgentApp, use_fake):
     """Crash-restart simulation: after a run, a fresh app instance sees the persisted session id."""
     run = app.runs.create(agent_name="fake-coder", prompt="task", worktree="auto")

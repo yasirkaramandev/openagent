@@ -13,16 +13,15 @@ import textwrap
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from openagent.core.events import EventType, NormalizedEvent
+from openagent.core.events import NormalizedEvent
 from openagent.core.models import CliInstallation
 from openagent.runtimes.cli.base import (
     AuthStatus,
     CliCapabilities,
     CliRunRequest,
-    finalize_terminal_event,
-    is_terminal_event,
+    run_managed_cli,
 )
-from openagent.runtimes.cli.codex import _parse_line, map_codex_event
+from openagent.runtimes.cli.codex import map_codex_event
 from openagent.security.process import ManagedProcess, minimal_environment
 
 SOURCE = "fake-cli"
@@ -63,6 +62,17 @@ FAKE_SCRIPT = textwrap.dedent(
         sys.exit(0)
     if mode == "fail1":
         sys.exit(1)
+    if mode == "success_exit1":
+        # Claims success in the stream, but the process fails -> must be reported as failed.
+        emit({"type": "thread.started", "thread_id": "th-fake-1"})
+        emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
+        sys.exit(1)
+    if mode == "double_terminal":
+        # Two terminal events in the stream -> exactly one must survive.
+        emit({"type": "thread.started", "thread_id": "th-fake-1"})
+        emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
+        emit({"type": "turn.failed", "error": {"message": "second terminal"}})
+        sys.exit(0)
     if mode == "malformed":
         print("{ this is not valid json", flush=True)
         sys.exit(1)
@@ -124,27 +134,11 @@ class FakeCliAdapter:
             cwd=request.workspace, env=minimal_environment(),
         )
         self._processes[request.run_id] = proc
-        await proc.start()
-        yield NormalizedEvent(
-            run_id=request.run_id, type=EventType.RUN_STARTED, source=SOURCE,
-            data={"pid": proc.pid, "create_time": proc.create_time},
-        )
-        emitted_terminal = False
         try:
-            async for line in proc.stream_stdout():
-                obj = _parse_line(line)
-                if obj is None:
-                    continue
-                for event in map_codex_event(obj, request.run_id):
-                    emitted_terminal = emitted_terminal or is_terminal_event(event)
-                    yield event
-            code = await proc.wait()
-            final = finalize_terminal_event(
-                run_id=request.run_id, source=SOURCE, exit_code=code,
-                cancelled=proc.cancelled, emitted_terminal=emitted_terminal, stderr=proc.stderr,
-            )
-            if final is not None:
-                yield final
+            async for event in run_managed_cli(
+                proc=proc, run_id=request.run_id, source=SOURCE, mapper=map_codex_event
+            ):
+                yield event
         finally:
             self._processes.pop(request.run_id, None)
 

@@ -59,7 +59,23 @@ async def test_usage_limit_is_failed(script: Path, tmp_path: Path):
     assert _terminals(events) == [EventType.RUN_FAILED.value]
 
 
+async def test_success_event_but_nonzero_exit_is_failed(script: Path, tmp_path: Path):
+    # The stream claims success, but the process exits 1 — the exit code must win.
+    events = await _run(FakeCliAdapter(script, mode="success_exit1"), tmp_path)
+    assert _terminals(events) == [EventType.RUN_FAILED.value]
+    failed = next(e for e in events if (e.type if isinstance(e.type, str) else e.type.value)
+                  == EventType.RUN_FAILED.value)
+    assert failed.data.get("error_type") == "exit_code_mismatch"
+
+
+async def test_two_terminal_events_collapse_to_one(script: Path, tmp_path: Path):
+    events = await _run(FakeCliAdapter(script, mode="double_terminal"), tmp_path)
+    # Only the first terminal event survives; it exited 0 so completion stands.
+    assert _terminals(events) == [EventType.RUN_COMPLETED.value]
+
+
 async def test_exactly_one_terminal_event(script: Path, tmp_path: Path):
-    for mode in ("complete", "silent0", "fail1", "malformed", "usage_limit"):
+    for mode in ("complete", "silent0", "fail1", "malformed", "usage_limit",
+                 "success_exit1", "double_terminal"):
         events = await _run(FakeCliAdapter(script, mode=mode), tmp_path)
         assert len(_terminals(events)) == 1, f"{mode} produced {_terminals(events)}"

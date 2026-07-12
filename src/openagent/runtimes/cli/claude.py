@@ -22,9 +22,8 @@ from .base import (
     CliCapabilities,
     CliRunRequest,
     detect_version,
-    finalize_terminal_event,
     find_executable,
-    is_terminal_event,
+    run_managed_cli,
 )
 
 SOURCE = "claude-cli"
@@ -94,27 +93,11 @@ class ClaudeAdapter:
         env = minimal_environment(request.credential_env)
         proc = ManagedProcess(args, cwd=request.workspace, env=env)
         self._processes[request.run_id] = proc
-        await proc.start()
-        yield NormalizedEvent(
-            run_id=request.run_id, type=EventType.RUN_STARTED, source=SOURCE,
-            data={"pid": proc.pid, "create_time": proc.create_time},
-        )
-        emitted_terminal = False
         try:
-            async for line in proc.stream_stdout():
-                obj = _parse_line(line)
-                if obj is None:
-                    continue
-                for event in map_claude_event(obj, request.run_id):
-                    emitted_terminal = emitted_terminal or is_terminal_event(event)
-                    yield event
-            code = await proc.wait()
-            final = finalize_terminal_event(
-                run_id=request.run_id, source=SOURCE, exit_code=code,
-                cancelled=proc.cancelled, emitted_terminal=emitted_terminal, stderr=proc.stderr,
-            )
-            if final is not None:
-                yield final
+            async for event in run_managed_cli(
+                proc=proc, run_id=request.run_id, source=SOURCE, mapper=map_claude_event
+            ):
+                yield event
         finally:
             self._processes.pop(request.run_id, None)
 
