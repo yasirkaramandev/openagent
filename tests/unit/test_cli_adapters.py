@@ -136,3 +136,30 @@ def test_claude_result_malformed_fails():
 
 def test_claude_result_is_error_false_without_subtype_completes():
     assert _result_type({"is_error": False, "result": "done"}) == "run.completed"
+
+
+# ----------------------------------------------- claude result: valid success envelope only (item 10)
+
+def test_claude_result_is_error_false_without_result_fails():
+    # is_error=false but no result string at all -> fail closed.
+    assert _result_type({"is_error": False}) == "run.failed"
+
+
+def test_claude_result_wrong_result_type_fails():
+    # result must be a string; a dict/number is not a valid result envelope.
+    assert _result_type({"is_error": False, "result": {"nested": 1}}) == "run.failed"
+    assert _result_type({"subtype": "success", "result": 42}) == "run.failed"
+
+
+def test_claude_result_conflicting_success_but_is_error_true_fails():
+    assert _result_type({"subtype": "success", "is_error": True, "result": "ok"}) == "run.failed"
+
+
+def test_claude_result_conflicting_error_subtype_but_is_error_false_fails():
+    assert _result_type(
+        {"subtype": "error_during_execution", "is_error": False, "result": "ok"}
+    ) == "run.failed"
+
+
+def test_claude_result_empty_object_fails():
+    assert _result_type({}) == "run.failed"

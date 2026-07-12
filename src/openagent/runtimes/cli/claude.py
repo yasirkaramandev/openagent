@@ -176,22 +176,43 @@ def _map_result(obj: dict[str, Any], ev) -> list[NormalizedEvent]:
 
 
 def _result_terminal(obj: dict[str, Any], ev) -> NormalizedEvent:
-    """Decide the terminal event for a Claude ``result`` object — fail closed (item 7).
+    """Decide the terminal event for a Claude ``result`` object — fail closed (items 7, 10).
 
-    Success is only accepted when Claude *explicitly* says so: ``subtype == "success"``, or
-    ``is_error is False``. A missing ``is_error``, an error subtype, an unknown/absent subtype, or
-    a malformed result all map to a failure — an ambiguous result is never counted as completed.
+    A run completes **only** on a well-formed, self-consistent success envelope:
+
+    * ``subtype == "success"`` with ``is_error`` not ``True`` and a string ``result``; or
+    * ``is_error is False`` with **no** subtype and a string ``result``.
+
+    Everything else fails closed: an explicit error (``is_error True`` or an ``error*`` subtype), a
+    **conflict** (``subtype=="success"`` with ``is_error True``, or an ``error*`` subtype with
+    ``is_error False``), a missing/absent ``is_error``, an unknown subtype, a missing or
+    wrong-typed ``result``, or an empty object.
     """
 
     subtype = obj.get("subtype")
     is_error = obj.get("is_error")
-    if subtype == "success" or is_error is False:
-        return ev(EventType.RUN_COMPLETED, result=obj.get("result", ""))
+    result = obj.get("result")
+    result_ok = isinstance(result, str)  # present and a string (absent/dict/number is not valid)
+
+    # Any explicit error signal wins — including a conflict (error subtype while is_error is False,
+    # or is_error True while subtype claims success).
     if is_error is True or (isinstance(subtype, str) and subtype.startswith("error")):
         return ev(EventType.RUN_FAILED, error_type="claude_error",
-                  message=obj.get("result") or f"claude reported {subtype or 'error'}")
-    # Neither an explicit success nor an explicit error: treat the ambiguous/malformed result as a
-    # failure rather than silently completing.
+                  message=(result if isinstance(result, str) and result else None)
+                  or f"claude reported {subtype or 'error'}")
+
+    if subtype == "success":
+        if result_ok:
+            return ev(EventType.RUN_COMPLETED, result=result)
+        return ev(EventType.RUN_FAILED, error_type="malformed_result",
+                  message="claude reported success but no valid result string")
+    if is_error is False and subtype is None:
+        if result_ok:
+            return ev(EventType.RUN_COMPLETED, result=result)
+        return ev(EventType.RUN_FAILED, error_type="malformed_result",
+                  message="claude is_error=false but no valid result string")
+
+    # Neither an explicit success nor an explicit error: ambiguous/unknown -> fail closed.
     return ev(EventType.RUN_FAILED, error_type="ambiguous_result",
               message="claude result was ambiguous (no explicit success/is_error)")
 
