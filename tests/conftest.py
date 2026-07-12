@@ -11,6 +11,39 @@ from openagent.config import Paths, ensure_dirs
 from openagent.storage.db import Database
 from openagent.storage.repositories import Repositories
 
+try:
+    import keyring
+    from keyring.backend import KeyringBackend
+
+    class _MemoryKeyring(KeyringBackend):
+        """An in-memory keyring so tests never touch the real OS keychain and behave the same on
+        headless CI (which has no backend)."""
+
+        priority = 1  # type: ignore[assignment]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._store: dict[tuple[str, str], str] = {}
+
+        def get_password(self, service: str, username: str) -> str | None:
+            return self._store.get((service, username))
+
+        def set_password(self, service: str, username: str, password: str) -> None:
+            self._store[(service, username)] = password
+
+        def delete_password(self, service: str, username: str) -> None:
+            self._store.pop((service, username), None)
+except Exception:  # pragma: no cover - keyring always present as a dependency
+    keyring = None  # type: ignore[assignment]
+    _MemoryKeyring = None  # type: ignore[assignment,misc]
+
+
+@pytest.fixture(autouse=True)
+def _memory_keyring() -> None:
+    """Use an isolated in-memory keyring for every test."""
+    if keyring is not None and _MemoryKeyring is not None:
+        keyring.set_keyring(_MemoryKeyring())
+
 
 @pytest.fixture()
 def database() -> Database:

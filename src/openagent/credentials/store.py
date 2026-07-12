@@ -90,7 +90,10 @@ class CredentialStore:
         if ref.type is CredentialType.KEYCHAIN:
             if keyring is None:
                 raise CredentialError("keyring backend unavailable")
-            return keyring.get_password(ref.service or self.service, ref.account or "")
+            try:
+                return keyring.get_password(ref.service or self.service, ref.account or "")
+            except Exception:  # noqa: BLE001 - no usable backend (headless CI/servers): treat as "no key"
+                return None
         raise CredentialError(f"unknown credential type {ref.type!r}")
 
     def available(self, ref: CredentialRef) -> bool:
