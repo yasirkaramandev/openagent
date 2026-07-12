@@ -68,3 +68,61 @@ async def test_error(httpx_mock: HTTPXMock):
     result = await collect(make_adapter().stream_response(req()))
     assert result.is_error
     assert result.error_type == "permission_denied"
+
+
+# --------------------------------------------------------------------------- incomplete (item 8)
+
+async def test_incomplete_max_tokens_is_context_limit(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(json={
+        "id": "resp_i", "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}],
+        "usage": {"input_tokens": 6, "output_tokens": 16},
+    })
+    result = await collect(make_adapter().stream_response(req()))
+    assert result.is_error
+    assert result.error_type == "context_limit"
+
+
+async def test_incomplete_content_filter_maps_to_content_filtered(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(json={
+        "id": "resp_i2", "status": "incomplete",
+        "incomplete_details": {"reason": "content_filter"}, "output": [],
+    })
+    result = await collect(make_adapter().stream_response(req()))
+    assert result.error_type == "content_filtered"
+
+
+async def test_incomplete_other_reason_is_incomplete_response(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(json={
+        "id": "resp_i3", "status": "incomplete",
+        "incomplete_details": {"reason": "something_else"}, "output": [],
+    })
+    result = await collect(make_adapter().stream_response(req()))
+    assert result.error_type == "incomplete_response"
+
+
+async def test_incomplete_does_not_surface_tool_calls(httpx_mock: HTTPXMock):
+    # A truncated response may contain a partial function_call — it must not be executed.
+    httpx_mock.add_response(json={
+        "id": "resp_i4", "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [{"type": "function_call", "call_id": "fc_x", "name": "run_command",
+                    "arguments": "{"}],
+    })
+    result = await collect(make_adapter().stream_response(req(tools=[{"name": "run_command"}])))
+    assert result.is_error
+    assert result.tool_calls == []
+
+
+async def test_incomplete_streaming_is_error_not_done(httpx_mock: HTTPXMock):
+    sse = (
+        'data: {"type":"response.created","response":{"id":"resp_s"}}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"par"}\n\n'
+        'data: {"type":"response.incomplete","response":{"id":"resp_s","status":"incomplete",'
+        '"incomplete_details":{"reason":"max_output_tokens"}}}\n\n'
+    )
+    httpx_mock.add_response(text=sse, headers={"content-type": "text/event-stream"})
+    result = await collect(make_adapter().stream_response(req(stream=True)))
+    assert result.is_error
+    assert result.error_type == "context_limit"

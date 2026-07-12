@@ -10,6 +10,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..core.errors import ErrorType
 from ..core.events import ModelEventType, NormalizedModelEvent, TokenUsage, ToolCall
 from ..core.models import ModelCapabilities, RemoteModel
 from .base import (
@@ -170,6 +171,9 @@ def _events_from_response(
     events: list[NormalizedModelEvent] = []
     response_id = data.get("id")
     output = data.get("output", [])
+    status = str(data.get("status") or "").lower()
+    incomplete = status == "incomplete"
+    failed = status == "failed"
     if not text_already_streamed:
         text = _extract_text(output)
         if text:
@@ -178,23 +182,60 @@ def _events_from_response(
                     type=ModelEventType.TEXT_DELTA, text=text, response_id=response_id
                 )
             )
-    for item in output:
-        if item.get("type") == "function_call":
-            events.append(
-                NormalizedModelEvent(
-                    type=ModelEventType.TOOL_CALL,
-                    tool_call=ToolCall(
-                        id=item.get("call_id") or item.get("id") or "call_0",
-                        name=item.get("name", ""),
-                        arguments=_loads(item.get("arguments", "")),
-                    ),
-                    response_id=response_id,
+    # Do not surface tool calls from a truncated/failed response — acting on a partial function
+    # call is unsafe. Only a genuine completion produces tool calls.
+    if not incomplete and not failed:
+        for item in output:
+            if item.get("type") == "function_call":
+                events.append(
+                    NormalizedModelEvent(
+                        type=ModelEventType.TOOL_CALL,
+                        tool_call=ToolCall(
+                            id=item.get("call_id") or item.get("id") or "call_0",
+                            name=item.get("name", ""),
+                            arguments=_loads(item.get("arguments", "")),
+                        ),
+                        response_id=response_id,
+                    )
                 )
-            )
     if data.get("usage"):
         events.append(NormalizedModelEvent(type=ModelEventType.USAGE, usage=_parse_usage(data["usage"])))
-    events.append(NormalizedModelEvent(type=ModelEventType.DONE, response_id=response_id))
+    # An incomplete or failed response is NOT a successful completion (item 8): emit a normalized
+    # error instead of DONE so the run is not counted as completed.
+    if incomplete:
+        events.append(_incomplete_error(data, response_id))
+    elif failed:
+        events.append(_failed_error(data, response_id))
+    else:
+        events.append(NormalizedModelEvent(type=ModelEventType.DONE, response_id=response_id))
     return events
+
+
+def _incomplete_error(data: dict[str, Any], response_id: str | None) -> NormalizedModelEvent:
+    reason = str((data.get("incomplete_details") or {}).get("reason") or "").lower()
+    if reason in ("max_output_tokens", "max_tokens", "token_limit", "length"):
+        etype = ErrorType.CONTEXT_LIMIT
+    elif reason in ("content_filter", "content_filtering", "safety"):
+        etype = ErrorType.CONTENT_FILTERED
+    else:
+        etype = ErrorType.INCOMPLETE_RESPONSE
+    return NormalizedModelEvent(
+        type=ModelEventType.ERROR, error_type=etype.value, response_id=response_id,
+        error_message=f"response incomplete: {reason or 'unknown reason'}",
+    )
+
+
+def _failed_error(data: dict[str, Any], response_id: str | None) -> NormalizedModelEvent:
+    err = data.get("error") or {}
+    code = str(err.get("code") or "").lower()
+    if "content" in code or "safety" in code:
+        etype = ErrorType.CONTENT_FILTERED
+    else:
+        etype = ErrorType.INVALID_REQUEST
+    return NormalizedModelEvent(
+        type=ModelEventType.ERROR, error_type=etype.value, response_id=response_id,
+        error_message=f"response failed: {err.get('message') or code or 'unknown error'}",
+    )
 
 
 def _extract_text(output: list[dict[str, Any]]) -> str:

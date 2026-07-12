@@ -18,6 +18,9 @@ class ErrorType(str, Enum):
     INSUFFICIENT_BALANCE = "insufficient_balance"
     INVALID_REQUEST = "invalid_request"
     CONTEXT_LIMIT = "context_limit"
+    #: A provider returned a truncated/incomplete result that is not a usable completion (spec §12).
+    INCOMPLETE_RESPONSE = "incomplete_response"
+    CONTENT_FILTERED = "content_filtered"
     TOOL_FAILED = "tool_failed"
     COMMAND_FAILED = "command_failed"
     TEST_FAILED = "test_failed"
