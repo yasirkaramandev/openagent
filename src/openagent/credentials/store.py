@@ -15,13 +15,20 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 from ..core.models import CredentialRef, CredentialType
+from ..security.process import minimal_environment, run_capture
 
 try:  # keyring is optional at import time so unit tests run without a backend
     import keyring
 except Exception:  # pragma: no cover - environment dependent
     keyring = None  # type: ignore[assignment]
+
+#: Hard limits for the external-command credential backend (spec §30, item 9). The timeout bounds a
+#: hung/slow command; the size cap rejects a runaway one. Kept module-level so tests can tighten them.
+CRED_CMD_TIMEOUT_SECONDS = 10
+CRED_CMD_MAX_OUTPUT_BYTES = 16 * 1024
 
 
 class CredentialError(RuntimeError):
@@ -77,16 +84,7 @@ class CredentialStore:
         if ref.type is CredentialType.SESSION:
             return self._session.get(self._session_key(ref))
         if ref.type is CredentialType.EXTERNAL_COMMAND:
-            if not ref.command:
-                raise CredentialError("external-command credential requires command")
-            result = subprocess.run(  # noqa: S603 - user-provided by design
-                ref.command, capture_output=True, text=True, check=False
-            )
-            if result.returncode != 0:
-                raise CredentialError(
-                    f"credential command failed with exit {result.returncode}"
-                )
-            return result.stdout.strip()
+            return self._resolve_external_command(ref)
         if ref.type is CredentialType.KEYCHAIN:
             if keyring is None:
                 raise CredentialError("keyring backend unavailable")
@@ -95,6 +93,45 @@ class CredentialStore:
             except Exception:  # noqa: BLE001 - no usable backend (headless CI/servers): treat as "no key"
                 return None
         raise CredentialError(f"unknown credential type {ref.type!r}")
+
+    def _resolve_external_command(self, ref: CredentialRef) -> str:
+        """Run a user-provided command that prints a secret — sandboxed (spec §30, item 9).
+
+        Hardening: ``shell=False`` with a structured argv, a **minimal environment** (the parent's
+        secrets — including other API keys — are not inherited), a strict timeout with whole
+        process-tree termination on expiry, and a stdout size cap. Failures never echo the command's
+        stdout/stderr (which may itself contain the secret) — only a generic reason is surfaced.
+        """
+
+        if not ref.command:
+            raise CredentialError("external-command credential requires command")
+        argv = list(ref.command)
+        try:
+            result = run_capture(
+                argv, cwd=Path.home(), env=minimal_environment(),
+                timeout=CRED_CMD_TIMEOUT_SECONDS, shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CredentialError(
+                f"credential command timed out after {CRED_CMD_TIMEOUT_SECONDS}s"
+            ) from exc
+        except OSError as exc:
+            # e.g. executable not found — the errno/strerror is safe; the argv might not be.
+            raise CredentialError(f"credential command could not run ({exc.strerror})") from exc
+        if result.returncode != 0:
+            # Deliberately omit stdout/stderr: a failing command may still have printed the secret.
+            raise CredentialError(
+                f"credential command failed with exit {result.returncode}"
+            )
+        out = result.stdout or ""
+        if len(out.encode("utf-8", errors="replace")) > CRED_CMD_MAX_OUTPUT_BYTES:
+            raise CredentialError(
+                f"credential command output exceeds {CRED_CMD_MAX_OUTPUT_BYTES} bytes"
+            )
+        secret = out.strip()
+        if not secret:
+            raise CredentialError("credential command produced no output")
+        return secret
 
     def available(self, ref: CredentialRef) -> bool:
         try:

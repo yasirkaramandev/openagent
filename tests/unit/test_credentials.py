@@ -1,5 +1,17 @@
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+import openagent.credentials.store as store_mod
 from openagent.core.models import CredentialRef, CredentialType
-from openagent.credentials.store import CredentialStore
+from openagent.credentials.store import CredentialError, CredentialStore
+
+
+def _cmd_ref(*code_or_argv: str, py: bool = True) -> CredentialRef:
+    argv = [sys.executable, "-c", *code_or_argv] if py else list(code_or_argv)
+    return CredentialRef(type=CredentialType.EXTERNAL_COMMAND, command=argv)
 
 
 def test_env_credential_resolves(monkeypatch):
@@ -55,7 +67,73 @@ def test_keychain_resolve_survives_backend_failure(monkeypatch):
     assert store.resolve(ref) is None
 
 
-def test_external_command_credential():
+# --------------------------------------------------------------------------- external command (item 9)
+
+def test_external_command_credential_succeeds():
     store = CredentialStore()
-    ref = CredentialRef(type=CredentialType.EXTERNAL_COMMAND, command=["printf", "cmd-secret"])
-    assert store.resolve(ref) == "cmd-secret"
+    assert store.resolve(_cmd_ref("print('cmd-secret')")) == "cmd-secret"
+
+
+def test_external_command_does_not_inherit_parent_secrets(monkeypatch):
+    """The parent's secret env (e.g. another API key) is not exposed to the command (minimal env)."""
+    monkeypatch.setenv("SECRET_LEAK", "topsecret")
+    store = CredentialStore()
+    ref = _cmd_ref("import os; print(os.environ.get('SECRET_LEAK', ''))")
+    # SECRET_LEAK is not in the minimal env, so the command prints nothing -> empty is rejected.
+    with pytest.raises(CredentialError) as exc:
+        store.resolve(ref)
+    assert "topsecret" not in str(exc.value)
+
+
+def test_external_command_empty_output_is_error():
+    store = CredentialStore()
+    with pytest.raises(CredentialError, match="no output"):
+        store.resolve(_cmd_ref("pass"))
+
+
+def test_external_command_nonzero_exit_is_error():
+    store = CredentialStore()
+    with pytest.raises(CredentialError, match="exit 3"):
+        store.resolve(_cmd_ref("import sys; print('x'); sys.exit(3)"))
+
+
+def test_external_command_error_output_not_leaked():
+    store = CredentialStore()
+    with pytest.raises(CredentialError) as exc:
+        store.resolve(_cmd_ref("import sys; sys.stderr.write('sk-LEAKED-SECRET'); sys.exit(1)"))
+    assert "sk-LEAKED-SECRET" not in str(exc.value)
+
+
+def test_external_command_excessive_output_is_rejected():
+    store = CredentialStore()
+    with pytest.raises(CredentialError, match="exceeds"):
+        store.resolve(_cmd_ref("print('A' * (20 * 1024))"))
+
+
+def test_external_command_timeout_is_error(monkeypatch):
+    monkeypatch.setattr(store_mod, "CRED_CMD_TIMEOUT_SECONDS", 1)
+    store = CredentialStore()
+    with pytest.raises(CredentialError, match="timed out"):
+        store.resolve(_cmd_ref("import time; time.sleep(30)"))
+
+
+def test_external_command_timeout_kills_child_process(tmp_path: Path, monkeypatch):
+    """On timeout the whole process tree is terminated — a spawned child never survives to run."""
+    monkeypatch.setattr(store_mod, "CRED_CMD_TIMEOUT_SECONDS", 1)
+    marker = tmp_path / "child.marker"
+    child = tmp_path / "child.py"
+    child.write_text(
+        f"import time, pathlib\ntime.sleep(4)\npathlib.Path(r'{marker}').write_text('x')\n",
+        encoding="utf-8",
+    )
+    parent = (
+        f"import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, r'{child}'])\n"
+        f"time.sleep(30)\n"
+    )
+    store = CredentialStore()
+    with pytest.raises(CredentialError, match="timed out"):
+        store.resolve(_cmd_ref(parent))
+    # Give the child longer than its own 4s sleep to (not) write the marker; the tree kill prevents it.
+    time.sleep(5)
+    assert not marker.exists(), "spawned child survived the timeout kill"
