@@ -11,11 +11,12 @@ OpenAgent unifies two kinds of AI backends behind a single terminal UI, CLI, and
 1. **API agents** — OpenAI, Anthropic, DeepSeek, Qwen, Kimi, GLM, MiniMax, OpenRouter, Ollama, and
    any OpenAI-/Anthropic-compatible endpoint. These only emit text and tool calls, so OpenAgent runs
    its **own agent loop** with a safe toolset (read / search / patch / run / test).
-2. **CLI agents** — Codex CLI, Claude Code, and more. These have their own loops; OpenAgent runs them
-   as subprocesses and **normalizes their output** into one event stream.
+2. **CLI agents** — Codex CLI, Claude Code, Antigravity (`agy`), and more. These have their own
+   loops; OpenAgent runs them as subprocesses and **normalizes their output** into one event stream.
 
-Whichever backend does the work, every run produces the **same standard artifact bundle** in an
-isolated git worktree — that standardization is the point.
+Whichever backend does the work, every run produces the **same standard artifact bundle**. Each run
+executes in an isolated **Git worktree**, an isolated **directory copy** (non-git projects), or an
+**explicitly confirmed in-place** workspace — that standardization is the point.
 
 ```
 .openagent/runs/run_01ABC/
@@ -26,9 +27,9 @@ isolated git worktree — that standardization is the point.
 ## Status
 
 **v0.1 (alpha).** Working core: TUI + CLI, OpenAI (Chat + Responses) / Anthropic / generic
-OpenAI-compatible API agents with a tool loop, CLI adapters (Codex, Claude Code), isolated
-worktrees, permission profiles, OS-keychain credentials, and the standard run bundle. See
-[ROADMAP.md](ROADMAP.md) for what's next.
+OpenAI-compatible API agents with a tool loop, CLI adapters (Codex, Claude Code, Antigravity),
+worktree/copy/in-place isolation, permission profiles, OS-keychain credentials, and the standard run
+bundle. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ### Maturity — what's actually verified
 
@@ -36,12 +37,13 @@ We try to be precise about what is proven vs. pending, so nothing here is overso
 
 | Area | State |
 |---|---|
-| API agents (OpenAI Chat/Responses, Anthropic, OpenAI-compatible) | Offline-tested end to end (mocked HTTP): tool loop, worktree diff, artifacts, redaction. Not yet exercised against a paid live key in CI. |
+| API agents (OpenAI Chat/Responses, Anthropic, OpenAI-compatible) | Adapter implemented; offline-tested end to end (mocked HTTP): tool loop, worktree diff, artifacts, redaction. **Live-unverified** — not yet exercised against a paid live key in CI. Presets for DeepSeek/Qwen/Kimi/GLM/MiniMax/OpenRouter/Mistral/Together/Fireworks/Ollama/LM Studio share the OpenAI/Anthropic-compatible adapters but are **not individually live-verified**. |
 | **Codex CLI** | Event schema validated **live** against `codex-cli 0.142.5`; the full run/cancel/terminal-state pipeline is exercised via a real-subprocess fake-CLI harness. A **successful real model turn is pending account/usage-limit availability**. |
 | **Claude Code** | **Fixture-validated** — the `stream-json` mapping and invocation are ready, but not yet run against an installed `claude` on this machine. Treat as unverified against a live CLI. |
-| TUI (dashboard, agents, providers, add/edit agent, run, approvals) | Pilot-tested against **Textual 8.2.8**, including **real keyboard-driven** dropdown selection (open overlay + arrow keys, not just `.value` assignment): creating Codex/Claude agents, the unified API onboarding (reuse a saved connection *or* connect a new API — key, Test Connection, Load Models — inside Add Agent), empty-selection handling (no crash, inline "Choose a CLI"), validation, provider add, and the approval modal. Every `Select` empty state is normalised so no Textual sentinel reaches a service or model. |
-| Security (minimal env, command allowlist, worktree isolation, redaction, process-tree cancel) | Unit + integration tested (see `tests/`). |
-| **AGY** | **Not part of v0.1.** |
+| **Antigravity (`agy`)** | **Verified live** against `agy v1.1.0`: `--print --output-format json` result envelope and `--conversation` resume were captured from the real CLI (`tests/fixtures/antigravity_print.jsonl`), and the full OpenAgent→agy pipeline (session capture, usage, one terminal event) was run end to end. Output is a single final JSON object, so events are **coarse** (final text + usage + status), not per-file/per-command. Failure/cancel envelope shapes are inferred (fail-closed), not captured live. |
+| TUI Add-Agent **wizard** | Backend-first multi-step wizard (Backend → CLI/Provider → Connection → Agent details) on **Textual 8.2.8**, pilot-tested with **real keyboard-driven** radio/list selection (not `.value` assignment): CLI path (Codex/Claude/Antigravity, incl. unavailable-CLI handling), API path (provider cards, new/existing connection, masked key, missing-key inline error, local no-key providers), Back/Continue navigation preserving non-secret input, and Cancel. A fixed action bar keeps Continue/Create visible; the API key uses `SecretStr` and never reaches persistence/logs. |
+| TUI (dashboard, agents, providers, run, approvals, ask_user) | Pilot-tested against Textual 8.2.8: agent/provider screens, live run stream, approval modal, and the end-to-end `ask_user` question flow (modal → answer → next model request). Every `Select` empty state is normalised so no Textual sentinel reaches a service or model. |
+| Security (minimal env, command allowlist, worktree/copy/in-place isolation, redaction, process-tree cancel, PID-identity recovery, sandboxed credential commands) | Unit + integration tested (see `tests/`). |
 | **Gemini** | **Not part of v0.1.** |
 
 Everything above except the live-CLI/live-API caveats runs in the **offline test suite in CI**
@@ -67,8 +69,9 @@ openagent init                       # set up local state
 openagent discover                   # detect installed coding CLIs (codex, claude, …)
 openagent doctor                     # system diagnostics
 
-# Register an installed CLI as an agent
+# Register an installed CLI as an agent (codex | claude | antigravity)
 openagent add --name codex-coder --title "Codex Coder" --cli codex --tag coder
+openagent add --name antigravity-coder --title "Antigravity" --cli antigravity --tag coder
 
 # Register an API provider (key is prompted with hidden input, stored in the OS keychain)
 openagent provider add deepseek-main --type deepseek

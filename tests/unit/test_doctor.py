@@ -17,7 +17,7 @@ from openagent.core.models import (
     ProviderConnection,
     RuntimeType,
 )
-from openagent.services.doctor_service import FAIL, WARN
+from openagent.services.doctor_service import FAIL, OK, WARN
 
 
 def _app(tmp_path: Path) -> OpenAgentApp:
@@ -84,3 +84,23 @@ async def test_env_credential_var_set_is_ok(tmp_path: Path, monkeypatch: pytest.
                      credential_source="env")
     checks = _checks_by_name(await oa.doctor.run())
     assert checks["Credential: ds"].status not in (FAIL, WARN)
+
+
+async def test_doctor_reports_all_cli_runtimes(tmp_path: Path):
+    """Doctor reports every known CLI runtime — including Antigravity — with an install line and,
+    when installed, an adapter-status line that never claims readiness from a mere binary (item 18)."""
+    oa = _app(tmp_path)
+    names = {c.name for c in await oa.doctor.run()}
+    for cli in ("Codex CLI", "Claude Code", "Antigravity"):
+        assert f"{cli} installed" in names
+
+
+async def test_doctor_antigravity_status_line_when_installed(tmp_path: Path):
+    """When Antigravity is installed, the adapter-status line distinguishes structured output +
+    resume support from mere detection (item 18). Skips cleanly when agy is absent on this host."""
+    oa = _app(tmp_path)
+    checks = _checks_by_name(await oa.doctor.run())
+    if "Antigravity installed" in checks and checks["Antigravity installed"].status == OK:
+        status = checks["Antigravity adapter status"]
+        assert "structured output: yes" in status.detail
+        assert "resume: yes" in status.detail

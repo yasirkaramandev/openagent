@@ -48,6 +48,7 @@ class CliRegistryEntry:
     version: str | None
     installed: bool
     authenticated: bool | None
+    auth_detail: str
     adapter: str
     structured_events: bool
     resumable: bool
@@ -103,9 +104,11 @@ async def cli_registry_entries() -> list[CliRegistryEntry]:
         install = await adapter.detect()
         caps = await adapter.capabilities()
         authenticated: bool | None = None
+        auth_detail = ""
         if install is not None:
             try:
-                authenticated = (await adapter.inspect_auth()).authenticated
+                auth = await adapter.inspect_auth()
+                authenticated, auth_detail = auth.authenticated, auth.detail
             except Exception:  # noqa: BLE001 - auth probing is best-effort/offline
                 authenticated = None
         entries.append(CliRegistryEntry(
@@ -115,6 +118,7 @@ async def cli_registry_entries() -> list[CliRegistryEntry]:
             version=install.version if install else None,
             installed=install is not None,
             authenticated=authenticated,
+            auth_detail=auth_detail,
             adapter=install.adapter if install else cli_type,
             structured_events=caps.structured_events,
             resumable=caps.resumable,

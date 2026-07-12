@@ -17,9 +17,8 @@ from ..credentials.store import keychain_available
 from ..providers.factory import get_preset
 from ..reporting.openagent_md import render_agents_block
 from ..runtimes.cli.registry import (
-    build_cli_adapter,
     cli_install_status,
-    discover_installed,
+    cli_registry_entries,
     known_cli_types,
 )
 from ..workspaces.worktree import is_git_repo
@@ -73,19 +72,34 @@ class DoctorService:
         return checks
 
     async def _cli_checks(self) -> list[Check]:
+        """Per-CLI readiness for every known runtime — Codex, Claude Code, and Antigravity (item 18).
+
+        For each installed CLI, distinguishes: executable detected, authentication detected,
+        structured-output/resume support, and the adapter's honest verification status (spec §17).
+        A binary being present is never reported as "ready" on its own.
+        """
+
         checks: list[Check] = []
-        installed = {c.type: c for c in await discover_installed()}
-        for cli_type in ("codex", "claude"):
-            install = installed.get(cli_type)
-            if install is None:
-                checks.append(Check(f"{cli_type} CLI installed", WARN, "not found"))
+        for entry in await cli_registry_entries():
+            name = entry.display_name
+            if not entry.installed:
+                checks.append(Check(f"{name} installed", WARN, "not found"))
                 continue
-            checks.append(Check(f"{cli_type} CLI installed", OK, install.version or install.executable))
-            adapter = build_cli_adapter(cli_type, install.executable)
-            auth = await adapter.inspect_auth()
             checks.append(Check(
-                f"{cli_type} authentication", OK if auth.authenticated else WARN, auth.detail
+                f"{name} installed", OK,
+                entry.version or entry.executable or "detected",
             ))
+            checks.append(Check(
+                f"{name} authentication",
+                OK if entry.authenticated else WARN,
+                entry.auth_detail or ("authenticated" if entry.authenticated else "not detected"),
+            ))
+            caps = (
+                f"structured output: {'yes' if entry.structured_events else 'no'}, "
+                f"resume: {'yes' if entry.resumable else 'no'}"
+                f"{' (experimental)' if entry.experimental else ''}"
+            )
+            checks.append(Check(f"{name} adapter status", OK, f"{entry.status_label}; {caps}"))
         return checks
 
     def _provider_checks(self) -> list[Check]:
