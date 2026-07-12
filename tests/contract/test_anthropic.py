@@ -105,8 +105,12 @@ async def test_connection_reachable_on_success(httpx_mock: HTTPXMock):
     assert result.detail == "reachable"
 
 
-def test_minimax_raw_blocks_preserved():
-    """Full assistant content blocks are echoed back verbatim (spec §19)."""
+def test_raw_blocks_echo_hook_when_caller_sets_them():
+    """The experimental raw_blocks hook echoes exact blocks *if a caller provides them* (item 11).
+
+    This does not exercise end-to-end MiniMax fidelity — the API loop does not populate raw_blocks
+    yet (see Message.raw_blocks). It only pins the echo behavior for the day it is wired up.
+    """
     blocks = [{"type": "text", "text": "t"}, {"type": "tool_use", "id": "u1", "name": "f", "input": {}}]
     msg = Message(role=Role.ASSISTANT, raw_blocks=blocks,
                   tool_calls=[ToolCall(id="u1", name="f", arguments={})])

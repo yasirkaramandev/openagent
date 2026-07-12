@@ -2,8 +2,13 @@
 
 Anthropic returns tool calls as ``tool_use`` content blocks; OpenAgent runs the tool and sends the
 result back as a ``tool_result`` block in a new user message. Also used (via base-URL swap) by
-Anthropic-compatible providers like DeepSeek, GLM, and MiniMax. For MiniMax fidelity (spec §19), the
-assistant's full content-block list is preserved on :attr:`Message.raw_blocks` and echoed back.
+Anthropic-compatible providers like DeepSeek, GLM, and MiniMax.
+
+Note (v0.1): :attr:`Message.raw_blocks` is an **experimental, not-yet-wired** hook for full native
+block fidelity (e.g. MiniMax echoing back the exact assistant blocks, spec §19). The echo path below
+honors ``raw_blocks`` *if a caller sets it*, but the API agent loop does **not** populate it today —
+so native block preservation is unverified and must not be relied on. It is either implemented
+end-to-end or dropped in a later milestone; until then treat MiniMax fidelity as best-effort.
 """
 
 from __future__ import annotations
@@ -208,7 +213,7 @@ def _to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
                 }
             )
         elif role == Role.ASSISTANT.value:
-            if msg.raw_blocks is not None:  # preserve exact blocks (spec §19 MiniMax)
+            if msg.raw_blocks is not None:  # experimental hook (item 11): only if a caller set it
                 out.append({"role": "assistant", "content": msg.raw_blocks})
                 continue
             content: list[dict[str, Any]] = []

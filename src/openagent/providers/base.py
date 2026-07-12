@@ -35,8 +35,10 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
-    #: Provider-native content blocks preserved verbatim for fidelity (e.g. MiniMax requires the
-    #: full assistant block list be echoed back — spec §19). Opaque to the loop.
+    #: EXPERIMENTAL (item 11, v0.1): a hook for provider-native content blocks echoed back verbatim
+    #: (e.g. MiniMax's full assistant block list, spec §19). The Anthropic adapter honors this when a
+    #: caller sets it, but the API agent loop does NOT populate it yet — so native fidelity is
+    #: unverified. Do not rely on it; it is either wired end-to-end or removed in a later milestone.
     raw_blocks: list[dict[str, Any]] | None = None
 
 
