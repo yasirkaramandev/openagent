@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -41,9 +42,13 @@ def format_event(event: NormalizedEvent) -> str:
         "tool.failed": f"[red]✗ {d.get('tool', '')}[/red]",
         "command.started": f"[blue]$ {d.get('command', '')}[/blue]",
         "command.completed": f"[blue]$ exit {d.get('exit_code')}[/blue]",
-        "approval.requested": f"[yellow]⚠ approval requested: {d.get('command', '')}[/yellow]",
+        "approval.requested": f"[yellow]⚠ approval requested: {escape(str(d.get('command', '')))}[/yellow]",
         "approval.accepted": "[green]✓ approved[/green]",
         "approval.denied": "[red]✗ denied[/red]",
+        # ask_user questions are distinct from approvals; escape the model/user text (item 13, 16).
+        "question.requested": f"[yellow]❓ {escape((d.get('question') or '').strip()[:120])}[/yellow]",
+        "question.answered": "[green]✓ question answered[/green]",
+        "question.cancelled": "[dim]○ question unanswered[/dim]",
         "file.created": f"[green]+ {d.get('path', '')}[/green]",
         "file.modified": f"[yellow]✎ {d.get('path', '')}[/yellow]",
         "file.deleted": f"[red]- {d.get('path', '')}[/red]",

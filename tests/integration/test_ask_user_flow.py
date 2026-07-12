@@ -75,10 +75,11 @@ async def test_ask_user_answer_reaches_model_and_is_recorded(app: OpenAgentApp, 
     second_body = httpx_mock.get_requests()[1].content.decode()
     assert "use port 8080" in second_body
 
-    # The Q&A is on the event stream.
+    # The Q&A is on the event stream via the dedicated question lifecycle (item 13).
     events = app.runs.output(run.id, "events")
     assert "which port should I use?" in events
-    assert "question_answered" in events
+    assert "question.requested" in events
+    assert "question.answered" in events
 
 
 async def test_ask_user_without_callback_uses_best_judgment(app: OpenAgentApp, httpx_mock: HTTPXMock):

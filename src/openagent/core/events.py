@@ -46,10 +46,14 @@ class EventType(str, Enum):
     FILE_CREATED = "file.created"
     FILE_MODIFIED = "file.modified"
     FILE_DELETED = "file.deleted"
-    # approvals
+    # approvals (reserved for permission decisions only)
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_ACCEPTED = "approval.accepted"
     APPROVAL_DENIED = "approval.denied"
+    # ask_user questions (distinct from approvals, spec §2.1)
+    QUESTION_REQUESTED = "question.requested"
+    QUESTION_ANSWERED = "question.answered"
+    QUESTION_CANCELLED = "question.cancelled"
     # accounting / reliability
     USAGE_UPDATED = "usage.updated"
     RATE_LIMIT_DETECTED = "rate_limit.detected"

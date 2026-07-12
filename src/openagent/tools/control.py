@@ -20,18 +20,22 @@ class TaskFinished(Exception):
 def ask_user(ctx: ToolContext, question: str) -> ToolResult:
     """Ask the interactive user a question and return their answer as the tool result (item 16).
 
-    Under the TUI a real modal opens and the run waits for the answer. In a non-interactive run
-    (no resolver, or the user cancels) the tool falls back to best-judgment and says so. Both the
-    question and the answer are recorded on the event stream, where secret redaction applies.
+    Emits the dedicated **question** lifecycle — ``question.requested`` → ``question.answered`` /
+    ``question.cancelled`` — never ``approval.requested``, which stays reserved for permission
+    decisions (item 13). Under the TUI a real modal opens and the run waits for the answer; in a
+    non-interactive run (no resolver, or the user cancels) the tool emits ``question.cancelled`` and
+    falls back to best judgment. The question and answer are recorded on the event stream, where
+    secret redaction applies before anything hits disk (spec §30).
     """
 
     if ctx.emit:
-        ctx.emit("approval.requested", {"kind": "question", "question": question})
+        ctx.emit("question.requested", {"question": question})
 
     answer = ctx.ask_user_callback(question) if ctx.ask_user_callback is not None else None
     if answer is None or not answer.strip():
+        reason = "no interactive user available" if ctx.ask_user_callback is None else "cancelled"
         if ctx.emit:
-            ctx.emit("log", {"kind": "question_unanswered", "question": question})
+            ctx.emit("question.cancelled", {"question": question, "reason": reason})
         return ToolResult.success(
             "No interactive user is available; proceed with your best judgment and note assumptions.",
             question=question, answered=False,
@@ -39,8 +43,7 @@ def ask_user(ctx: ToolContext, question: str) -> ToolResult:
 
     answer = answer.strip()
     if ctx.emit:
-        # Redaction is applied by the event log before this hits disk (spec §30).
-        ctx.emit("log", {"kind": "question_answered", "question": question, "answer": answer})
+        ctx.emit("question.answered", {"question": question, "answer": answer})
     return ToolResult.success(answer, question=question, answered=True)
 
 
