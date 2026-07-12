@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -89,6 +90,45 @@ class ProviderService:
         # has no recognizable prefix (spec §30).
         register_secret(api_key)
         return build_adapter(provider, api_key)
+
+    async def test_config(
+        self,
+        *,
+        provider_type: str,
+        protocol: Protocol | None = None,
+        base_url: str | None = None,
+        anthropic_base_url: str | None = None,
+        region: str | None = None,
+        workspace_id: str | None = None,
+        api_key: str | None = None,
+        key_env: str | None = None,
+    ) -> HealthResult:
+        """Test a would-be provider *before* saving it (spec §31 Test Connection).
+
+        Builds a transient adapter from the supplied fields and key — nothing is persisted and the
+        key is never stored or echoed back.
+        """
+
+        preset = get_preset(provider_type)
+        resolved_protocol = protocol or (preset.protocol if preset else Protocol.OPENAI_CHAT)
+        provider = ProviderConnection(
+            id="provider__transient", name="__transient", provider_type=provider_type,
+            protocol=resolved_protocol, base_url=base_url, anthropic_base_url=anthropic_base_url,
+            region=region, workspace_id=workspace_id, credential=CredentialRef(type=CredentialType.NONE),
+        )
+        key = api_key or (os.environ.get(key_env) if key_env else None)
+        register_secret(key)
+        try:
+            resolve_base_url(provider)
+        except ValueError as exc:
+            return HealthResult(ok=False, detail=str(exc))
+        adapter = build_adapter(provider, key)
+        try:
+            return await adapter.test_connection()
+        except Exception as exc:  # noqa: BLE001 - surface any failure as an unhealthy result
+            return HealthResult(ok=False, detail=str(exc))
+        finally:
+            await _maybe_close(adapter)
 
     async def test(self, name: str) -> HealthResult:
         provider = self.get(name)

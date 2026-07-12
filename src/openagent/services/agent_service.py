@@ -53,6 +53,34 @@ class AgentService:
         self.sync_openagent_md()
         return agent
 
+    def update(
+        self,
+        name: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        tags: list[str] | None = None,
+        system_prompt: str | None = None,
+        permission_profile: str | None = None,
+    ) -> AgentProfile:
+        """Update mutable fields of an existing agent (runtime/name are immutable)."""
+
+        agent = self.repos.agents.get(name)
+        if not agent:
+            raise AgentError(f"agent {name!r} not found")
+        if permission_profile is not None:
+            get_profile(permission_profile)  # validate
+        updates = {
+            k: v for k, v in {
+                "title": title, "description": description, "tags": tags,
+                "system_prompt": system_prompt, "permission_profile": permission_profile,
+            }.items() if v is not None
+        }
+        updated = agent.model_copy(update=updates)
+        self.repos.agents.upsert(updated)
+        self.sync_openagent_md()
+        return updated
+
     def list(self) -> Sequence[AgentProfile]:
         return self.repos.agents.list()
 

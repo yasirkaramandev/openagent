@@ -143,19 +143,28 @@ def runs(limit: int = typer.Option(20, "--limit")) -> None:
 def run(
     name: str = typer.Option(..., "--name", help="Agent name."),
     prompt: str = typer.Option(..., "--prompt", "-p"),
-    worktree: str = typer.Option("auto", "--worktree", help="auto | none"),
+    worktree: str = typer.Option("auto", "--worktree", help="auto | none | copy"),
     profile: str | None = typer.Option(None, "--profile"),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Approve high-risk operations non-interactively (records approval events).",
+    ),
 ) -> None:
-    """Run an agent on a task (spec §32)."""
+    """Run an agent on a task (spec §32).
+
+    Approvals: without --yes a non-interactive run denies high-risk operations by default.
+    """
     oa = _app()
     oa.runs.recover_orphans()
     try:
         run_obj = oa.runs.create(agent_name=name, prompt=prompt, worktree=worktree,
-                                 permission_profile=profile)
+                                 permission_profile=profile, confirm_in_place=yes)
     except RunError as exc:
         _fail(str(exc))
     console.print(f"[dim]run {run_obj.id} starting…[/dim]")
-    result = _run(oa.runs.execute(run_obj, on_event=_print_event))
+    # A non-interactive CLI has no human to prompt: --yes approves, otherwise deny (never silent).
+    approval = (lambda _req: True) if yes else None
+    result = _run(oa.runs.execute(run_obj, on_event=_print_event, approval_callback=approval))
     status = result.status if isinstance(result.status, str) else result.status.value
     color = "green" if status == "completed" else "red"
     console.print(f"\n[{color}]● {status}[/{color}] — run {result.id}")

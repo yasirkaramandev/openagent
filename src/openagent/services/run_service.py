@@ -22,7 +22,7 @@ from ..reporting.artifacts import ArtifactWriter, RunArtifacts, TestSummary
 from ..runtimes.api_agent.loop import run_api_agent
 from ..runtimes.cli.base import CliAdapter, CliRunRequest
 from ..runtimes.cli.registry import build_cli_adapter
-from ..security.approvals import ApprovalGate
+from ..security.approvals import ApprovalCallback, ApprovalGate
 from ..security.process import is_pid_alive, pid_identity, terminate_pid_tree
 from ..storage.event_log import EventLog
 from ..tools.base import ToolContext
@@ -99,7 +99,10 @@ class RunService:
 
     # ------------------------------------------------------------------ execution
 
-    async def execute(self, run: Run, on_event: EventHook | None = None) -> Run:
+    async def execute(
+        self, run: Run, on_event: EventHook | None = None,
+        approval_callback: ApprovalCallback | None = None,
+    ) -> Run:
         agent = self.repos.agents.get(run.agent)
         if not agent:
             raise RunError(f"agent {run.agent!r} not found")
@@ -140,7 +143,7 @@ class RunService:
         try:
             rtype = agent.runtime.type
             if rtype is RuntimeType.API_AGENT or rtype == RuntimeType.API_AGENT.value:
-                await self._run_api(run, agent, workspace.root, sink, art, state)
+                await self._run_api(run, agent, workspace.root, sink, art, state, approval_callback)
             else:
                 await self._run_cli(run, agent, workspace.root, sink, state)
         except Exception as exc:  # noqa: BLE001 - convert to a failed run
@@ -187,7 +190,8 @@ class RunService:
         if etype in (EventType.RUN_STARTED.value, EventType.SESSION_CREATED.value):
             self.repos.runs.upsert(run)
 
-    async def _run_api(self, run, agent, root: Path, sink, art, state) -> None:
+    async def _run_api(self, run, agent, root: Path, sink, art, state,
+                       approval_callback: ApprovalCallback | None = None) -> None:
         provider = self.repos.providers.get_by_name(agent.runtime.provider or "")
         if not provider:
             raise RunError(f"provider {agent.runtime.provider!r} not found")
@@ -204,8 +208,8 @@ class RunService:
         ctx = ToolContext(
             workspace_root=root, profile=profile,
             approval_gate=ApprovalGate(
-                auto_approve=not profile.require_approval_for_destructive, emit=tool_emit,
-                run_id=run.id,
+                auto_approve=not profile.require_approval_for_destructive,
+                callback=approval_callback, emit=tool_emit, run_id=run.id,
             ),
             run_id=run.id, emit=tool_emit,
         )
