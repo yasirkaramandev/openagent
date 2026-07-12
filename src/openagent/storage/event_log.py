@@ -8,12 +8,32 @@ recoverable if the DB is lost, and easy to stream. The SQLite ``events`` table s
 from __future__ import annotations
 
 import json
+import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 from ..core.events import NormalizedEvent
 from ..credentials.redaction import redact_mapping
 from .repositories import EventIndexRepository
+
+_IS_WINDOWS = sys.platform.startswith("win")
+
+
+def _secure_dir(path: Path) -> None:
+    if not _IS_WINDOWS:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:  # pragma: no cover - platform dependent
+            pass
+
+
+def _secure_file(path: Path) -> None:
+    if not _IS_WINDOWS:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:  # pragma: no cover - platform dependent
+            pass
 
 
 class EventLog:
@@ -25,10 +45,20 @@ class EventLog:
         self.index = index
 
     def append(self, event: NormalizedEvent) -> NormalizedEvent:
+        # events.jsonl can hold sensitive material (prompts, diffs); give it the same owner-only
+        # permissions ArtifactWriter uses — run dir 0700, file 0600 (item 13). chmod on every
+        # append is idempotent, so the mode is preserved as the file grows.
+        first_write = not self.path.exists()
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        _secure_dir(self.run_dir)
         safe = event.model_copy(update={"data": redact_mapping(event.data)})
+        if first_write:
+            # Create with restrictive perms *before* writing the first (possibly secret) line.
+            self.path.touch()
+            _secure_file(self.path)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(safe.to_json_line() + "\n")
+        _secure_file(self.path)
         if self.index is not None:
             seq = self.index.next_seq(safe.run_id)
             type_ = safe.type if isinstance(safe.type, str) else safe.type.value
