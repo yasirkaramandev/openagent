@@ -47,6 +47,7 @@ class AgentService:
         tags: list[str] | None = None,
         system_prompt: str = "",
         permission_profile: str = "safe-edit",
+        max_steps: int = 40,
     ) -> AgentProfile:
         # Reject non-string bindings *before* Pydantic so a leaked Textual sentinel (Select.NULL)
         # or any other non-string never reaches AgentRuntime and blows up with a raw ValidationError.
@@ -70,6 +71,7 @@ class AgentService:
             name=name, title=title, description=description,
             runtime=AgentRuntime(type=runtime_type, provider=provider, model=model, cli=cli),
             tags=tags or [], system_prompt=system_prompt, permission_profile=permission_profile,
+            max_steps=max_steps,
         )
         self.repos.agents.upsert(agent)
         try:

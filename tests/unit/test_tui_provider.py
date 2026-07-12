@@ -69,7 +69,8 @@ async def test_save_provider_then_available_in_add_agent(tmp_path: Path):
         await pilot.pause()
         add = pilot.app.screen
         assert isinstance(add, AddAgentScreen)
-        provider_values = select_option_values(add.query_one("#provider", Select))
+        # Saved connections populate the existing-connection selector on the wizard's API path.
+        provider_values = select_option_values(add.query_one("#existing-provider", Select))
         assert "local-llm" in provider_values
 
 
