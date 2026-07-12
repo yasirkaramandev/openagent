@@ -158,25 +158,64 @@ def pid_identity(pid: int | None) -> float | None:
         return None
 
 
+#: How close two OS create-times must be to be considered the same process (seconds).
+_IDENTITY_TOLERANCE = 1.0
+
+#: Identity classifications for a recorded run PID (spec §45).
+PID_ALIVE = "alive"      # the same process is still running (PID + create-time match)
+PID_GONE = "gone"        # no such PID (or no PID recorded)
+PID_REUSED = "reused"    # PID is live but belongs to a *different* process (create-time differs)
+PID_UNKNOWN = "unknown"  # PID is live but identity can't be verified (no recorded time / denied)
+
+
+def run_process_status(
+    pid: int | None, expected_create_time: float | None, *, tolerance: float = _IDENTITY_TOLERANCE
+) -> str:
+    """Classify a recorded run's process by **PID + start-time identity** (spec §45).
+
+    The shared identity check behind both orphan recovery and cross-process cancellation, so neither
+    ever acts on a process that merely happens to reuse an old PID:
+
+    * ``PID_GONE`` — no PID recorded, or no such process now;
+    * ``PID_ALIVE`` — the PID is live and its create-time matches (same process);
+    * ``PID_REUSED`` — the PID is live but its create-time differs (a *different* process);
+    * ``PID_UNKNOWN`` — the PID is live but identity can't be verified (no recorded create-time, or
+      access to the process is denied). Callers treat this fail-closed (do not touch / orphan).
+    """
+
+    if not pid:
+        return PID_GONE
+    try:
+        actual = psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return PID_GONE
+    except psutil.AccessDenied:  # pragma: no cover - perm dependent
+        return PID_UNKNOWN
+    if expected_create_time is None:
+        return PID_UNKNOWN  # a live PID we can't tie to our run — never claim it as alive
+    return PID_ALIVE if abs(actual - expected_create_time) <= tolerance else PID_REUSED
+
+
 def terminate_pid_tree(
     pid: int | None, expected_create_time: float | None = None, *, grace: float = 3.0
 ) -> bool:
     """Terminate a run's process tree by PID, verifying identity first (spec §45).
 
-    Guards against killing an unrelated process after PID reuse: if ``expected_create_time`` is
-    given it must match the live process's start time (within a small tolerance). Idempotent —
+    Guards against killing an unrelated process after PID reuse: when ``expected_create_time`` is
+    given, the live process's start time must match it (via :func:`run_process_status`). Idempotent —
     returns ``False`` when the process is already gone or fails the identity check.
     """
 
     if not pid:
         return False
-    try:
-        proc = psutil.Process(pid)
-        if expected_create_time is not None:
-            if abs(proc.create_time() - expected_create_time) > 1.0:
-                return False  # PID was reused by a different process — do not touch it
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return False
+    if expected_create_time is not None:
+        if run_process_status(pid, expected_create_time) != PID_ALIVE:
+            return False  # gone, reused, or unverifiable — do not touch it
+    else:
+        try:
+            psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
     terminate_process_tree(pid, grace=grace)
     return True
 

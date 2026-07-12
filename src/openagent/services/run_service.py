@@ -23,7 +23,7 @@ from ..runtimes.api_agent.loop import run_api_agent
 from ..runtimes.cli.base import CliAdapter, CliRunRequest
 from ..runtimes.cli.registry import build_cli_adapter
 from ..security.approvals import ApprovalCallback, ApprovalGate
-from ..security.process import is_pid_alive, pid_identity, terminate_pid_tree
+from ..security.process import PID_ALIVE, pid_identity, run_process_status, terminate_pid_tree
 from ..storage.event_log import EventLog
 from ..tools.base import AskUserResolver, ToolContext
 from ..tools.registry import ToolExecutor
@@ -422,17 +422,27 @@ class RunService:
     # ------------------------------------------------------------------ maintenance
 
     def recover_orphans(self) -> Sequence[str]:
-        """Mark active runs whose process is gone as orphaned (spec §45)."""
+        """Mark active runs whose process is gone (or reused) as orphaned (spec §45).
+
+        Uses **PID + start-time identity** (the same check as cross-process cancellation): a run is
+        only left running when its recorded PID is live *and* its OS create-time still matches. A
+        missing PID, a dead PID, a PID reused by an unrelated process, or a PID whose identity can't
+        be verified all orphan the run — and the reason is recorded — so OpenAgent never adopts or
+        acts on a stranger's process.
+        """
 
         recovered: list[str] = []
         for run in self.repos.runs.list_active():
             if run.id in self._cli_adapters:
                 continue  # still running in this process
-            if not is_pid_alive(run.pid):
-                run.status = RunStatus.ORPHANED
-                run.completed_at = _now()
-                self.repos.runs.upsert(run)
-                recovered.append(run.id)
+            status = run_process_status(run.pid, run.pid_started_at)
+            if status == PID_ALIVE:
+                continue
+            run.status = RunStatus.ORPHANED
+            run.completed_at = _now()
+            run.failure_type = run.failure_type or f"orphaned_pid_{status}"
+            self.repos.runs.upsert(run)
+            recovered.append(run.id)
         return recovered
 
     def output(self, run_id: str, fmt: str = "md") -> str:
