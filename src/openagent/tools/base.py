@@ -33,6 +33,10 @@ class ToolResult:
 #: Signature for the optional event sink a runtime passes so tools can emit fine-grained events.
 EventSink = Callable[[str, dict], None]
 
+#: Resolver for ``ask_user``: given a question, return the user's answer, or ``None`` when no
+#: interactive user is available or they cancelled (the tool then falls back to best judgment).
+AskUserResolver = Callable[[str], "str | None"]
+
 
 @dataclass
 class ToolContext:
@@ -43,6 +47,9 @@ class ToolContext:
     approval_gate: ApprovalGate
     run_id: str = ""
     emit: EventSink | None = None
+    #: Resolver that answers ``ask_user`` from a real interactive user (TUI modal). ``None`` in a
+    #: non-interactive run, where ``ask_user`` falls back to best-judgment (item 16).
+    ask_user_callback: AskUserResolver | None = None
     #: Extra environment variables injected into command subprocesses for *this* run only. Empty by
     #: default: an API agent's commands never inherit provider keys or the parent environment
     #: (spec §7). Populate only with credentials a specific operation explicitly needs.

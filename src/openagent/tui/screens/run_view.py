@@ -26,7 +26,7 @@ from ...core.events import NormalizedEvent
 from ...security.approvals import ApprovalRequest
 from ...services.run_service import RunError
 from ..select_utils import selected_string
-from .modals import ApprovalModal
+from .modals import ApprovalModal, QuestionModal
 
 
 def format_event(event: NormalizedEvent) -> str:
@@ -129,9 +129,15 @@ class NewRunScreen(Screen):
             # call_from_thread awaits the coroutine on the UI thread and returns its result.
             return bool(self.app.call_from_thread(self._ask_approval, request))  # type: ignore[arg-type]
 
+        def ask_user(question: str) -> str | None:
+            # Open a real modal on the UI thread and block this worker until the user answers.
+            return self.app.call_from_thread(self._ask_question, question)  # type: ignore[arg-type]
+
         try:
             result = asyncio.run(
-                self.app.oa.runs.execute(run, on_event=on_event, approval_callback=approval)  # type: ignore[attr-defined]
+                self.app.oa.runs.execute(  # type: ignore[attr-defined]
+                    run, on_event=on_event, approval_callback=approval, ask_user_callback=ask_user,
+                )
             )
             status = result.status if isinstance(result.status, str) else result.status.value
             self.app.call_from_thread(
@@ -161,6 +167,19 @@ class NewRunScreen(Screen):
         self.app.push_screen(ApprovalModal(request), resolved)
         await done.wait()
         return holder["approved"]
+
+    async def _ask_question(self, question: str) -> str | None:
+        """Push the question modal on the UI thread and block the run worker until answered."""
+        done = asyncio.Event()
+        holder: dict[str, str | None] = {"answer": None}
+
+        def resolved(value: str | None) -> None:
+            holder["answer"] = value
+            done.set()
+
+        self.app.push_screen(QuestionModal(question), resolved)
+        await done.wait()
+        return holder["answer"]
 
     def action_cancel_run(self) -> None:
         if not self._run_id:

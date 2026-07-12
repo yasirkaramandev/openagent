@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Label, Static
+from textual.widgets import Button, Input, Label, Static
 from textual.widgets.button import ButtonVariant
 
 from ...security.approvals import ApprovalRequest
@@ -88,3 +88,52 @@ class ApprovalModal(ModalScreen[bool]):
 
     def action_deny(self) -> None:
         self.dismiss(False)
+
+
+class QuestionModal(ModalScreen[str | None]):
+    """Ask the interactive user a question during a run (item 16).
+
+    Dismisses with the typed answer, or ``None`` if the user cancels (Esc) — the run then continues
+    with the agent's best judgment.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    QuestionModal { align: center middle; }
+    QuestionModal #box { width: 78; height: auto; border: thick $accent; background: $panel; padding: 1 2; }
+    QuestionModal #q { text-style: bold; padding: 0 0 1 0; }
+    QuestionModal #buttons { height: 3; align-horizontal: right; }
+    QuestionModal Button { margin: 0 0 0 2; }
+    """
+
+    def __init__(self, question: str) -> None:
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Label("The agent is asking:", id="title")
+            yield Static(self.question, id="q")
+            yield Input(placeholder="type your answer", id="answer")
+            with Horizontal(id="buttons"):
+                yield Button("Skip (Esc)", id="cancel")
+                yield Button("Answer", variant="primary", id="ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#answer", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def _submit(self) -> None:
+        value = self.query_one("#answer", Input).value.strip()
+        self.dismiss(value or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

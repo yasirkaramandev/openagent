@@ -25,7 +25,7 @@ from ..runtimes.cli.registry import build_cli_adapter
 from ..security.approvals import ApprovalCallback, ApprovalGate
 from ..security.process import is_pid_alive, pid_identity, terminate_pid_tree
 from ..storage.event_log import EventLog
-from ..tools.base import ToolContext
+from ..tools.base import AskUserResolver, ToolContext
 from ..tools.registry import ToolExecutor
 from ..workspaces.worktree import NONE, STRATEGIES, WorktreeManager
 
@@ -102,6 +102,7 @@ class RunService:
     async def execute(
         self, run: Run, on_event: EventHook | None = None,
         approval_callback: ApprovalCallback | None = None,
+        ask_user_callback: AskUserResolver | None = None,
     ) -> Run:
         agent = self.repos.agents.get(run.agent)
         if not agent:
@@ -148,7 +149,8 @@ class RunService:
             rtype = agent.runtime.type
             if rtype is RuntimeType.API_AGENT or rtype == RuntimeType.API_AGENT.value:
                 await self._run_api(run, agent, workspace.root, sink, art, state,
-                                    approval_callback, workspace.describe_for_agent())
+                                    approval_callback, workspace.describe_for_agent(),
+                                    ask_user_callback)
             else:
                 await self._run_cli(run, agent, workspace.root, sink, state)
         except Exception as exc:  # noqa: BLE001 - convert to a failed run
@@ -199,7 +201,8 @@ class RunService:
 
     async def _run_api(self, run, agent, root: Path, sink, art, state,
                        approval_callback: ApprovalCallback | None = None,
-                       workspace_note: str = "") -> None:
+                       workspace_note: str = "",
+                       ask_user_callback: AskUserResolver | None = None) -> None:
         provider = self.repos.providers.get_by_name(agent.runtime.provider or "")
         if not provider:
             raise RunError(f"provider {agent.runtime.provider!r} not found")
@@ -219,7 +222,7 @@ class RunService:
                 auto_approve=not profile.require_approval_for_destructive,
                 callback=approval_callback, emit=tool_emit, run_id=run.id,
             ),
-            run_id=run.id, emit=tool_emit,
+            run_id=run.id, emit=tool_emit, ask_user_callback=ask_user_callback,
         )
         executor = ToolExecutor(ctx)
         try:
