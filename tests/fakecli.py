@@ -58,6 +58,26 @@ FAKE_SCRIPT = textwrap.dedent(
         emit({"type": "turn.completed", "usage": {"input_tokens": 3, "output_tokens": 2}})
         sys.exit(0)
 
+    if mode == "mutate":
+        # Turn 1: modify an existing file, delete an existing file, create a new one.
+        import os
+        with open("seed.txt", "a") as fh:
+            fh.write("turn1 append\\n")
+        if os.path.exists("todelete.txt"):
+            os.remove("todelete.txt")
+        open("created1.txt", "w").write("created in turn1\\n")
+        emit({"type": "thread.started", "thread_id": "th-fake-m"})
+        emit({"type": "turn.started"})
+        emit({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 3}})
+        sys.exit(0)
+    if mode == "mutate2":
+        # Turn 2 (resume): modify the same file again and create another.
+        with open("seed.txt", "a") as fh:
+            fh.write("turn2 append\\n")
+        open("created2.txt", "w").write("created in turn2\\n")
+        emit({"type": "turn.started"})
+        emit({"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 1}})
+        sys.exit(0)
     if mode == "silent0":
         sys.exit(0)
     if mode == "fail1":

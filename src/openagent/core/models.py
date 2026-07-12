@@ -221,6 +221,12 @@ class Run(BaseModel):
     pid_started_at: float | None = None
     #: Worktree isolation strategy actually used: ``auto`` | ``none`` | ``copy``.
     worktree_strategy: str = "auto"
+    #: Workspace metadata persisted so a resume reconstructs the exact same diff baseline (item 5).
+    is_copy: bool = False
+    in_place: bool = False
+    source_path: str | None = None
+    #: Path to the immutable baseline snapshot for non-git (copy/in-place) diffing; None for git.
+    baseline_dir: str | None = None
     #: How many turns this run has had (1 = initial; incremented by resume/message, spec §32).
     turns: int = 1
     started_at: datetime = Field(default_factory=utcnow)

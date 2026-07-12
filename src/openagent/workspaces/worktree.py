@@ -17,7 +17,7 @@ from __future__ import annotations
 import difflib
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 _IGNORE_DIRS = {".git", ".openagent", ".venv", "node_modules", "__pycache__", ".mypy_cache",
@@ -64,8 +64,12 @@ class Workspace:
     base_commit: str | None = None
     is_copy: bool = False   # True when using an isolated directory copy
     in_place: bool = False  # True for strategy "none" (runs in the source tree directly)
-    #: For copies: content hashes of the source tree at creation, used to compute a diff afterwards.
-    baseline: dict[str, str] = field(default_factory=dict)
+    #: For non-git diffing (copies and in-place non-git runs): an **immutable snapshot** of the
+    #: source tree captured at creation, before the agent touched anything. The diff compares the
+    #: workspace against this snapshot — persisted across resume so the baseline never drifts and a
+    #: resumed turn's created/modified/deleted files are computed correctly (item 5). ``None`` for
+    #: git-diffed runs, which use the base commit instead.
+    baseline_dir: Path | None = None
 
     @property
     def lower_safety(self) -> bool:
@@ -115,10 +119,12 @@ class WorktreeManager:
         git = is_git_repo(self.project_root)
 
         if strategy == NONE:
+            # In a git repo we diff against the base commit; otherwise capture an immutable baseline
+            # snapshot so an in-place run's before/after are never read from the same folder (item 5).
+            baseline_dir = None if git else self._make_baseline(run_id)
             return Workspace(
                 run_id=run_id, root=self.project_root, source=self.project_root,
-                is_git=git, strategy=NONE, in_place=True,
-                baseline={} if git else self._snapshot(self.project_root),
+                is_git=git, strategy=NONE, in_place=True, baseline_dir=baseline_dir,
             )
 
         if strategy == AUTO and git:
@@ -145,10 +151,22 @@ class WorktreeManager:
             self.project_root, target,
             ignore=shutil.ignore_patterns(*_IGNORE_DIRS),
         )
+        # The working copy is the "after"; an immutable baseline snapshot is the "before".
         return Workspace(
             run_id=run_id, root=target, source=self.project_root, is_git=git,
-            strategy=COPY, is_copy=True, baseline=self._snapshot(self.project_root),
+            strategy=COPY, is_copy=True, baseline_dir=self._make_baseline(run_id),
         )
+
+    def _make_baseline(self, run_id: str) -> Path:
+        """Copy the untouched source tree into an immutable baseline snapshot dir (item 5)."""
+
+        baseline = self.worktrees_dir / f"{run_id}__baseline"
+        if baseline.exists():
+            shutil.rmtree(baseline)
+        shutil.copytree(
+            self.project_root, baseline, ignore=shutil.ignore_patterns(*_IGNORE_DIRS),
+        )
+        return baseline
 
     # ------------------------------------------------------------------ inspection
 
@@ -198,10 +216,14 @@ class WorktreeManager:
                 yield Path(dirpath) / name
 
     def _compare(self, ws: Workspace) -> tuple[list[str], list[str], list[str]]:
-        """Return (changed, created, deleted) relative paths for a copy/in-place run."""
+        """Return (changed, created, deleted) relative paths for a copy/in-place run.
+
+        Compares the workspace against the **immutable baseline snapshot** (never the live source),
+        so this is correct on the first run and on every resumed turn (item 5).
+        """
 
         after = self._snapshot(ws.root)
-        before = ws.baseline
+        before = self._snapshot(ws.baseline_dir) if ws.baseline_dir else {}
         created = [p for p in after if p not in before]
         deleted = [p for p in before if p not in after]
         modified = [p for p in after if p in before and after[p] != before[p]]
@@ -210,9 +232,12 @@ class WorktreeManager:
 
     def _text_diff(self, ws: Workspace) -> str:
         changed, created, deleted = self._compare(ws)
+        # "before" always comes from the immutable baseline snapshot, "after" from the workspace —
+        # never the same folder, so an in-place non-git run produces a real diff (item 5).
+        before_root = ws.baseline_dir or ws.source
         chunks: list[str] = []
         for rel in changed:
-            src = ws.source / rel
+            src = before_root / rel
             dst = ws.root / rel
             before = _read_text(src) if rel not in created else ""
             after = _read_text(dst) if rel not in deleted else ""
@@ -229,8 +254,13 @@ class WorktreeManager:
     # ------------------------------------------------------------------ disposition
 
     def discard(self, ws: Workspace) -> None:
-        """Remove the worktree/copy and its branch (spec §28). No-op for in-place runs."""
+        """Remove the worktree/copy and its branch (spec §28). No-op for in-place runs.
 
+        The immutable baseline snapshot (if any) is always cleaned up too.
+        """
+
+        if ws.baseline_dir and ws.baseline_dir.exists():
+            shutil.rmtree(ws.baseline_dir, ignore_errors=True)
         if ws.in_place:
             return
         if ws.is_copy:

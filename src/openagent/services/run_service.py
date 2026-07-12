@@ -117,6 +117,10 @@ class RunService:
         run.worktree_strategy = workspace.strategy
         run.branch = workspace.branch
         run.base_commit = workspace.base_commit
+        run.is_copy = workspace.is_copy
+        run.in_place = workspace.in_place
+        run.source_path = str(workspace.source)
+        run.baseline_dir = str(workspace.baseline_dir) if workspace.baseline_dir else None
         run.status = RunStatus.RUNNING
         self.repos.runs.upsert(run)
 
@@ -340,13 +344,22 @@ class RunService:
         return art, state
 
     def _reconstruct_workspace(self, run: Run):
+        """Rebuild the exact Workspace used for the run so a resumed diff uses the same baseline.
+
+        Restores the persisted copy/in-place flags, source path, and immutable baseline snapshot
+        (item 5) — without them a copy/non-git resume would treat every file as newly created.
+        """
+
         from ..workspaces.worktree import Workspace, is_git_repo
 
         root = Path(run.worktree or run.workspace)
+        source = Path(run.source_path) if run.source_path else self.paths.project_root
+        baseline_dir = Path(run.baseline_dir) if run.baseline_dir else None
         return Workspace(
-            run_id=run.id, root=root, source=self.paths.project_root,
+            run_id=run.id, root=root, source=source,
             is_git=is_git_repo(root), strategy=run.worktree_strategy,
             branch=run.branch, base_commit=run.base_commit,
+            is_copy=run.is_copy, in_place=run.in_place, baseline_dir=baseline_dir,
         )
 
     async def cancel(self, run_id: str) -> None:
