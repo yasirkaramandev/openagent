@@ -93,6 +93,39 @@ async def test_save_key_required_provider_with_no_credential_is_rejected(tmp_pat
         assert isinstance(pilot.app.screen, AddProviderScreen)
 
 
+async def test_provider_test_shortcut_runs_connection_test(tmp_path: Path, monkeypatch):
+    """The advertised 'T test' shortcut is real: it runs a connection test (item 15)."""
+
+    from openagent.providers.base import HealthResult
+    from openagent.tui.screens.lists import ProvidersScreen
+
+    oa = _app(tmp_path)
+    oa.providers.add(name="local-llm", provider_type="ollama", credential_source="none")
+
+    called: dict[str, str] = {}
+
+    async def fake_test(name: str) -> HealthResult:
+        called["name"] = name
+        return HealthResult(ok=True, detail="reachable")
+
+    monkeypatch.setattr(oa.providers, "test", fake_test)
+
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        pilot.app.push_screen(ProvidersScreen())
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert isinstance(screen, ProvidersScreen)
+        # 't' is a real binding (not just title text).
+        assert any(b.key == "t" and b.action == "test" for b in screen.BINDINGS)
+        screen.query_one("#table").focus()
+        await pilot.press("t")
+        await pilot.pause()
+        # Let the worker run.
+        await pilot.pause()
+    assert called.get("name") == "local-llm"
+
+
 async def test_saved_key_never_displayed(tmp_path: Path):
     oa = _app(tmp_path)
     app = OpenAgentTUI(oa)

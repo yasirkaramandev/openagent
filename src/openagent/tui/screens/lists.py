@@ -215,7 +215,9 @@ class ProvidersScreen(_TableScreen):
     title_text = "Providers  ([b]A[/b] add · [b]D[/b] remove · [b]T[/b] test)"
     BINDINGS = _TableScreen.BINDINGS + [
         Binding("a", "add", "Add provider"),
+        Binding("d", "remove", "Remove"),
         Binding("delete", "remove", "Remove"),
+        Binding("t", "test", "Test connection"),
     ]
 
     def populate(self, table: DataTable) -> None:
@@ -248,6 +250,27 @@ class ProvidersScreen(_TableScreen):
 
         self.app.push_screen(ConfirmModal(f"Remove provider [b]{name}[/b]?",
                                           confirm_label="Remove"), callback=done)
+
+    def action_test(self) -> None:
+        """Test the selected provider's connection and report the result (item 15)."""
+
+        table = self.query_one("#table", DataTable)
+        if table.row_count == 0:
+            return
+        name = str(table.get_row_at(table.cursor_row)[0])
+        self.notify(f"testing '{name}'…")
+        self.run_worker(self._test_provider(name), exclusive=True)
+
+    async def _test_provider(self, name: str) -> None:
+        try:
+            result = await self.app.oa.providers.test(name)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - surface any failure as an unhealthy result
+            self.notify(f"✗ {name}: {exc}", severity="error", timeout=8)
+            return
+        if result.ok:
+            self.notify(f"✓ {name}: {result.detail}", severity="information", timeout=6)
+        else:
+            self.notify(f"✗ {name}: {result.detail}", severity="error", timeout=8)
 
 
 class CliToolsScreen(_TableScreen):
