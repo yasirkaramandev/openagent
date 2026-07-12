@@ -19,6 +19,7 @@ from textual.widgets import (
     Static,
     TabbedContent,
     TabPane,
+    TextArea,
 )
 
 from ...core.events import NormalizedEvent
@@ -69,11 +70,14 @@ class NewRunScreen(Screen):
         agents = [(a.name, a.name) for a in self.app.oa.agents.list()]  # type: ignore[attr-defined]
         yield Header()
         yield Static("New Run", classes="screen-title")
+        agent_kwargs: dict = {}
+        if self._preselect and any(value == self._preselect for _, value in agents):
+            agent_kwargs["value"] = self._preselect
         with Horizontal():
             with Vertical(classes="panel"):
                 yield Label("Agent")
-                yield Select(agents, value=self._preselect or Select.BLANK, prompt="select agent",
-                             id="agent", allow_blank=True)
+                yield Select(agents, prompt="select agent", id="agent", allow_blank=True,
+                             **agent_kwargs)
                 yield Label("Prompt")
                 yield Input(placeholder="describe the task", id="prompt")
                 yield Label("Worktree")
@@ -185,14 +189,16 @@ class OutputScreen(Screen):
             for label, fmt in (("Output", "md"), ("Diff", "diff"), ("Logs", "logs"),
                                ("Result", "json"), ("Events", "events")):
                 with TabPane(label, id=f"tab-{fmt}"):
-                    yield RichLog(id=f"log-{fmt}", markup=False, highlight=False, wrap=True)
+                    # Read-only TextArea: holds and scrolls its content regardless of which tab is
+                    # active (a RichLog rendered while hidden would drop its lines).
+                    yield TextArea(id=f"log-{fmt}", read_only=True, soft_wrap=True)
         yield Footer()
 
     def on_mount(self) -> None:
         oa = self.app.oa  # type: ignore[attr-defined]
         for fmt in ("md", "diff", "logs", "json", "events"):
-            widget = self.query_one(f"#log-{fmt}", RichLog)
+            widget = self.query_one(f"#log-{fmt}", TextArea)
             try:
-                widget.write(oa.runs.output(self.run_id, fmt))
+                widget.text = oa.runs.output(self.run_id, fmt)
             except RunError as exc:
-                widget.write(f"(no {fmt} artifact: {exc})")
+                widget.text = f"(no {fmt} artifact: {exc})"
