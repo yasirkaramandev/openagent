@@ -21,7 +21,7 @@ from ..core.models import Protocol, RuntimeType
 from ..core.permissions import profile_names
 from ..providers.factory import PRESETS, preset_names
 from ..services.agent_service import AgentError
-from ..services.provider_service import ProviderValidationError
+from ..services.provider_service import ProviderInUseError, ProviderValidationError
 from ..services.run_service import RunError
 
 app = typer.Typer(
@@ -308,7 +308,11 @@ def provider_models(name: str = typer.Argument(...)) -> None:
 
 @provider_app.command("remove")
 def provider_remove(name: str = typer.Argument(...)) -> None:
-    if _app().providers.remove(name):
+    try:
+        removed = _app().providers.remove(name)
+    except ProviderInUseError as exc:
+        _fail(str(exc))
+    if removed:
         console.print(f"[green]✓[/green] removed provider {name}")
     else:
         _fail(f"provider {name!r} not found")

@@ -37,6 +37,29 @@ def test_provider_add_with_key_env_and_list():
     assert "testco" in listed.stdout
 
 
+def test_provider_add_key_required_no_credential_rejected():
+    # 'no key' for a key-required preset (deepseek) is refused at the service layer.
+    result = runner.invoke(app, ["provider", "add", "ds", "--type", "deepseek", "--no-key"])
+    assert result.exit_code == 1
+    listed = runner.invoke(app, ["provider", "list"])
+    assert "ds" not in listed.stdout
+
+
+def test_provider_remove_refused_when_in_use():
+    add = runner.invoke(app, [
+        "provider", "add", "ds", "--type", "custom",
+        "--base-url", "https://api.test/v1", "--key-env", "DS_KEY",
+    ])
+    assert add.exit_code == 0, add.stdout
+    agent = runner.invoke(app, ["add", "--name", "ds-coder", "--provider", "ds", "--model", "m"])
+    assert agent.exit_code == 0, agent.stdout
+    removed = runner.invoke(app, ["provider", "remove", "ds"])
+    assert removed.exit_code == 1
+    assert "ds-coder" in removed.stdout + str(removed.stderr or "")
+    # Still present.
+    assert "ds" in runner.invoke(app, ["provider", "list"]).stdout
+
+
 def test_add_cli_agent_creates_openagent_md():
     result = runner.invoke(app, [
         "add", "--name", "codex-coder", "--title", "Codex Coder",

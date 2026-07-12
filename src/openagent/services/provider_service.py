@@ -26,6 +26,17 @@ class ProviderValidationError(ValueError):
         self.field = field
 
 
+class ProviderInUseError(ValueError):
+    """Raised when deleting a provider that one or more agents still bind to."""
+
+    def __init__(self, provider: str, agents: Sequence[str]) -> None:
+        self.provider = provider
+        self.agents = list(agents)
+        super().__init__(
+            f"provider {provider!r} is used by agents: {', '.join(self.agents)}"
+        )
+
+
 def resolve_credential(
     *,
     name: str,
@@ -141,10 +152,25 @@ class ProviderService:
     def get(self, name: str) -> ProviderConnection | None:
         return self.repos.providers.get_by_name(name)
 
+    def agents_using(self, name: str) -> Sequence[str]:
+        """Names of agents whose runtime binds to the provider connection ``name``."""
+
+        return [a.name for a in self.repos.agents.list() if a.runtime.provider == name]
+
     def remove(self, name: str) -> bool:
+        """Delete a provider and its keychain secret.
+
+        Refuses (raises :class:`ProviderInUseError`) when any agent still binds to it, so a
+        dependent agent is never left pointing at a missing provider. Returns ``False`` when the
+        provider does not exist.
+        """
+
         provider = self.get(name)
         if not provider:
             return False
+        dependents = self.agents_using(name)
+        if dependents:
+            raise ProviderInUseError(name, dependents)
         if provider.credential.type is CredentialType.KEYCHAIN:
             self.credentials.delete_secret(provider.credential)
         self.repos.providers.delete(provider.id)

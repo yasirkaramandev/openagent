@@ -9,6 +9,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from ...core.models import AgentProfile
+from ...services.provider_service import ProviderInUseError
 
 
 def _runtime_label(a: AgentProfile) -> str:
@@ -237,7 +238,11 @@ class ProvidersScreen(_TableScreen):
 
         def done(confirmed: bool | None) -> None:
             if confirmed:
-                self.app.oa.providers.remove(name)  # type: ignore[attr-defined]
+                try:
+                    self.app.oa.providers.remove(name)  # type: ignore[attr-defined]
+                except ProviderInUseError as exc:
+                    self.notify(str(exc), severity="error", timeout=8)
+                    return
                 self.notify(f"removed provider '{name}'")
                 self.reload()
 
