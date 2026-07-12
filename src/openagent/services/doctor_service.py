@@ -7,13 +7,21 @@ provider network tests are intentionally excluded so doctor stays fast and CI-sa
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ..core.models import CredentialType, RuntimeType
 from ..credentials.store import keychain_available
+from ..providers.factory import get_preset
 from ..reporting.openagent_md import render_agents_block
-from ..runtimes.cli.registry import build_cli_adapter, discover_installed
+from ..runtimes.cli.registry import (
+    build_cli_adapter,
+    cli_install_status,
+    discover_installed,
+    known_cli_types,
+)
 from ..workspaces.worktree import is_git_repo
 
 if TYPE_CHECKING:
@@ -60,6 +68,7 @@ class DoctorService:
 
         checks.extend(await self._cli_checks())
         checks.extend(self._provider_checks())
+        checks.extend(self._agent_checks())
         checks.append(self._openagent_md_check())
         return checks
 
@@ -83,8 +92,63 @@ class DoctorService:
         providers = self.app.repos.providers.list()
         if not providers:
             return [Check("Providers configured", WARN, "no API providers added yet")]
-        names = ", ".join(p.name for p in providers)
-        return [Check("Providers configured", OK, names)]
+        checks: list[Check] = [Check("Providers configured", OK, ", ".join(p.name for p in providers))]
+        for p in providers:
+            checks.append(self._provider_credential_check(p))
+        return checks
+
+    def _provider_credential_check(self, provider) -> Check:
+        """Offline credential health for one provider (item 20) — no network call."""
+
+        name = f"Credential: {provider.name}"
+        cred = provider.credential
+        preset = get_preset(provider.provider_type)
+        needs_key = preset.needs_key if preset else True
+
+        if cred.type is CredentialType.ENV:
+            if not cred.env_var:
+                return Check(name, FAIL, "env credential has no variable name")
+            if os.environ.get(cred.env_var) is None:
+                return Check(name, WARN, f"env var {cred.env_var} is not set")
+            return Check(name, OK, f"env var {cred.env_var} is set")
+        if cred.type is CredentialType.KEYCHAIN:
+            if not self.app.credentials.available(cred):
+                sev = FAIL if needs_key else WARN
+                return Check(name, sev, "no stored key in the keychain")
+            return Check(name, OK, "key present in keychain")
+        if cred.type is CredentialType.NONE:
+            if needs_key:
+                return Check(name, FAIL, "no credential but this provider type requires a key")
+            return Check(name, OK, "no key required")
+        return Check(name, OK, cred.type.value)
+
+    def _agent_checks(self) -> list[Check]:
+        agents = self.app.repos.agents.list()
+        if not agents:
+            return []
+        provider_names = {p.name for p in self.app.repos.providers.list()}
+        installed = {c for c, ok in cli_install_status() if ok}
+        known = set(known_cli_types())
+        checks: list[Check] = []
+        for agent in agents:
+            rt = agent.runtime
+            rtype = rt.type if isinstance(rt.type, str) else rt.type.value
+            label = f"Agent: {agent.name}"
+            if rtype == RuntimeType.API_AGENT.value:
+                if rt.provider not in provider_names:
+                    checks.append(Check(label, FAIL,
+                                        f"references missing provider {rt.provider!r}"))
+                else:
+                    checks.append(Check(label, OK, f"provider {rt.provider!r} present"))
+            else:
+                cli = rt.cli or ""
+                if cli not in known:
+                    checks.append(Check(label, WARN, f"unknown CLI runtime {cli!r}"))
+                elif cli not in installed:
+                    checks.append(Check(label, WARN, f"CLI {cli!r} is not installed"))
+                else:
+                    checks.append(Check(label, OK, f"CLI {cli!r} installed"))
+        return checks
 
     def _openagent_md_check(self) -> Check:
         path = self.app.paths.openagent_md()
