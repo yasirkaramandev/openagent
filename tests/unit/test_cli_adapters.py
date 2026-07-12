@@ -98,7 +98,9 @@ def test_claude_usage_and_cost():
     events = _events_from("claude_stream.jsonl", map_claude_event)
     usage = next(e for e in events if e.type == "usage.updated")
     assert usage.data["input_tokens"] == 1200
-    assert usage.data["cost_usd"] == 0.012
+    # Native total_cost_usd is normalized onto the single provider_cost field (item 12).
+    assert usage.data["provider_cost"] == 0.012
+    assert "cost_usd" not in usage.data
 
 
 # ------------------------------------------------------- claude result success/failure (item 7)

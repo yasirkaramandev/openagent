@@ -74,6 +74,38 @@ def test_orphan_recovery_detects_pid_reuse(app: OpenAgentApp):
         proc.wait()
 
 
+def test_rebuild_artifacts_accumulates_provider_cost(app: OpenAgentApp):
+    """Cumulative usage across turns sums provider_cost: turn1 cost + turn2 cost = total (item 12)."""
+    from openagent.core.events import EventType, NormalizedEvent
+    from openagent.storage.event_log import EventLog
+
+    run = Run(id="run_cost", agent="x", status=RunStatus.RUNNING)
+    app.repos.runs.upsert(run)
+    log = EventLog(app.paths.run_dir(run.id))
+    for cost, inp in ((0.01, 10), (0.02, 3)):
+        log.append(NormalizedEvent(run_id=run.id, type=EventType.USAGE_UPDATED, source="test",
+                                   data={"input_tokens": inp, "cached_input_tokens": 0,
+                                         "output_tokens": 1, "provider_cost": cost}))
+    art, _ = app.runs._rebuild_artifacts(run)
+    assert art.usage["input_tokens"] == 13
+    assert art.usage["provider_cost"] == 0.03
+
+
+def test_rebuild_artifacts_cost_none_when_no_cost_reported(app: OpenAgentApp):
+    """A CLI that reports no cost leaves provider_cost None, not 0 (item 12)."""
+    from openagent.core.events import EventType, NormalizedEvent
+    from openagent.storage.event_log import EventLog
+
+    run = Run(id="run_nocost", agent="x", status=RunStatus.RUNNING)
+    app.repos.runs.upsert(run)
+    log = EventLog(app.paths.run_dir(run.id))
+    log.append(NormalizedEvent(run_id=run.id, type=EventType.USAGE_UPDATED, source="test",
+                               data={"input_tokens": 5, "cached_input_tokens": 0,
+                                     "output_tokens": 2, "provider_cost": None}))
+    art, _ = app.runs._rebuild_artifacts(run)
+    assert art.usage["provider_cost"] is None
+
+
 def test_output_unknown_format_raises(app: OpenAgentApp):
     with pytest.raises(RunError):
         app.runs.output("run_x", "bogus")

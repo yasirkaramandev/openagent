@@ -355,17 +355,24 @@ class RunService:
         art = RunArtifacts()
         state: dict[str, Any] = {"terminal": None}
         event_log = EventLog(self.paths.run_dir(run.id))
-        usage_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        usage_total: dict[str, Any] = {
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+        }
+        cost_total: float | None = None
         saw_usage = False
         for event in event_log.read():
             _capture(event, art, run, state)
             etype = event.type if isinstance(event.type, str) else event.type.value
             if etype == EventType.USAGE_UPDATED.value:
                 saw_usage = True
-                for key in usage_total:
+                for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
                     usage_total[key] += int(event.data.get(key) or 0)
+                cost = event.data.get("provider_cost")
+                if cost is not None:  # cumulative cost across turns (turn1 + turn2 = total, item 12)
+                    cost_total = (cost_total or 0.0) + float(cost)
         # Cumulative usage across every turn (item 18) — overrides _capture's last-turn-only value.
         if saw_usage:
+            usage_total["provider_cost"] = cost_total
             art.usage = usage_total
         return art, state
 
@@ -504,7 +511,8 @@ def _capture(event: NormalizedEvent, art: RunArtifacts | None, run: Run, state: 
                 art.log_lines.append(f"$ {data['command']} -> exit {data.get('exit_code')}")
     elif etype == EventType.USAGE_UPDATED.value:
         if art is not None:
-            art.usage = {k: data.get(k) for k in ("input_tokens", "cached_input_tokens", "output_tokens")}
+            art.usage = {k: data.get(k) for k in
+                         ("input_tokens", "cached_input_tokens", "output_tokens", "provider_cost")}
     elif etype == EventType.RUN_COMPLETED.value:
         state["terminal"] = RunStatus.COMPLETED
         state["emitted_terminal"] = True

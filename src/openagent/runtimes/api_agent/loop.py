@@ -80,6 +80,8 @@ async def run_api_agent(
                 total.input_tokens += event.usage.input_tokens
                 total.cached_input_tokens += event.usage.cached_input_tokens
                 total.output_tokens += event.usage.output_tokens
+                if event.usage.provider_cost is not None:
+                    total.provider_cost = (total.provider_cost or 0.0) + event.usage.provider_cost
                 _emit(EventType.USAGE_UPDATED, **event.usage.model_dump())
             elif event.type == ModelEventType.ERROR:
                 error_type, error_message = event.error_type, event.error_message

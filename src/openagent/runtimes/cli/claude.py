@@ -166,11 +166,12 @@ def _map_stream_event(event: dict[str, Any], ev) -> list[NormalizedEvent]:
 
 def _map_result(obj: dict[str, Any], ev) -> list[NormalizedEvent]:
     usage = obj.get("usage") or {}
+    # Normalize Claude's native ``total_cost_usd`` onto the single ``provider_cost`` field (item 12).
     events = [ev(EventType.USAGE_UPDATED,
                  input_tokens=usage.get("input_tokens", 0),
                  cached_input_tokens=usage.get("cache_read_input_tokens", 0),
                  output_tokens=usage.get("output_tokens", 0),
-                 cost_usd=obj.get("total_cost_usd"))]
+                 provider_cost=obj.get("total_cost_usd"))]
     events.append(_result_terminal(obj, ev))
     return events
 

@@ -87,6 +87,31 @@ async def test_loop_runs_tool_then_finishes(tmp_path: Path):
     assert "message.completed" in types
 
 
+async def test_loop_accumulates_provider_cost_across_turns(tmp_path: Path):
+    """provider_cost is summed across turns into the outcome usage (item 12)."""
+    adapter = ScriptedAdapter([
+        [
+            NormalizedModelEvent(type=ModelEventType.USAGE,
+                                 usage=TokenUsage(input_tokens=10, output_tokens=5, provider_cost=0.01)),
+            NormalizedModelEvent(
+                type=ModelEventType.TOOL_CALL,
+                tool_call=ToolCall(id="c1", name="finish_task", arguments={"summary": "done"}),
+            ),
+            NormalizedModelEvent(type=ModelEventType.DONE),
+        ],
+    ])
+    events: list[NormalizedEvent] = []
+    outcome = await run_api_agent(
+        run_id="r", agent=_agent(), prompt="x", adapter=adapter,
+        executor=_executor(tmp_path), workspace_root=tmp_path, emit=events.append,
+    )
+    assert outcome.completed
+    assert outcome.usage.provider_cost == 0.01
+    usage_ev = next(e for e in events if e.type == "usage.updated")
+    assert usage_ev.data["provider_cost"] == 0.01
+    assert "cost_usd" not in usage_ev.data
+
+
 async def test_loop_finish_task_tool(tmp_path: Path):
     adapter = ScriptedAdapter([
         [
