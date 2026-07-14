@@ -20,10 +20,25 @@ events are available (final text + usage + terminal status), never per-file/per-
 Because the output is one object, the mapper is fail-closed: only an explicit ``SUCCESS`` completes;
 ``CANCELLED`` maps to cancelled; anything else (``ABORTED`` / ``UNKNOWN`` / missing / error) fails. The
 shared ``run_managed_cli`` finalizer then reconciles that against the process exit code (spec §6.2).
+
+**Permissions (item 15).** ``--print`` is non-interactive, so it cannot answer Antigravity's own
+tool-permission prompt; the only way to let it edit is ``--dangerously-skip-permissions``, which
+disables *Antigravity's* checks — and OpenAgent cannot observe Antigravity's internal tool calls to
+compensate. v0.1 therefore refuses to infer that from a ``safe-edit`` profile:
+
+* ``read-only`` → ``--mode plan`` (supported, the default);
+* ``safe-edit`` → editing is **experimental and off** unless ``OPENAGENT_ANTIGRAVITY_EXPERIMENTAL_EDIT``
+  is set;
+* ``development`` / ``full-access`` → the bypass is used only when ``OPENAGENT_ANTIGRAVITY_DANGEROUS_BYPASS``
+  is set, and the run emits a loud warning.
+
+A blocked combination fails at preflight with an actionable reason rather than starting a run that
+silently cannot do what was asked.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -43,12 +58,50 @@ from .base import (
 
 SOURCE = "antigravity-cli"
 
+#: The Antigravity version this adapter's output mapping was captured against (item 16).
+VALIDATED_VERSION = "1.1.0"
+
+#: Opt-in to let Antigravity **edit files** at all. Editing requires
+#: ``--dangerously-skip-permissions`` because ``--print`` is non-interactive and cannot answer
+#: Antigravity's own tool prompt — and that flag turns *Antigravity's* permission checks off while
+#: OpenAgent cannot observe its internal tool calls. So OpenAgent v0.1 does **not** infer it from a
+#: ``safe-edit`` profile (item 15): editing is experimental and must be enabled deliberately.
+EXPERIMENTAL_EDIT_ENV = "OPENAGENT_ANTIGRAVITY_EXPERIMENTAL_EDIT"
+
+#: A second, separate opt-in for the high-risk profiles (development / full-access).
+DANGEROUS_BYPASS_ENV = "OPENAGENT_ANTIGRAVITY_DANGEROUS_BYPASS"
+
+#: Profiles whose semantics need Antigravity's native permission bypass to be honored at all.
+_HIGH_RISK_PROFILES = {"development", "full-access"}
+
+
+class AntigravityPermissionError(RuntimeError):
+    """The requested permission profile needs an Antigravity capability the user has not enabled."""
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 class AntigravityAdapter:
-    def __init__(self, executable: str | None = None) -> None:
+    def __init__(
+        self,
+        executable: str | None = None,
+        *,
+        allow_experimental_edit: bool | None = None,
+        allow_dangerous_bypass: bool | None = None,
+    ) -> None:
         # The official executable is ``agy``; ``antigravity`` is accepted as an alias if present.
         self.executable = executable or find_executable("agy", "antigravity")
         self._processes: dict[str, ManagedProcess] = {}
+        self.allow_experimental_edit = (
+            _env_flag(EXPERIMENTAL_EDIT_ENV) if allow_experimental_edit is None
+            else allow_experimental_edit
+        )
+        self.allow_dangerous_bypass = (
+            _env_flag(DANGEROUS_BYPASS_ENV) if allow_dangerous_bypass is None
+            else allow_dangerous_bypass
+        )
 
     async def detect(self) -> CliInstallation | None:
         if not self.executable:
@@ -56,7 +109,7 @@ class AntigravityAdapter:
         return CliInstallation(
             id="cli_antigravity", type="antigravity", executable=self.executable,
             version=detect_version(self.executable), adapter="antigravity-json",
-            authenticated=None, experimental=False,
+            authenticated=None, experimental=False, validated_version=VALIDATED_VERSION,
         )
 
     async def inspect_auth(self) -> AuthStatus:
@@ -77,12 +130,12 @@ class AntigravityAdapter:
     # ------------------------------------------------------------------ running
 
     def start_run(self, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]:
-        return self._drive(request, self._build_args(request, request.prompt))
+        return self._drive(request, prompt=request.prompt)
 
     def resume_run(
         self, session_id: str, prompt: str, request: CliRunRequest
     ) -> AsyncIterator[NormalizedEvent]:
-        return self._drive(request, self._build_args(request, prompt, conversation=session_id))
+        return self._drive(request, prompt=prompt, conversation=session_id)
 
     def _build_args(
         self, request: CliRunRequest, prompt: str, *, conversation: str | None = None
@@ -93,23 +146,59 @@ class AntigravityAdapter:
         args += self._permission_args(request.permission_profile)
         return args
 
-    def _permission_args(self, profile_name: str) -> list[str]:
-        """Map the permission profile onto Antigravity's flags.
+    def permission_status(self, profile_name: str) -> tuple[bool, str]:
+        """Whether ``profile_name`` can run on Antigravity right now, and why not (item 15).
 
-        A read-only profile runs in ``--mode plan`` (no edits). An editing profile must
-        auto-approve, since ``--print`` is non-interactive and cannot answer a tool prompt; the run
-        is already isolated in an OpenAgent worktree (same rationale as Codex ``workspace-write`` /
-        Claude ``acceptEdits``). The exact non-interactive tool-permission behavior is not itself
-        live-verified.
+        Used by preflight so a blocked run is refused *before* it starts, with an actionable reason.
+        """
+
+        profile = get_profile(profile_name)
+        if not profile.can_edit_files:
+            return True, "read-only → Antigravity plan mode"
+        if profile.name in _HIGH_RISK_PROFILES:
+            if self.allow_dangerous_bypass:
+                return True, (
+                    f"{profile.name} → native permission bypass ENABLED via "
+                    f"{DANGEROUS_BYPASS_ENV} (high risk)"
+                )
+            return False, (
+                f"profile {profile.name!r} needs Antigravity's native permission bypass "
+                f"(--dangerously-skip-permissions), which disables Antigravity's own tool checks "
+                f"while OpenAgent cannot observe its internal tool calls. Set "
+                f"{DANGEROUS_BYPASS_ENV}=1 to accept that risk, or choose the read-only profile."
+            )
+        if self.allow_experimental_edit:
+            return True, (
+                f"{profile.name} → experimental editing ENABLED via {EXPERIMENTAL_EDIT_ENV}"
+            )
+        return False, (
+            f"Antigravity editing is EXPERIMENTAL in v0.1 and is not enabled. A non-interactive "
+            f"--print run can only edit with --dangerously-skip-permissions, which turns off "
+            f"Antigravity's own permission checks; OpenAgent will not do that just because the "
+            f"profile is {profile.name!r}. Set {EXPERIMENTAL_EDIT_ENV}=1 to opt in, or choose the "
+            f"read-only profile."
+        )
+
+    def _permission_args(self, profile_name: str) -> list[str]:
+        """Map the permission profile onto Antigravity's flags — conservatively (item 15).
+
+        ``read-only`` runs in ``--mode plan``. An editing profile is **refused** unless the user has
+        explicitly opted in, because the only way to edit non-interactively is
+        ``--dangerously-skip-permissions``: that disables Antigravity's *own* permission checks, and
+        OpenAgent cannot see Antigravity's internal tool calls to compensate. A ``safe-edit`` profile
+        alone can never imply that bypass — "safe" would be a lie.
         """
 
         profile = get_profile(profile_name)
         if not profile.can_edit_files:
             return ["--mode", "plan"]
+        allowed, reason = self.permission_status(profile_name)
+        if not allowed:
+            raise AntigravityPermissionError(reason)
         return ["--dangerously-skip-permissions"]
 
     async def _drive(
-        self, request: CliRunRequest, args: list[str]
+        self, request: CliRunRequest, *, prompt: str, conversation: str | None = None
     ) -> AsyncIterator[NormalizedEvent]:
         if not self.executable:
             yield NormalizedEvent(
@@ -117,6 +206,23 @@ class AntigravityAdapter:
                 data={"error_type": "cli_not_found", "message": "antigravity (agy) is not installed"},
             )
             return
+        try:
+            args = self._build_args(request, prompt, conversation=conversation)
+        except AntigravityPermissionError as exc:
+            yield NormalizedEvent(
+                run_id=request.run_id, type=EventType.RUN_FAILED, source=SOURCE,
+                data={"error_type": "permission_mode_unsupported", "message": str(exc)},
+            )
+            return
+        if self.allow_experimental_edit or self.allow_dangerous_bypass:
+            _, reason = self.permission_status(request.permission_profile)
+            if get_profile(request.permission_profile).can_edit_files:
+                yield NormalizedEvent(
+                    run_id=request.run_id, type=EventType.LOG, source=SOURCE,
+                    data={"level": "warning", "message":
+                          "Antigravity is running with its native permission checks DISABLED "
+                          f"({reason}). OpenAgent cannot observe its internal tool calls."},
+                )
         env = minimal_environment(request.credential_env)
         proc = ManagedProcess(args, cwd=request.workspace, env=env)
         self._processes[request.run_id] = proc

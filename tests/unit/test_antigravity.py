@@ -7,6 +7,7 @@ synthetic objects — deliberately *not* recorded fixtures, since no real failur
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -14,7 +15,11 @@ from pathlib import Path
 
 import pytest
 
-from openagent.runtimes.cli.antigravity import AntigravityAdapter, map_antigravity_event
+from openagent.runtimes.cli.antigravity import (
+    AntigravityAdapter,
+    AntigravityPermissionError,
+    map_antigravity_event,
+)
 from openagent.runtimes.cli.base import CliRunRequest
 from openagent.runtimes.cli.registry import (
     build_cli_adapter,
@@ -86,13 +91,90 @@ def test_missing_status_fails():
 # --------------------------------------------------------------------------- adapter args + registry
 
 def test_start_run_uses_print_json_flags(tmp_path: Path):
-    adapter = AntigravityAdapter(executable="/usr/local/bin/agy")
+    adapter = AntigravityAdapter(executable="/usr/local/bin/agy", allow_experimental_edit=False)
     args = adapter._build_args(
-        CliRunRequest(run_id="r", prompt="do it", workspace=tmp_path, permission_profile="safe-edit"),
+        CliRunRequest(run_id="r", prompt="do it", workspace=tmp_path, permission_profile="read-only"),
         "do it",
     )
     assert args[:5] == ["/usr/local/bin/agy", "--print", "do it", "--output-format", "json"]
-    assert "--dangerously-skip-permissions" in args  # editing profile auto-approves in print mode
+
+
+# --------------------------------------------------------------------------- permission safety (item 15)
+
+
+def test_safe_edit_never_implies_native_permission_bypass(tmp_path: Path):
+    """``safe-edit`` must not silently disable Antigravity's own permission checks (item 15).
+
+    Editing in ``--print`` mode is only possible via ``--dangerously-skip-permissions``, which turns
+    Antigravity's tool checks off — and OpenAgent cannot observe Antigravity's internal tool calls to
+    compensate. Calling that "safe-edit" would be a lie, so it is refused until the user opts in.
+    """
+
+    adapter = AntigravityAdapter(executable="/usr/local/bin/agy", allow_experimental_edit=False)
+    allowed, reason = adapter.permission_status("safe-edit")
+    assert allowed is False
+    assert "EXPERIMENTAL" in reason
+
+    with pytest.raises(AntigravityPermissionError):
+        adapter._build_args(
+            CliRunRequest(run_id="r", prompt="x", workspace=tmp_path,
+                          permission_profile="safe-edit"),
+            "x",
+        )
+
+
+def test_read_only_is_supported_by_default(tmp_path: Path):
+    adapter = AntigravityAdapter(executable="agy", allow_experimental_edit=False)
+    allowed, _ = adapter.permission_status("read-only")
+    assert allowed is True
+    args = adapter._build_args(
+        CliRunRequest(run_id="r", prompt="x", workspace=tmp_path, permission_profile="read-only"),
+        "x",
+    )
+    assert args[args.index("--mode") + 1] == "plan"
+
+
+def test_experimental_opt_in_enables_editing(tmp_path: Path):
+    adapter = AntigravityAdapter(executable="agy", allow_experimental_edit=True)
+    allowed, reason = adapter.permission_status("safe-edit")
+    assert allowed is True and "ENABLED" in reason
+    args = adapter._build_args(
+        CliRunRequest(run_id="r", prompt="x", workspace=tmp_path, permission_profile="safe-edit"),
+        "x",
+    )
+    assert "--dangerously-skip-permissions" in args
+
+
+def test_high_risk_profile_needs_its_own_opt_in(tmp_path: Path):
+    """The experimental-edit opt-in is not enough for development/full-access — that needs its own."""
+
+    adapter = AntigravityAdapter(executable="agy", allow_experimental_edit=True,
+                                 allow_dangerous_bypass=False)
+    allowed, reason = adapter.permission_status("full-access")
+    assert allowed is False
+    assert "DANGEROUS_BYPASS" in reason
+
+    opted_in = AntigravityAdapter(executable="agy", allow_dangerous_bypass=True)
+    allowed, _ = opted_in.permission_status("full-access")
+    assert allowed is True
+
+
+def test_permission_block_fails_the_run_rather_than_running_blind(tmp_path: Path):
+    """A blocked profile produces one explicit run.failed — not a silent, edit-less "success"."""
+
+    adapter = AntigravityAdapter(executable="/usr/local/bin/agy", allow_experimental_edit=False)
+
+    async def _collect():
+        return [
+            e async for e in adapter.start_run(
+                CliRunRequest(run_id="r", prompt="x", workspace=tmp_path,
+                              permission_profile="safe-edit")
+            )
+        ]
+
+    events = asyncio.run(_collect())
+    assert _types(events) == ["run.failed"]
+    assert events[0].data["error_type"] == "permission_mode_unsupported"
 
 
 def test_resume_passes_conversation_id(tmp_path: Path):
@@ -147,11 +229,12 @@ async def test_end_to_end_run_through_fake_agy(tmp_path: Path):
     adapter = AntigravityAdapter(executable=str(fake))
     events = [
         e async for e in adapter.start_run(
-            CliRunRequest(run_id="run_e2e", prompt="go", workspace=tmp_path)
+            CliRunRequest(run_id="run_e2e", prompt="go", workspace=tmp_path,
+                          permission_profile="read-only")
         )
     ]
     types = _types(events)
-    assert types[0] == "run.started"
+    assert types[0] == "process.started"
     terminals = [t for t in types if t in ("run.completed", "run.failed", "run.cancelled")]
     assert terminals == ["run.completed"]
     assert "session.created" in types and "usage.updated" in types
