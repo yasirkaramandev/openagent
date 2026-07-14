@@ -119,3 +119,66 @@ def test_output_missing_artifact_raises(app: OpenAgentApp):
 def test_create_run_unknown_agent(app: OpenAgentApp):
     with pytest.raises(RunError):
         app.runs.create(agent_name="nope", prompt="x")
+
+
+def test_enum_value_renders_the_plain_status_not_the_repr():
+    """`RunStatus` subclasses str, which makes the obvious guard a trap.
+
+    `isinstance(RunStatus.RUNNING, str)` is True, so `x if isinstance(x, str) else x.value` returns
+    the *enum* — and `str()` of it is "RunStatus.RUNNING". A live run showed exactly that in the Run
+    Console header. Whether an f-string renders the value or the repr also varies by Python version,
+    so every display/serialization path goes through this one helper instead.
+    """
+
+    from openagent.core.models import RunStatus, enum_value
+
+    assert enum_value(RunStatus.RUNNING) == "running"
+    assert enum_value(RunStatus.COMPLETED) == "completed"
+    assert enum_value("already a string") == "already a string"
+    assert "RunStatus" not in enum_value(RunStatus.FAILED)
+
+
+async def test_run_console_header_shows_a_human_status(tmp_path):
+    """The console header must say "running", never "RunStatus.RUNNING"."""
+
+    import subprocess
+
+    from textual.widgets import Static
+
+    from openagent.app import OpenAgentApp
+    from openagent.config import Paths
+    from openagent.core.models import RuntimeType
+    from openagent.tui.app import OpenAgentTUI
+    from openagent.tui.screens.run_console import RunConsoleScreen
+    from tests.fakecli import FakeCliAdapter, install_fake_cli, write_fake_script
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=project, check=True, capture_output=True)
+    _git("init", "-q")
+    _git("config", "user.email", "t@t.com")
+    _git("config", "user.name", "t")
+    (project / "seed.txt").write_text("seed\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "init")
+    oa = OpenAgentApp(Paths(data_dir=tmp_path / "d", config_dir=tmp_path / "c",
+                            db_path=tmp_path / "d" / "o.db", project_root=project))
+    oa.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
+
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        install_fake_cli(mp, FakeCliAdapter(write_fake_script(tmp_path)))
+        run = oa.runs.create(agent_name="fake-coder", prompt="go", worktree="auto")
+        await oa.runs.execute(run)
+
+        app = OpenAgentTUI(oa)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.push_screen(RunConsoleScreen(run.id))
+            await pilot.pause(0.3)
+            header = str(app.screen.query_one("#status", Static).content)
+            assert "completed" in header
+            assert "RunStatus" not in header
+    finally:
+        mp.undo()

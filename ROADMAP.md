@@ -7,11 +7,29 @@ of real usage data.
 ## v0.1 — Working core ✅
 
 - `openagent` TUI + `openagent` CLI (init, add, agent/provider management, run, output, doctor)
-- SQLite storage, OS-keychain credentials, run IDs, `events.jsonl`, `output.md`, `result.json`
-- Isolated git worktrees + permission profiles
-- **Codex CLI** adapter (live) and **Claude Code** adapter (fixture-validated)
-- **OpenAI** (Chat + Responses), **Anthropic** Messages, and generic **OpenAI-compatible** API agents
-- `OPENAGENT.md` generation; secret redaction; command policy; process-tree cancel + orphan recovery
+- SQLite storage, OS-keychain credentials, run IDs, `events.jsonl`, `output.md`, `result.json`,
+  `timeline.md`
+- **Live Run Console**: readiness preflight, then reasoning summaries, plan, commands, files, diff,
+  tests, messages, usage and raw events — closable and reopenable without stopping the run
+- Isolated git worktrees + permission profiles; explicit confirmation before editing in place
+- **Codex CLI** adapter — verified live end to end (reasoning, plan, commands, files, web search,
+  cancel, resume, failure); **Antigravity** verified live read-only (editing experimental, opt-in);
+  **Claude Code** fixture-validated
+- **OpenAI** (Chat + Responses), **Anthropic** Messages, and generic **OpenAI-compatible** API agents,
+  with user-visible `update_plan` / `report_progress` tools
+- Real cancellation for both runtimes (process tree for CLI; loop checkpoints + stream teardown for
+  API), including from an approval/question modal
+- `OPENAGENT.md` generation; secret redaction; command policy; orphan recovery
+
+### Known limits in v0.1
+
+- **No OS-level sandbox.** Isolation is by workspace (worktree/copy) and by policy, not by kernel.
+- **API agents are not live-verified** — offline contract tests only.
+- **Claude Code is fixture-only** — not run against an installed `claude`.
+- **Antigravity editing is experimental** and requires an explicit opt-in; its `--print` output is a
+  single final object, so per-file/per-command events are not available.
+- **Follow-up/resume is CLI-only**, and only between turns: a non-interactive CLI process cannot take
+  new input mid-turn, and OpenAgent says so rather than pretending otherwise.
 
 ## v0.2 — Broader providers & CLIs
 

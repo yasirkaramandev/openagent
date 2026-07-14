@@ -26,7 +26,7 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..app import OpenAgentApp
 from ..core.events import NormalizedEvent
-from ..core.models import Run
+from ..core.models import Run, enum_value
 from ..core.projection import RunProjection
 from ..security.approvals import ApprovalRequest
 from .screens.add_agent import AddAgentScreen
@@ -115,9 +115,9 @@ class DashboardScreen(Screen):
         providers = oa.providers.list()
         clis = oa.clis.list()
         runs = oa.runs.list(100)
-        active = [r for r in runs if (r.status if isinstance(r.status, str) else r.status.value)
+        active = [r for r in runs if (enum_value(r.status))
                   in ("running", "starting", "queued", "waiting_approval")]
-        failed = [r for r in runs if (r.status if isinstance(r.status, str) else r.status.value) == "failed"]
+        failed = [r for r in runs if (enum_value(r.status)) == "failed"]
         text = (
             f"[b]OpenAgent[/b]   project: [cyan]{oa.paths.project_root.name}[/cyan]\n\n"
             f"Agents         [b]{len(agents):>3}[/b]\n"

@@ -45,6 +45,7 @@ from textual.widgets import (
 )
 
 from ...core.events import ItemStatus, NormalizedEvent
+from ...core.models import enum_value
 from ...core.permissions import get_profile, profile_names
 from ...core.projection import Item, RunProjection
 from ...runtimes.cli.registry import cli_registry_entries
@@ -424,7 +425,7 @@ class RunConsoleScreen(Screen):
             rtype = rt.cli or "" if kind == "cli" else f"{rt.provider or ''}/{rt.model or ''}"
 
         status = p.status or (run.status if run else "")
-        status = status if isinstance(status, str) else status.value
+        status = enum_value(status)
         colour = {"completed": "green", "failed": "red", "cancelled": "yellow"}.get(status, "cyan")
         phase = p.phase or (run.phase if run else "")
         elapsed = _elapsed(p.started_at or (run.started_at.isoformat() if run else ""),
@@ -601,7 +602,7 @@ class RunConsoleScreen(Screen):
         run = oa.runs.get(self.run_id)
         if run is None:
             return
-        status = run.status if isinstance(run.status, str) else run.status.value
+        status = enum_value(run.status)
         active = status in ("queued", "starting", "running", "waiting_approval")
         self.query_one("#cancel", Button).disabled = not active
         can_resume, _ = oa.runs.resume_support(run)

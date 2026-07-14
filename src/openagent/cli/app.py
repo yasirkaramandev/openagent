@@ -17,7 +17,7 @@ from rich.table import Table
 from .. import __version__
 from ..app import OpenAgentApp
 from ..core.events import NormalizedEvent
-from ..core.models import Protocol, RuntimeType
+from ..core.models import Protocol, RuntimeType, enum_value
 from ..core.permissions import profile_names
 from ..providers.factory import PRESETS, preset_names
 from ..services.agent_service import AgentError
@@ -135,7 +135,7 @@ def runs(limit: int = typer.Option(20, "--limit")) -> None:
     oa = _app()
     table = Table("ID", "Agent", "Status", "Started", "Files")
     for run in oa.runs.list(limit):
-        status = run.status if isinstance(run.status, str) else run.status.value
+        status = enum_value(run.status)
         table.add_row(run.id, run.agent, status, run.started_at.strftime("%m-%d %H:%M"),
                       str(len(run.files_changed)))
     console.print(table)
@@ -167,7 +167,7 @@ def run(
     # A non-interactive CLI has no human to prompt: --yes approves, otherwise deny (never silent).
     approval = (lambda _req: True) if yes else None
     result = _run(oa.runs.execute(run_obj, on_event=_print_event, approval_callback=approval))
-    status = result.status if isinstance(result.status, str) else result.status.value
+    status = enum_value(result.status)
     color = "green" if status == "completed" else "red"
     console.print(f"\n[{color}]● {status}[/{color}] — run {result.id}")
     console.print(f"  files changed: {', '.join(result.files_changed) or '(none)'}")
@@ -198,7 +198,7 @@ def message(
         result = _run(oa.runs.resume(id, prompt, on_event=_print_event))
     except RunError as exc:
         _fail(str(exc))
-    status = result.status if isinstance(result.status, str) else result.status.value
+    status = enum_value(result.status)
     console.print(f"\n[green]●[/green] {status} — run {result.id}")
 
 

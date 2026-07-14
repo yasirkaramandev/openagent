@@ -95,8 +95,34 @@ launch.
 
 ## Reasoning privacy
 
-Raw provider chain-of-thought is treated as sensitive metadata and is **not** surfaced verbatim to
-the user or written to artifacts.
+**OpenAgent shows reasoning summaries. It never shows, requests, infers, or stores hidden
+chain-of-thought.** The two are different things, and conflating them is how a tool ends up leaking
+private model reasoning while believing it is being transparent.
+
+* A **reasoning summary** is text the *backend itself* designates as user-visible. Codex emits these
+  as `reasoning` items (short lines such as `**Checking git status and file contents**`), and its own
+  event model defines that item as the reasoning *summary*. OpenAgent asks for them explicitly
+  (`model_reasoning_summary`), because Codex emits none by default — which is why the previous
+  version of this adapter, which threw the text away, left the user with nothing to go on.
+* An **API agent** publishes its own progress through the `report_progress` and `update_plan` tools:
+  explicit statements the model chooses to make to the user. The system prompt asks for them and
+  tells the model, in those words, not to reveal private reasoning.
+* Anything a provider does *not* designate as a user-visible summary — encrypted reasoning blobs, raw
+  content parts, internal fields — is never mapped, never persisted, and never rendered. There is a
+  regression test for exactly that.
+* Reasoning **tokens** are counted (`reasoning_tokens` in usage). The reasoning they represent is
+  never obtained.
+
+Summaries pass through the same secret redaction and markup escaping as any other untrusted text
+before they are persisted or rendered.
+
+## UI injection
+
+Every string that reaches a markup-enabled widget from outside — model messages, reasoning summaries,
+questions, answers, commands, command output, tool names, file paths, provider/CLI errors, agent
+titles and descriptions — is escaped through one shared helper (`tui/markup.safe_markup`), which also
+strips ANSI and control characters. Unescaped, a model could render `[green]✓ tests passed[/green]`
+as a real success line — including inside the very dialog asking whether to trust it.
 
 ## Reporting a vulnerability
 

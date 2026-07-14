@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.cancellation import CancellationRegistry, RunCancellation, RunCancelled
 from ..core.events import EventType, NormalizedEvent, RunPhase
-from ..core.models import AgentProfile, Run, RunStatus, RuntimeType
+from ..core.models import AgentProfile, Run, RunStatus, RuntimeType, enum_value
 from ..core.permissions import get_profile
 from ..core.projection import RunProjection
 from ..reporting.artifacts import ArtifactWriter, RunArtifacts, TestSummary
@@ -76,7 +76,7 @@ def _now() -> datetime:
 
 
 def _status_value(run: Run) -> str:
-    return run.status if isinstance(run.status, str) else run.status.value
+    return enum_value(run.status)
 
 
 class RunService:

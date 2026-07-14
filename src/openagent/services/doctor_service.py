@@ -99,8 +99,32 @@ class DoctorService:
                 f"resume: {'yes' if entry.resumable else 'no'}"
                 f"{' (experimental)' if entry.experimental else ''}"
             )
-            checks.append(Check(f"{name} adapter status", OK, f"{entry.status_label}; {caps}"))
+            # An adapter validated against one version cannot claim "verified" on another (item 16).
+            verified = entry.version_verified or not entry.validated_version
+            checks.append(Check(f"{name} adapter status", OK if verified else WARN,
+                                f"{entry.status_label}; {caps}"))
+            if entry.type == "antigravity":
+                checks.append(self._antigravity_permission_check())
         return checks
+
+    def _antigravity_permission_check(self) -> Check:
+        """What Antigravity is actually allowed to do right now, and why (item 15)."""
+
+        from .preflight import antigravity_permission_status
+
+        edit_ok, reason = antigravity_permission_status("safe-edit")
+        if not edit_ok:
+            return Check(
+                "antigravity permissions", OK,
+                "read-only (supported). Editing is experimental and OFF: a non-interactive "
+                "--print run can only edit with --dangerously-skip-permissions, which disables "
+                "Antigravity's own tool checks. Set OPENAGENT_ANTIGRAVITY_EXPERIMENTAL_EDIT=1 to "
+                "opt in.",
+            )
+        return Check(
+            "antigravity permissions", WARN,
+            f"editing ENABLED — Antigravity's native permission checks are bypassed ({reason})",
+        )
 
     def _provider_checks(self) -> list[Check]:
         providers = self.app.repos.providers.list()

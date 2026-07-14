@@ -54,6 +54,19 @@ TERMINAL_STATUSES = {
 }
 
 
+def enum_value(value: object) -> str:
+    """The plain string behind a str-enum (or a string), for **display and serialization**.
+
+    ``RunStatus`` subclasses ``str``, so the tempting ``x if isinstance(x, str) else x.value`` is a
+    trap: ``isinstance(RunStatus.RUNNING, str)`` is ``True``, so the guard returns the *enum*, and
+    ``str()`` of it renders ``"RunStatus.RUNNING"`` — which is exactly what the Run Console header
+    showed in a live run. Worse, whether an f-string renders the value or the repr depends on the
+    Python version. This helper is unambiguous on every version.
+    """
+
+    return str(getattr(value, "value", value))
+
+
 class CredentialType(str, Enum):
     KEYCHAIN = "keychain"
     ENV = "env"

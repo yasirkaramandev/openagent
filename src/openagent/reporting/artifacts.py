@@ -27,7 +27,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..core.models import Run
+from ..core.models import Run, enum_value
 from ..core.projection import RunProjection
 from ..credentials.redaction import redact
 
@@ -85,7 +85,7 @@ class ArtifactWriter:
         })
 
     def write_status(self, run: Run) -> None:
-        status = run.status if isinstance(run.status, str) else run.status.value
+        status = enum_value(run.status)
         self._json("status.json", {
             "run_id": run.id,
             "status": status,
@@ -100,7 +100,7 @@ class ArtifactWriter:
     def write_results(
         self, run: Run, art: RunArtifacts, projection: RunProjection | None = None
     ) -> None:
-        status = run.status if isinstance(run.status, str) else run.status.value
+        status = enum_value(run.status)
         # Scrub free text and the diff before anything hits disk (spec §30).
         art.summary = redact(art.summary)
         art.warnings = [redact(w) for w in art.warnings]
@@ -141,7 +141,7 @@ class ArtifactWriter:
         produced. The cumulative view of the whole run lives in ``result.json``.
         """
 
-        status = run.status if isinstance(run.status, str) else run.status.value
+        status = enum_value(run.status)
         usage = art.usage or {}
         usage_line = (
             f"in {usage.get('input_tokens', 0)} / cached {usage.get('cached_input_tokens', 0)} / "
@@ -190,7 +190,7 @@ def _secure_dir(path: Path) -> None:
 
 
 def _render_output_md(run: Run, art: RunArtifacts) -> str:
-    status = run.status if isinstance(run.status, str) else run.status.value
+    status = enum_value(run.status)
     lines = ["# Run Result", "", "## Summary", "", art.summary or "(no summary)", ""]
     lines += ["## Status", "", f"- Status: {status}", f"- Agent: {run.agent}", f"- Turns: {run.turns}", ""]
     if status != "completed" and (art.error or run.failure_type):
@@ -267,7 +267,7 @@ def _structured(projection: RunProjection | None) -> dict:
 
 
 def _render_timeline_md(run: Run, projection: RunProjection) -> str:
-    status = run.status if isinstance(run.status, str) else run.status.value
+    status = enum_value(run.status)
     lines = [
         f"# Timeline — {run.id}", "",
         f"- Agent: {run.agent}",
@@ -347,7 +347,7 @@ def _timeline_entry(item) -> list[str]:
 
 
 def _render_handoff_md(run: Run, art: RunArtifacts) -> str:
-    status = run.status if isinstance(run.status, str) else run.status.value
+    status = enum_value(run.status)
     lines = [
         f"# Handoff — {run.id}", "",
         f"Agent `{run.agent}` finished with status **{status}** after {run.turns} turn(s).", "",

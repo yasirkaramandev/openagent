@@ -10,7 +10,7 @@ from textual.containers import Horizontal
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
-from ...core.models import AgentProfile
+from ...core.models import AgentProfile, enum_value
 from ...services.provider_service import ProviderInUseError
 from ..markup import safe_line, safe_markup
 
@@ -320,7 +320,7 @@ class RunsScreen(_TableScreen):
                           "Files")
         oa = self.app.oa  # type: ignore[attr-defined]
         for r in oa.runs.list(50):
-            status = r.status if isinstance(r.status, str) else r.status.value
+            status = enum_value(r.status)
             agent = oa.agents.get(r.agent)
             runtime = "—"
             if agent is not None:

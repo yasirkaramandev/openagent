@@ -33,20 +33,23 @@ bundle. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ### Maturity — what's actually verified
 
-We try to be precise about what is proven vs. pending, so nothing here is oversold.
+We try to be precise about what is proven vs. pending, so nothing here is oversold. The labels mean:
+**Verified live** (run against the real thing), **Fixture validated** (mapped from a recorded real
+capture), **Offline contract tested** (mocked transport), **Experimental**, **Unsupported**.
 
 | Area | State |
 |---|---|
-| API agents (OpenAI Chat/Responses, Anthropic, OpenAI-compatible) | Adapter implemented; offline-tested end to end (mocked HTTP): tool loop, worktree diff, artifacts, redaction. **Live-unverified** — not yet exercised against a paid live key in CI. Presets for DeepSeek/Qwen/Kimi/GLM/MiniMax/OpenRouter/Mistral/Together/Fireworks/Ollama/LM Studio share the OpenAI/Anthropic-compatible adapters but are **not individually live-verified**. |
-| **Codex CLI** | Event schema validated **live** against `codex-cli 0.142.5`; the full run/cancel/terminal-state pipeline is exercised via a real-subprocess fake-CLI harness. A **successful real model turn is pending account/usage-limit availability**. |
-| **Claude Code** | **Fixture-validated** — the `stream-json` mapping and invocation are ready, but not yet run against an installed `claude` on this machine. Treat as unverified against a live CLI. |
-| **Antigravity (`agy`)** | **Verified live** against `agy v1.1.0`: `--print --output-format json` result envelope and `--conversation` resume were captured from the real CLI (`tests/fixtures/antigravity_print.jsonl`), and the full OpenAgent→agy pipeline (session capture, usage, one terminal event) was run end to end. Output is a single final JSON object, so events are **coarse** (final text + usage + status), not per-file/per-command. Failure/cancel envelope shapes are inferred (fail-closed), not captured live. |
-| TUI Add-Agent **wizard** | Backend-first multi-step wizard (Backend → CLI/Provider → Connection → Agent details) on **Textual 8.2.8**, pilot-tested with **real keyboard-driven** radio/list selection (not `.value` assignment): CLI path (Codex/Claude/Antigravity, incl. unavailable-CLI handling), API path (provider cards, new/existing connection, masked key, missing-key inline error, local no-key providers), Back/Continue navigation preserving non-secret input, and Cancel. A fixed action bar keeps Continue/Create visible; the API key uses `SecretStr` and never reaches persistence/logs. |
-| TUI (dashboard, agents, providers, run, approvals, ask_user) | Pilot-tested against Textual 8.2.8: agent/provider screens, live run stream, approval modal, and the end-to-end `ask_user` question flow (modal → answer → next model request). Every `Select` empty state is normalised so no Textual sentinel reaches a service or model. |
-| Security (minimal env, command allowlist, worktree/copy/in-place isolation, redaction, process-tree cancel, PID-identity recovery, sandboxed credential commands) | Unit + integration tested (see `tests/`). |
+| **Codex CLI** | **Verified live** against `codex-cli 0.142.5`, end to end *through OpenAgent* — not just at the CLI. Captured from real runs: reasoning summaries, the `todo_list` plan (projected onto one checklist), `command_execution` with output, `file_change` (add/update/delete), `web_search`, usage incl. `reasoning_output_tokens`, cancellation (process tree terminated, status `cancelled`, no later `completed`), resume (turn 2 in the same thread), and a real failure (normalized `schema_mismatch`). Fixtures in `tests/fixtures/codex_v0142_*.jsonl` are sanitized captures of those runs. |
+| **Antigravity (`agy`)** | **Verified live (read-only)** against `agy v1.1.0`: the `--print --output-format json` envelope and `--conversation` resume were captured from the real CLI. **Editing is experimental and off by default** — see [Antigravity permissions](#antigravity-permissions). Output is a single final JSON object, so events are **coarse** (final text + usage + status), never per-file/per-command. |
+| **Claude Code** | **Fixture validated** — the `stream-json` mapping and invocation are ready, but `claude` is not installed on this machine, so nothing here has been run against a live CLI. |
+| API agents (OpenAI Chat/Responses, Anthropic, OpenAI-compatible) | **Offline contract tested** end to end (mocked HTTP): tool loop, progress tools, cancellation, worktree diff, artifacts, redaction. **Not live-verified** against a paid key. Presets for DeepSeek/Qwen/Kimi/GLM/MiniMax/OpenRouter/Mistral/Together/Fireworks/Ollama/LM Studio share the compatible adapters and are **not individually live-verified**. |
+| **Run Console** (live reasoning/plan/commands/files/diff/tests/usage/raw events) | Pilot-tested on Textual 8.2.8 at 80×24, 100×30 and 120×40; the live-run, leave-and-reopen, cancel and resume paths are driven end to end with a real subprocess. The Codex side of it is the live verification above. |
+| TUI Add-Agent **wizard** | Pilot-tested with **real keyboard input** (Space selects, Enter advances): CLI and API paths, masked key cleared on every transition, connections filtered to the provider family, credentials validated on the connection step, `max_steps` bounded. |
+| Security (minimal env, command allowlist, worktree/copy/in-place isolation, redaction, process-tree cancel, PID-identity recovery, sandboxed credential commands, streaming output bound, exact keychain rollback) | Unit + integration tested (see `tests/`). |
+| **OS-level sandbox** | **Unsupported.** OpenAgent isolates by *workspace* (git worktree / copy), not by kernel sandbox. A CLI backend may bring its own (Codex `--sandbox`), and OpenAgent maps profiles onto it — but OpenAgent itself does not sandbox processes. |
 | **Gemini** | **Not part of v0.1.** |
 
-Everything above except the live-CLI/live-API caveats runs in the **offline test suite in CI**
+Everything except the live-CLI/live-API rows runs in the **offline test suite in CI**
 (Ubuntu 3.10/3.11/3.12) with no API keys and no installed CLIs.
 
 ## Install
@@ -89,19 +92,69 @@ openagent message --id <run-id> -p "now add a test"
 openagent cancel --id <run-id>
 ```
 
+## The Run Console
+
+Running an agent opens a two-stage screen.
+
+**Setup + preflight.** Pick the agent, the task, the workspace strategy and the permission profile.
+The screen shows what that agent actually *is* — runtime, executable, detected version, auth state —
+and runs a readiness checklist before anything is created:
+
+```
+✓ Agent exists: codex-coder          ✓ Authentication detected: ~/.codex/auth.json present
+✓ Permission profile: safe-edit      ✓ codex exec supports --json
+✓ codex found: /usr/local/bin/codex  ✓ Sandbox 'workspace-write' supported
+✓ Version detected: codex-cli 0.142.5
+```
+
+`Run Agent` runs preflight itself, so a run never starts on an unready agent. A failed mandatory
+check blocks it and says why.
+
+**Live console.** A status header, tabbed panels — Overview, Reasoning, Plan, Commands, Files, Diff,
+Tests, Messages, Usage, Raw Events — and a fixed action bar (Cancel · Follow-up · Back), all working
+at 80×24. Every panel is *projected* from the event log, so an update replaces what it updates: the
+plan is one checklist that ticks off, a command is one card whose output is its latest snapshot, a
+file whose patch failed is red rather than green.
+
+Closing the console does **not** stop the run. `Runs` shows phase, elapsed and current activity, and
+Enter reopens the console — live for a running agent (replay the log, then tail it), replayed for a
+finished one. `Follow-up` sends another turn into the same session.
+
+### Reasoning summaries, not chain-of-thought
+
+The Reasoning tab shows what the backend itself publishes for the user:
+
+* **Codex** emits `reasoning` items — short summaries like `**Checking git status and file
+  contents**`. That is what Codex designates as a user-visible summary, and OpenAgent asks for them
+  explicitly (`model_reasoning_summary`), because without that Codex emits none at all.
+* An **API agent** publishes its own via the `report_progress` and `update_plan` tools — explicit
+  statements it chooses to make, not an extraction of anything hidden.
+
+OpenAgent does **not** request, infer, store, or render private chain-of-thought. Reasoning *tokens*
+are counted (`reasoning_tokens` in usage); the reasoning they represent is never obtained. When a
+backend publishes no summaries, the tab says so and shows operational activity instead — it does not
+invent a narrative.
+
 ## How it works
 
 ```
 Interfaces:     TUI · CLI · (MCP, SDK — planned)
                         │
-Services:       Agent · Provider · Model · Run · Discovery · Doctor
+Services:       Agent · Provider · Model · Run · Preflight · Discovery · Doctor
                         │
-Runtimes:       API agent loop (own tools)   │   CLI adapters (codex, claude)
+Runtimes:       API agent loop (own tools)   │   CLI adapters (codex, claude, agy)
                         │
 Workspace:      git worktree · permission profiles · command policy · secret redaction
                         │
-Storage:        SQLite (index) · events.jsonl (source of truth) · artifacts
+Storage:        SQLite (index) · events.jsonl (source of truth) · projection · artifacts
 ```
+
+Every run emits exactly one `run.started` (OpenAgent's — a backend process coming up is a separate
+`process.started`), then `run.phase` transitions
+(`preflight → preparing_workspace → starting_backend → running → finalizing`), then exactly one
+terminal event per turn. `events.jsonl` is append-only; readers *project* it into current state keyed
+by `(source, turn, item_id)`, which is what makes a run reopenable and what stops an updated plan
+from becoming five plans.
 
 * **Providers vs. Agents.** A *provider* is an API account (no prompt, no role). An *agent* binds a
   runtime + prompt + tags + permission profile. Many agents can share one provider; the key is
@@ -129,6 +182,38 @@ sandbox: an "approval-gated" profile routes network-*oriented* commands (`curl`,
 `git clone`, …) through an explicit approval — it does not block sockets at the kernel level. The
 **Codex sandbox** column is the flag OpenAgent passes to the Codex CLI, which enforces its own
 sandbox. See [SECURITY.md](SECURITY.md) for the full threat model.
+
+### Antigravity permissions
+
+Antigravity's `--print` mode is non-interactive, so it cannot answer its own tool-permission prompt.
+The only way to let it edit is `--dangerously-skip-permissions`, which turns **Antigravity's own**
+checks off — and OpenAgent cannot see Antigravity's internal tool calls to compensate. So v0.1 does
+not infer that from a profile name:
+
+| Profile | Antigravity behaviour |
+|---|---|
+| `read-only` | `--mode plan`. **Supported**, and the default. |
+| `safe-edit` | Editing is **experimental and off**. Opt in with `OPENAGENT_ANTIGRAVITY_EXPERIMENTAL_EDIT=1`. |
+| `development` / `full-access` | The native bypass is used only with `OPENAGENT_ANTIGRAVITY_DANGEROUS_BYPASS=1`, and the run emits a loud warning. |
+
+A blocked combination fails at **preflight** with an actionable reason, rather than starting a run
+that silently cannot do what was asked. `openagent doctor` reports the current state.
+
+### Cancelling a run
+
+Cancel really stops the agent, for both runtimes:
+
+* **CLI** — the whole process tree is terminated (SIGTERM → SIGKILL), with PID+start-time identity
+  verification so a reused PID is never killed.
+* **API** — the run's cancellation flag is raised; the agent loop checks it before each provider
+  request, on every stream chunk, around every tool call, and at the top of every step. The stream is
+  abandoned (which closes the HTTP response), no further tools run, and the run **cannot** go on to
+  report `completed`.
+* **From a modal** — `Ctrl+C` in an approval or question dialog cancels the *run*, not just the
+  dialog. The flag is raised before the modal is released, so the unblocked worker finds the run
+  already cancelled. (`Esc` in a question dialog still just *skips* the question.)
+
+A cancelled run records exactly one `run.cancelled`, and its artifacts stay readable.
 
 ## Security
 
