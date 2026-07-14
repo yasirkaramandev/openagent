@@ -182,9 +182,13 @@ def output(
     """Print a run artifact (spec §32)."""
     oa = _app()
     try:
-        console.print(oa.runs.output(id, format), highlight=False, markup=False)
+        artifact = oa.runs.output(id, format)
     except RunError as exc:
         _fail(str(exc))
+    # Emit the artifact **verbatim**. ``console.print`` soft-wraps at the console width (80 when
+    # piped), which injects newlines mid-string and corrupts machine-readable formats — the exact
+    # `openagent output --id <run-id> --format json` call OPENAGENT.md tells AI assistants to parse.
+    typer.echo(artifact)
 
 
 @app.command()

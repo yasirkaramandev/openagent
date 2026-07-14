@@ -66,6 +66,43 @@ def test_exactly_one_terminal_event_for_success():
     assert terminals == ["run.completed"]
 
 
+def test_thinking_tokens_normalized_to_reasoning_tokens():
+    """Antigravity's ``thinking_tokens`` must surface as OpenAgent's ``reasoning_tokens`` (item 9).
+
+    Every other backend (codex ``reasoning_output_tokens``, the API loop) reports reasoning under
+    ``reasoning_tokens``; Antigravity would otherwise silently drop them from the usage schema.
+    """
+
+    obj = {
+        "conversation_id": "c", "status": "SUCCESS", "response": "done",
+        "usage": {"input_tokens": 10, "output_tokens": 5, "thinking_tokens": 42, "total_tokens": 57},
+    }
+    usage = next(e for e in map_antigravity_event(obj, "r") if _types([e]) == ["usage.updated"])
+    assert usage.data["reasoning_tokens"] == 42
+    assert usage.data["input_tokens"] == 10
+    assert usage.data["output_tokens"] == 5
+    # A missing thinking_tokens field normalizes to 0, never a KeyError.
+    no_think = {"status": "SUCCESS", "response": "x", "usage": {"input_tokens": 1, "output_tokens": 1}}
+    usage2 = next(e for e in map_antigravity_event(no_think, "r") if _types([e]) == ["usage.updated"])
+    assert usage2.data["reasoning_tokens"] == 0
+
+
+def test_capabilities_do_not_advertise_editing_as_safe_and_verified():
+    """Editing is experimental/opt-in, so capabilities must not present it as normal & safe (item 9)."""
+
+    default = asyncio.run(AntigravityAdapter(executable="agy", allow_experimental_edit=False).capabilities())
+    assert default.experimental is True
+    assert default.edits_files is False  # not enabled -> not advertised
+    assert default.runs_commands is False
+    assert default.resumable is True  # live-verified, still honestly reported
+
+    opted_in = asyncio.run(
+        AntigravityAdapter(executable="agy", allow_experimental_edit=True).capabilities()
+    )
+    assert opted_in.edits_files is True
+    assert opted_in.experimental is True  # even opted-in, editing is experimental
+
+
 # --------------------------------------------------------------------------- fail-closed statuses
 
 def test_cancelled_status_maps_to_cancelled():

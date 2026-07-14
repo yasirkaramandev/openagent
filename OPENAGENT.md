@@ -16,12 +16,6 @@ This repository uses OpenAgent to discover and run external AI agents.
 
 <!-- OPENAGENT:AGENTS:START -->
 
-### Tester agent
-
-- Name: `agy-tester`
-- Runtime: `antigravity-cli`
-- Tags: `tester`
-- Description: Go tester agent
+_No agents registered yet. Add one with `openagent add`._
 
 <!-- OPENAGENT:AGENTS:END -->
-

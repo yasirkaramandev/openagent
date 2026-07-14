@@ -90,6 +90,28 @@ def test_output_missing_run_errors():
     assert result.exit_code == 1
 
 
+def test_output_json_is_emitted_verbatim_not_soft_wrapped(monkeypatch):
+    """`openagent output --format json` must stay valid JSON when piped (regression).
+
+    ``console.print`` soft-wraps at the console width (80 when the output is not a TTY), injecting
+    newlines mid-string — which broke the exact ``--format json`` call OPENAGENT.md tells AI
+    assistants to parse. The artifact must be emitted byte-for-byte instead.
+    """
+
+    import json
+
+    from openagent.services.run_service import RunService
+
+    long_run = "x" * 300  # far wider than any console; any wrapping would split this run
+    payload = json.dumps({"status": "completed", "summary": long_run})
+    monkeypatch.setattr(RunService, "output", lambda self, run_id, fmt: payload)
+
+    result = runner.invoke(app, ["output", "--id", "run_x", "--format", "json"])
+    assert result.exit_code == 0
+    assert long_run in result.stdout  # the 300-char run survived intact — nothing wrapped it
+    assert json.loads(result.stdout) == json.loads(payload)
+
+
 def test_provider_presets():
     result = runner.invoke(app, ["provider", "presets"])
     assert result.exit_code == 0

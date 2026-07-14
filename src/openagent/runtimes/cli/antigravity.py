@@ -120,11 +120,16 @@ class AntigravityAdapter:
         return AuthStatus(authenticated=False, detail="run `agy` to sign in")
 
     async def capabilities(self) -> CliCapabilities:
-        # Structured JSON result + resume are verified live; edits/commands go through Antigravity's
-        # own tools, which the single-object output does not itemize.
+        # Structured JSON result + resume are verified live. But editing is NOT a normal, safe,
+        # always-on capability here (item 9): file edits / command execution only happen through
+        # Antigravity's own tools, reachable non-interactively **only** via
+        # ``--dangerously-skip-permissions`` — an experimental, opt-in path (see module docstring).
+        # So ``edits_files``/``runs_commands`` reflect whether that opt-in is actually enabled, and
+        # the adapter is flagged ``experimental`` rather than pretending editing is verified & safe.
+        editing = self.allow_experimental_edit or self.allow_dangerous_bypass
         return CliCapabilities(
-            structured_events=True, resumable=True, edits_files=True, runs_commands=True,
-            experimental=False,
+            structured_events=True, resumable=True, edits_files=editing, runs_commands=editing,
+            experimental=True,
         )
 
     # ------------------------------------------------------------------ running
@@ -267,6 +272,9 @@ def map_antigravity_event(obj: dict[str, Any], run_id: str) -> list[NormalizedEv
             input_tokens=int(usage.get("input_tokens") or 0),
             cached_input_tokens=0,  # Antigravity reports no cached tokens
             output_tokens=int(usage.get("output_tokens") or 0),
+            # Antigravity names reasoning tokens "thinking_tokens"; OpenAgent normalizes to
+            # reasoning_tokens so the usage schema matches every other backend (codex/api) — item 9.
+            reasoning_tokens=int(usage.get("thinking_tokens") or 0),
             provider_cost=None,  # subscription product — no per-run monetary cost is reported
         ))
 
