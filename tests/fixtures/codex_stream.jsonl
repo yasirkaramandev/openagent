@@ -1,8 +1,8 @@
 {"type":"thread.started","thread_id":"th-abc-123"}
 {"type":"turn.started"}
-{"type":"item.completed","item":{"item_type":"reasoning","text":"internal chain of thought that must not be surfaced"}}
-{"type":"item.started","item":{"item_type":"command_execution","command":"pytest -q"}}
-{"type":"item.completed","item":{"item_type":"command_execution","command":"pytest -q","exit_code":0}}
-{"type":"item.completed","item":{"item_type":"file_change","changes":[{"kind":"add","path":"tests/test_ws.py"},{"kind":"update","path":"main.py"}]}}
-{"type":"item.completed","item":{"item_type":"assistant_message","text":"Updated the WSS client and added a test."}}
-{"type":"turn.completed","usage":{"input_tokens":18000,"cached_input_tokens":1000,"output_tokens":200}}
+{"type":"item.completed","item":{"id":"reason_1","type":"reasoning","text":"**Checking the WSS client before editing**"}}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"pytest -q","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"pytest -q","aggregated_output":"1 passed\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"tests/test_ws.py","kind":"add"},{"path":"main.py","kind":"update"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"Updated the WSS client and added a test."}}
+{"type":"turn.completed","usage":{"input_tokens":18000,"cached_input_tokens":1000,"output_tokens":200,"reasoning_output_tokens":320}}

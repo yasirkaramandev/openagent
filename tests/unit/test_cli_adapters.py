@@ -52,13 +52,58 @@ def test_codex_usage_parsed():
     usage = next(e for e in events if e.type == "usage.updated")
     assert usage.data["input_tokens"] == 18000
     assert usage.data["output_tokens"] == 200
+    # Codex's reasoning_output_tokens is normalized onto reasoning_tokens (item 5). The tokens are
+    # *counted*; the reasoning text they represent is never requested or stored.
+    assert usage.data["reasoning_tokens"] == 320
 
 
-def test_codex_reasoning_not_surfaced():
-    """Raw chain-of-thought must never appear in normalized events (spec §6)."""
+def test_codex_reasoning_summary_is_surfaced():
+    """Codex's ``reasoning`` item is the model's **summary**, and the user gets to see it (item 1).
+
+    Confirmed live against codex-cli 0.142.5: a reasoning item carries a short, user-facing summary
+    line (``"**Checking the WSS client before editing**"``), not raw chain-of-thought. Discarding it
+    — as the adapter used to — left the user with no idea what the agent was doing.
+    """
+
     events = _events_from("codex_stream.jsonl", map_codex_event)
+    summary = next(e for e in events if e.type == "reasoning.summary")
+    assert summary.data["text"] == "**Checking the WSS client before editing**"
+    assert summary.data["item_id"] == "reason_1"       # addressable, so updates project onto it
+    assert summary.data["status"] == "completed"
+
+
+def test_codex_blank_reasoning_summary_is_dropped():
+    """An empty summary is not an event — never render a blank 'Reasoning summary' card."""
+
+    events = map_codex_event(
+        {"type": "item.completed", "item": {"id": "r1", "type": "reasoning", "text": "   "}},
+        "run_1",
+    )
+    assert events == []
+
+
+def test_codex_undesignated_raw_fields_are_never_persisted():
+    """Only text the backend designates as a *summary* is mapped; internals are dropped (item 22).
+
+    A future/unknown Codex payload may carry raw provider internals alongside the summary. Anything
+    not explicitly a reasoning summary must not reach a normalized event — not the encrypted
+    reasoning blob, not raw content parts, not unknown internals.
+    """
+
+    events = map_codex_event(
+        {"type": "item.completed", "item": {
+            "id": "r2", "type": "reasoning", "text": "**Inspecting the parser**",
+            "encrypted_content": "gAAAAA-secret-reasoning-blob",
+            "raw_content": [{"type": "reasoning_text", "text": "step 1: I secretly think..."}],
+            "summary_parts": ["hidden deliberation"],
+        }},
+        "run_1",
+    )
     blob = json.dumps([e.model_dump() for e in events])
-    assert "internal chain of thought" not in blob
+    assert "**Inspecting the parser**" in blob          # the designated summary is kept
+    assert "gAAAAA-secret-reasoning-blob" not in blob   # …and nothing else is
+    assert "I secretly think" not in blob
+    assert "hidden deliberation" not in blob
 
 
 def test_codex_assistant_message():

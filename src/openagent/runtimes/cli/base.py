@@ -39,6 +39,10 @@ class CliRunRequest:
     #: Credentials to inject only into the child environment (spec §7), e.g. {"CODEX_API_KEY": ...}.
     credential_env: dict[str, str] = field(default_factory=dict)
     session_id: str | None = None
+    #: OpenAgent's private run directory. A CLI that must write a scratch file (Codex's
+    #: ``--output-last-message``) puts it **here**, never in the workspace, so it can never show up
+    #: in the project diff (item 6). ``None`` → the adapter falls back to a temp file.
+    artifacts_dir: Path | None = None
 
 
 @dataclass
@@ -192,28 +196,51 @@ def reconcile_terminal(
                 f"CLI produced no successful result ({detail})")
 
 
+@dataclass
+class StreamOutcome:
+    """What a CLI's event stream produced, handed to an adapter's finalizer after the process exits."""
+
+    exit_code: int | None
+    cancelled: bool
+    #: True when the stream carried at least one non-empty ``message.completed`` — i.e. the backend
+    #: already gave us a final answer, so a fallback is not needed (item 6).
+    saw_message: bool
+
+
+#: Called after the process exits and before the single terminal event: lets an adapter contribute
+#: last-moment events (e.g. Codex's ``--output-last-message`` fallback).
+Finalizer = Callable[[StreamOutcome], list[NormalizedEvent]]
+
+
 async def run_managed_cli(
     *, proc: ManagedProcess, run_id: str, source: str, mapper: EventMapper,
+    finalizer: Finalizer | None = None,
 ) -> AsyncIterator[NormalizedEvent]:
     """Start ``proc``, normalize its JSONL output, and enforce the terminal-state contract.
 
-    Shared by every CLI adapter (codex, claude, and the test fake) so they finalize identically:
+    Shared by every CLI adapter (codex, claude, antigravity, and the test fake) so they finalize
+    identically:
 
-    * emits ``run.started`` (with pid/create_time) up front;
+    * emits ``process.started`` (with pid/create_time) up front. **Not** ``run.started`` — the run
+      was started by OpenAgent, and only OpenAgent may say so; a backend process starting is a
+      different fact (item 4);
     * yields non-terminal events as they stream;
-    * **buffers every** terminal event (never surfacing one mid-stream) and after the process exits
-      yields exactly one terminal event reconciled fail-closed against the exit code
-      (:func:`reconcile_terminal`): a success event + non-zero exit becomes failed; a killed process
-      becomes cancelled; a completion followed by a failure becomes failed (``terminal_conflict``);
-      duplicate completions collapse to one.
+    * after the process exits, gives the adapter's ``finalizer`` a chance to add events (e.g. a
+      fallback final message);
+    * **buffers every** terminal event (never surfacing one mid-stream) and yields exactly one
+      terminal event reconciled fail-closed against the exit code (:func:`reconcile_terminal`): a
+      success event + non-zero exit becomes failed; a killed process becomes cancelled; a completion
+      followed by a failure becomes failed (``terminal_conflict``); duplicate completions collapse
+      to one.
     """
 
     await proc.start()
     yield NormalizedEvent(
-        run_id=run_id, type=EventType.RUN_STARTED, source=source,
+        run_id=run_id, type=EventType.PROCESS_STARTED, source=source,
         data={"pid": proc.pid, "create_time": proc.create_time},
     )
     observations = TerminalObservations()
+    saw_message = False
     async for line in proc.stream_stdout():
         obj = parse_json_line(line)
         if obj is None:
@@ -222,8 +249,15 @@ async def run_managed_cli(
             if is_terminal_event(event):
                 observations.observe(event)  # buffer all outcomes; reconciled once at the end
                 continue
+            etype = event.type if isinstance(event.type, str) else event.type.value
+            if etype == EventType.MESSAGE_COMPLETED.value and str(event.data.get("text") or "").strip():
+                saw_message = True
             yield event
     code = await proc.wait()
+    if finalizer is not None:
+        outcome = StreamOutcome(exit_code=code, cancelled=proc.cancelled, saw_message=saw_message)
+        for event in finalizer(outcome):
+            yield event
     yield reconcile_terminal(
         run_id=run_id, source=source, observations=observations,
         exit_code=code, cancelled=proc.cancelled, stderr=proc.stderr,

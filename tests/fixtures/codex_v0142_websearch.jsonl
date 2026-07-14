@@ -1,0 +1,6 @@
+{"type": "thread.started", "thread_id": "019f61b3-0000-7000-8000-000000000001"}
+{"type": "turn.started"}
+{"type": "item.started", "item": {"id": "ws_01", "type": "web_search", "query": "", "action": {"type": "other"}}}
+{"type": "item.completed", "item": {"id": "ws_01", "type": "web_search", "query": "Python latest stable version official downloads", "action": {"type": "search", "query": "Python latest stable version official downloads", "queries": ["Python latest stable version official downloads"]}}}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "The latest stable Python release is documented on python.org."}}
+{"type": "turn.completed", "usage": {"input_tokens": 12000, "cached_input_tokens": 8000, "output_tokens": 120, "reasoning_output_tokens": 64}}
