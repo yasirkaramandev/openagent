@@ -140,9 +140,34 @@ async def test_success_event_with_nonzero_exit_makes_run_failed(
 
 
 async def test_pid_and_session_persisted_immediately(app: OpenAgentApp, use_fake):
-    """Crash-restart simulation: after a run, a fresh app instance sees the persisted session id."""
+    """The pid and session id must hit the DB **the moment they arrive**, not at the end.
+
+    That is the whole point: a crash halfway through a run must still leave something another
+    process can cancel (needs the pid) and resume (needs the session id). Asserting only after the
+    run finishes would pass even if both were written once, at the very end — which is exactly the
+    hole this checks for.
+    """
+
     run = app.runs.create(agent_name="fake-coder", prompt="task", worktree="auto")
-    await app.runs.execute(run)
+
+    # Read the *persisted* row at the instant each event is emitted.
+    at_event: dict[str, tuple] = {}
+
+    def on_event(event) -> None:
+        etype = event.type if isinstance(event.type, str) else event.type.value
+        if etype in ("process.started", "session.created"):
+            stored = app.repos.runs.get(run.id)
+            at_event[etype] = (stored.pid, stored.provider_session_id)
+
+    await app.runs.execute(run, on_event=on_event)
+
+    # The pid was durable as soon as the backend process came up…
+    assert at_event["process.started"][0] is not None, "pid was not persisted when it arrived"
+    # …and the session id as soon as the backend reported it.
+    assert at_event["session.created"][1] == "th-fake-1", (
+        "session id was not persisted when it arrived"
+    )
+
     assert app.runs.get(run.id).provider_session_id == "th-fake-1"
 
     # A brand-new app object (simulating a restart) reads the same persisted state and can resume.
@@ -150,6 +175,7 @@ async def test_pid_and_session_persisted_immediately(app: OpenAgentApp, use_fake
     reloaded = restarted.runs.get(run.id)
     assert reloaded is not None
     assert reloaded.provider_session_id == "th-fake-1"
+    assert reloaded.pid is not None
 
 
 def test_orphan_recovery_uses_pid_identity(app: OpenAgentApp):
