@@ -136,6 +136,19 @@ def test_start_run_uses_print_json_flags(tmp_path: Path):
         "do it",
     )
     assert args[:5] == ["/usr/local/bin/agy", "--print", "do it", "--output-format", "json"]
+    assert "--model" not in args  # no model pinned → agy uses its own default
+
+
+def test_pinned_model_is_passed_to_agy(tmp_path: Path):
+    """A model discovered/pinned in the wizard must actually reach agy (--model), not be ignored."""
+
+    adapter = AntigravityAdapter(executable="agy", allow_experimental_edit=False)
+    args = adapter._build_args(
+        CliRunRequest(run_id="r", prompt="x", workspace=tmp_path, permission_profile="read-only",
+                      model="Gemini 3.5 Flash (Low)"),
+        "x",
+    )
+    assert args[args.index("--model") + 1] == "Gemini 3.5 Flash (Low)"
 
 
 # --------------------------------------------------------------------------- permission safety (item 15)

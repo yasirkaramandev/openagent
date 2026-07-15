@@ -179,6 +179,11 @@ class AntigravityAdapter:
         self, request: CliRunRequest, prompt: str, *, conversation: str | None = None
     ) -> list[str]:
         args = [self.executable or "agy", "--print", prompt, "--output-format", "json"]
+        if request.model:
+            # Pin the selected model (verified: `--model "<label>"` in agy --help, and the labels
+            # from `agy models` are accepted verbatim). Without this a model discovered/pinned in the
+            # wizard would be stored on the agent yet silently ignored — agy would use its default.
+            args += ["--model", request.model]
         if conversation:
             args += ["--conversation", conversation]
         args += self._permission_args(request.permission_profile)
