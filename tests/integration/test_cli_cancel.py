@@ -8,6 +8,7 @@ and idempotency are all exercised.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,13 @@ async def test_cancel_terminates_process_and_marks_cancelled(app: OpenAgentApp, 
     events = app.runs.output(run.id, "events")
     assert "run.cancelled" in events
     assert "run.completed" not in events
+    # The terminal event is the LAST log entry (item 1) and the projection settles on cancelled,
+    # never "cancelled/finalizing".
+    parsed = [json.loads(line) for line in events.splitlines() if line.strip()]
+    assert parsed[-1]["type"] == "run.cancelled"
+    proj = app.runs.projection(run.id)
+    assert proj.status == "cancelled"
+    assert proj.phase == "cancelled"
 
 
 async def test_cancel_is_idempotent(app: OpenAgentApp, fake):

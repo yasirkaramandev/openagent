@@ -153,6 +153,16 @@ class RunService:
             # so it is dropped rather than written to the log twice.
             if _is_redundant_phase(event, run):
                 return
+            if _is_terminal_event(event):
+                # The terminal event must be the LAST log entry and the final projection update
+                # (item 1). Every CLI adapter (via run_managed_cli) emits its own terminal event
+                # mid-stream; if we logged it here, the later ``finalizing`` phase + diff would land
+                # *after* it, leaving events[-1] == run.phase and projection "completed/finalizing".
+                # So capture its meaning now (status, failure, summary) but buffer it — the finalize
+                # block writes exactly one terminal event, last.
+                _capture(event, art, run, state)
+                state["pending_terminal"] = event
+                return
             saved = event_log.append(event)
             projection.apply(saved)
             _capture(saved, art, run, state)  # this is what advances run.phase
@@ -245,14 +255,29 @@ class RunService:
         finally:
             self.cancellations.discard(run.id)
 
-        # ---- finalize ---------------------------------------------------------------------
+        # ---- finalize (item 1) ------------------------------------------------------------
+        # The ``finalizing`` phase and the diff happen BEFORE the single terminal event, which is
+        # then written LAST — so events[-1] is always the terminal event and the projection never
+        # settles on "status: completed / phase: finalizing".
         sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
                              data={"phase": RunPhase.FINALIZING.value}))
         if workspace is not None:
-            # Collect diff + changed files from the workspace (git worktrees and copies alike).
-            art.diff = wt.diff(workspace)
-            art.files_changed = wt.changed_files(workspace)
-            run.files_changed = art.files_changed
+            try:
+                # Collect diff + changed files from the workspace (git worktrees and copies alike).
+                art.diff = wt.diff(workspace)
+                art.files_changed = wt.changed_files(workspace)
+                run.files_changed = art.files_changed
+            except Exception as exc:  # noqa: BLE001 - a finalization failure is its own terminal state
+                # A finalization error invalidates a prior *success* (item 1) but must not mask an
+                # earlier failure/cancellation (item 5): only an otherwise-completing run flips.
+                if state.get("terminal") in (None, RunStatus.COMPLETED):
+                    state["terminal"] = RunStatus.FAILED
+                    run.failure_type = "finalization_failed"
+                    state["pending_terminal"] = None  # the buffered success no longer holds
+                    if not art.error:
+                        art.error = {"error_type": "finalization_failed",
+                                     "message": str(exc) or exc.__class__.__name__,
+                                     "phase": RunPhase.FINALIZING.value, "source": "openagent"}
 
         final = self._resolve_final(run, state)
         run.status = final
@@ -264,12 +289,22 @@ class RunService:
                 art.summary = projection.final_message or "Run completed."
         self.repos.runs.upsert(run)
 
-        # Emit our own terminal event only if the runtime didn't already — exactly one per run.
-        if state.get("emitted_terminal") is not True:
-            sink(NormalizedEvent(run_id=run.id, type=_terminal_event_type(final), source="openagent",
-                                 data={"status": final.value,
-                                       "error_type": run.failure_type} if final is not RunStatus.COMPLETED
-                                 else {"status": final.value}))
+        # Write exactly one terminal event, LAST. Reuse the backend's own event when it still
+        # matches the resolved outcome (keeps its richer data, e.g. the final message/error);
+        # otherwise synthesize one for the reconciled status.
+        pending = state.get("pending_terminal")
+        if pending is not None and _status_of_terminal(pending) is final:
+            terminal_event = pending
+        else:
+            terminal_event = NormalizedEvent(
+                run_id=run.id, type=_terminal_event_type(final), source="openagent",
+                data={"status": final.value} if final is RunStatus.COMPLETED
+                else {"status": final.value, "error_type": run.failure_type},
+            )
+        saved = event_log.append(terminal_event)
+        projection.apply(saved)
+        if on_event is not None:
+            on_event(saved)
 
         writer.write_status(run)
         writer.write_results(run, art, projection)
@@ -687,6 +722,25 @@ def _terminal_event_type(status: RunStatus) -> EventType:
         RunStatus.COMPLETED: EventType.RUN_COMPLETED,
         RunStatus.CANCELLED: EventType.RUN_CANCELLED,
     }.get(status, EventType.RUN_FAILED)
+
+
+_TERMINAL_EVENT_TYPES = frozenset({
+    EventType.RUN_COMPLETED.value, EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value,
+})
+
+
+def _is_terminal_event(event: NormalizedEvent) -> bool:
+    etype = event.type if isinstance(event.type, str) else event.type.value
+    return etype in _TERMINAL_EVENT_TYPES
+
+
+def _status_of_terminal(event: NormalizedEvent) -> RunStatus | None:
+    etype = event.type if isinstance(event.type, str) else event.type.value
+    return {
+        EventType.RUN_COMPLETED.value: RunStatus.COMPLETED,
+        EventType.RUN_FAILED.value: RunStatus.FAILED,
+        EventType.RUN_CANCELLED.value: RunStatus.CANCELLED,
+    }.get(etype)
 
 
 def _typed(exc: Exception, error_type: str) -> Exception:

@@ -93,6 +93,45 @@ async def test_phases_are_reported_in_order(oa: OpenAgentApp, use_fake):
     assert oa.runs.get(run.id).phase == "completed"
 
 
+# ------------------------------------------------------- terminal event is the last log entry (item 1)
+
+
+async def test_terminal_event_is_the_last_log_entry_when_completed(oa: OpenAgentApp, use_fake):
+    """A CLI backend emits its own terminal event mid-stream; RunService must still write it LAST.
+
+    Regression: the ``finalizing`` phase + diff used to be logged *after* the backend's
+    ``run.completed``, leaving ``events[-1] == run.phase`` and a projection that read
+    "status: completed / phase: finalizing" — the state the TUI must never show (item 1).
+    """
+
+    run = oa.runs.create(agent_name="fake-coder", prompt="go", worktree="auto")
+    await oa.runs.execute(run)
+
+    events = _events(oa, run.id)
+    assert events[-1]["type"] == "run.completed", "finalizing must not trail the terminal event"
+    assert _types(events).count("run.completed") == 1
+    # …and the replayed projection settles on completed, never finalizing.
+    proj = oa.runs.projection(run.id)
+    assert proj.status == "completed"
+    assert proj.phase == "completed"
+    assert oa.runs.get(run.id).phase == "completed"
+
+
+async def test_terminal_event_is_the_last_log_entry_when_failed(
+    oa: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    install_fake_cli(monkeypatch, FakeCliAdapter(write_fake_script(tmp_path), mode="fail1"))
+    run = oa.runs.create(agent_name="fake-coder", prompt="go", worktree="auto")
+    await oa.runs.execute(run)
+
+    events = _events(oa, run.id)
+    assert events[-1]["type"] == "run.failed"
+    proj = oa.runs.projection(run.id)
+    assert proj.status == "failed"
+    assert proj.phase == "failed"
+    assert oa.runs.get(run.id).phase == "failed"
+
+
 # --------------------------------------------------------------------------- preflight gates (item 7)
 
 
