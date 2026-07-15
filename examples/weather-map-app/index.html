@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+  <title>Weather Map — OpenAgent example</title>
+  <meta name="description" content="Interactive weather map: click anywhere or search a city for current conditions, hourly and 7-day forecasts. No API key required." />
+
+  <!-- Leaflet (map). Pinned + SRI so the example is reproducible and tamper-evident. -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Full-screen map (background layer) -->
+    <div id="map" role="application" aria-label="Weather map. Click anywhere to load local weather."></div>
+
+    <!-- Floating search (top on mobile, top-left on desktop) -->
+    <form id="search-form" class="glass" role="search" autocomplete="off">
+      <label for="search-input" class="sr-only">Search for a city or place</label>
+      <div class="search-row">
+        <input
+          id="search-input"
+          name="q"
+          type="text"
+          placeholder="Search a city…  (e.g. Istanbul)"
+          aria-label="Search a city or place"
+          spellcheck="false"
+        />
+        <button id="search-btn" type="submit" aria-label="Search">🔍</button>
+        <button id="locate-btn" type="button" aria-label="Use my current location" title="Use my location">📍</button>
+      </div>
+      <ul id="suggestions" class="suggestions" role="listbox" aria-label="Search suggestions" hidden></ul>
+    </form>
+
+    <!-- Unit toggle + temperature legend -->
+    <div id="controls" class="glass" aria-hidden="false">
+      <div class="unit-toggle" role="group" aria-label="Temperature unit">
+        <button type="button" data-unit="c" class="unit active" aria-pressed="true">°C</button>
+        <button type="button" data-unit="f" class="unit" aria-pressed="false">°F</button>
+      </div>
+      <div class="legend" aria-label="Temperature colour scale">
+        <span class="legend-title">Temp</span>
+        <span class="legend-bar" aria-hidden="true"></span>
+        <span class="legend-min">−20°</span>
+        <span class="legend-max">40°+</span>
+      </div>
+    </div>
+
+    <!-- Weather detail panel: desktop sidebar / mobile bottom sheet -->
+    <section id="panel" class="glass panel" aria-live="polite" aria-label="Weather details">
+      <button id="panel-toggle" class="panel-grip" type="button" aria-label="Expand or collapse weather panel"></button>
+
+      <!-- Empty state -->
+      <div id="state-empty" class="panel-state">
+        <h1 class="panel-h">Weather Map</h1>
+        <p class="muted">Click anywhere on the map, search a city, or use 📍 to see live weather —
+          current conditions, hourly and a 7-day forecast.</p>
+        <p class="muted small">No account or API key needed. Your location is never stored.</p>
+      </div>
+
+      <!-- Loading state -->
+      <div id="state-loading" class="panel-state" hidden>
+        <div class="spinner" role="status" aria-label="Loading weather"></div>
+        <p class="muted" id="loading-label">Loading weather…</p>
+      </div>
+
+      <!-- Error state -->
+      <div id="state-error" class="panel-state" hidden>
+        <p class="error-icon" aria-hidden="true">⚠️</p>
+        <p id="error-message" class="error-text">Something went wrong.</p>
+        <button id="retry-btn" type="button" class="retry">Retry</button>
+      </div>
+
+      <!-- Data state -->
+      <div id="state-data" class="panel-state" hidden>
+        <header class="place">
+          <h2 id="place-name" class="place-name">—</h2>
+          <p id="place-coords" class="muted small">—</p>
+        </header>
+
+        <div class="current">
+          <div class="current-main">
+            <span id="cur-icon" class="cur-icon" aria-hidden="true">☀️</span>
+            <span id="cur-temp" class="cur-temp">—</span>
+          </div>
+          <div class="current-desc">
+            <p id="cur-cond" class="cur-cond">—</p>
+            <p id="cur-feels" class="muted small">Feels like —</p>
+          </div>
+        </div>
+
+        <ul class="metrics" aria-label="Current metrics">
+          <li><span class="m-label">Precip</span><span id="m-precip" class="m-val">—</span></li>
+          <li><span class="m-label">Chance</span><span id="m-pop" class="m-val">—</span></li>
+          <li><span class="m-label">Humidity</span><span id="m-humidity" class="m-val">—</span></li>
+          <li><span class="m-label">Wind</span><span id="m-wind" class="m-val">—</span></li>
+        </ul>
+
+        <h3 class="section-h">Next 24 hours</h3>
+        <div id="hourly" class="hourly" aria-label="Hourly forecast"></div>
+
+        <h3 class="section-h">7-day forecast</h3>
+        <ul id="daily" class="daily" aria-label="7-day forecast"></ul>
+
+        <p class="muted small credit">
+          Data: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> ·
+          Places: <a href="https://nominatim.org/" target="_blank" rel="noopener">Nominatim</a> ·
+          Map: © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>
+        </p>
+      </div>
+    </section>
+  </div>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script src="app.js" defer></script>
+</body>
+</html>
