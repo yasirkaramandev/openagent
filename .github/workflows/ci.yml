@@ -131,3 +131,104 @@ jobs:
 
       - name: Build package
         run: python -m build
+
+  # Real installer jobs (§5). These deliberately do NOT use actions/setup-python — the point is to
+  # simulate a machine where the user has not installed Python, and prove setup.sh / setup.bat bring
+  # their own managed Python via uv. They need network access (uv + managed Python + PyPI), so they
+  # are a separate, clearly named job. uv's tool/python dirs are redirected into RUNNER_TEMP so the
+  # runner's real environment is not polluted.
+  installer-unix:
+    name: installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      OPENAGENT_SETUP_NO_LAUNCH: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Isolate uv directories
+        run: |
+          {
+            echo "UV_TOOL_DIR=$RUNNER_TEMP/uv/tools"
+            echo "UV_TOOL_BIN_DIR=$RUNNER_TEMP/uv/bin"
+            echo "UV_PYTHON_INSTALL_DIR=$RUNNER_TEMP/uv/py"
+          } >> "$GITHUB_ENV"
+
+      - name: First install (setup.sh, no TUI launch)
+        run: bash setup.sh
+
+      - name: Verify openagent, managed Python, and parseable doctor JSON
+        run: |
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          openagent version
+          # doctor may exit non-zero (missing optional CLIs) but must emit parseable JSON.
+          openagent doctor --json > doctor.json || true
+          python3 -c "import json; json.load(open('doctor.json')); print('doctor json ok')"
+          # Managed Python was installed by uv — no dependency on a system Python.
+          ls "$UV_PYTHON_INSTALL_DIR" | grep -i cpython
+
+      - name: Installer created no .venv in the repo
+        run: test ! -d .venv
+
+      - name: Second install (update / idempotency)
+        run: bash setup.sh
+
+      - name: Install from a path containing spaces
+        run: |
+          dest="$RUNNER_TEMP/Open Agent Test"
+          rm -rf "$dest"; mkdir -p "$dest"
+          cp -R . "$dest/"
+          rm -rf "$dest/.venv"
+          UV_TOOL_DIR="$RUNNER_TEMP/uv2/tools" UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv2/bin" \
+            bash "$dest/setup.sh"
+          "$RUNNER_TEMP/uv2/bin/openagent" version
+
+  installer-windows:
+    name: installer (windows-latest)
+    runs-on: windows-latest
+    env:
+      OPENAGENT_SETUP_NO_LAUNCH: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Isolate uv directories
+        shell: cmd
+        run: |
+          echo UV_TOOL_DIR=%RUNNER_TEMP%\uv\tools>> "%GITHUB_ENV%"
+          echo UV_TOOL_BIN_DIR=%RUNNER_TEMP%\uv\bin>> "%GITHUB_ENV%"
+          echo UV_PYTHON_INSTALL_DIR=%RUNNER_TEMP%\uv\py>> "%GITHUB_ENV%"
+
+      - name: First install (setup.bat, no TUI launch)
+        shell: cmd
+        run: setup.bat
+
+      - name: Verify openagent and parseable doctor JSON
+        shell: cmd
+        run: |
+          set "PATH=%UV_TOOL_BIN_DIR%;%PATH%"
+          openagent version || exit /b 1
+          openagent doctor --json > doctor.json
+          python -c "import json;json.load(open('doctor.json'));print('doctor json ok')" || exit /b 1
+
+      - name: Installer created no .venv in the repo
+        shell: cmd
+        run: if exist .venv exit /b 1
+
+      - name: Second install (update / idempotency)
+        shell: cmd
+        run: setup.bat
+
+      - name: Install from a path containing spaces
+        shell: cmd
+        run: |
+          set "DEST=%RUNNER_TEMP%\Open Agent Test"
+          if exist "%DEST%" rmdir /s /q "%DEST%"
+          xcopy /E /I /Q /Y "%CD%" "%DEST%" >nul
+          if exist "%DEST%\.venv" rmdir /s /q "%DEST%\.venv"
+          set "UV_TOOL_DIR=%RUNNER_TEMP%\uv2\tools"
+          set "UV_TOOL_BIN_DIR=%RUNNER_TEMP%\uv2\bin"
+          call "%DEST%\setup.bat" || exit /b 1
+          "%RUNNER_TEMP%\uv2\bin\openagent.exe" version || exit /b 1
