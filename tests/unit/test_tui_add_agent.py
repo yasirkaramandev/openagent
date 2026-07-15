@@ -119,6 +119,29 @@ async def _create(pilot) -> None:
     await pilot.pause()
 
 
+async def _model_default_then_details(pilot, screen) -> None:
+    """On the Model step: pick the CLI default (model=None) and advance to Agent Details."""
+    assert screen.step == "model"
+    await _pick_radio(pilot, screen, "model-mode", 2)  # Use the CLI's default model
+    await _continue(pilot)
+    assert screen.step == "details"
+
+
+async def _model_manual_then_details(pilot, screen, model_id: str) -> None:
+    """On the Model step: enter a manual id and advance to Agent Details."""
+    assert screen.step == "model"
+    await _pick_radio(pilot, screen, "model-mode", 1)  # Enter a model ID manually
+    screen.query_one("#model", Input).value = model_id
+    await _continue(pilot)
+    assert screen.step == "details"
+
+
+async def _details_then_review(pilot, screen, name: str) -> None:
+    screen.query_one("#name", Input).value = name
+    await _continue(pilot)
+    assert screen.step == "review"
+
+
 def _preset_index(name: str) -> int:
     from openagent.providers.factory import preset_names
     return preset_names().index(name)
@@ -136,9 +159,10 @@ async def test_first_screen_is_backend_choice_not_full_form(tmp_path: Path):
         screen = await _open(pilot)
         assert screen.step == "backend"
         assert screen.query_one("#step-backend").display is True
-        assert "Step 1 of 3" in str(screen.query_one("#step-indicator").render())
+        assert "Step 1 of 5" in str(screen.query_one("#step-indicator").render())
         # No provider/model/CLI-selector/key fields on the first screen.
-        for hidden in ("#step-cli", "#step-provider", "#step-connection", "#common-fields"):
+        for hidden in ("#step-cli", "#step-provider", "#step-connection", "#step-model",
+                       "#common-fields", "#step-review"):
             assert screen.query_one(hidden).display is False
 
 
@@ -163,7 +187,7 @@ async def test_backend_api_then_continue_shows_provider_cards(tmp_path: Path):
         assert screen.query_one("#step-provider").display is True
         # CLI configuration is not shown on the API path.
         assert screen.query_one("#step-cli").display is False
-        assert screen.query_one("#cli-model-row").display is False
+        assert screen.query_one("#step-model").display is False
 
 
 # --------------------------------------------------------------------------- CLI path: create
@@ -177,13 +201,13 @@ async def test_create_codex_agent_via_keyboard(tmp_path: Path):
         await _continue(pilot)
         await _pick_radio(pilot, screen, "cli", 0)  # Codex
         await _continue(pilot)
-        assert screen.step == "cli_config"
-        assert "Codex CLI" in str(screen.query_one("#cli-runtime-info").render())
-        screen.query_one("#name", Input).value = "codex-coder"
+        await _model_default_then_details(pilot, screen)  # model is its own step now (item 11)
+        await _details_then_review(pilot, screen, "codex-coder")
         await _create(pilot)
         assert isinstance(pilot.app.screen, AgentsScreen)
     agent = oa.agents.get("codex-coder")
     assert agent is not None and agent.runtime.cli == "codex"
+    assert agent.runtime.model is None  # "Use CLI default" persists as no pinned model (item 11)
 
 
 async def test_create_claude_agent_via_keyboard(tmp_path: Path):
@@ -195,7 +219,8 @@ async def test_create_claude_agent_via_keyboard(tmp_path: Path):
         await _continue(pilot)
         await _pick_radio(pilot, screen, "cli", 1)  # Claude Code
         await _continue(pilot)
-        screen.query_one("#name", Input).value = "claude-coder"
+        await _model_default_then_details(pilot, screen)
+        await _details_then_review(pilot, screen, "claude-coder")
         await _create(pilot)
     agent = oa.agents.get("claude-coder")
     assert agent is not None and agent.runtime.cli == "claude"
@@ -212,8 +237,8 @@ async def test_create_antigravity_agent_when_installed(tmp_path: Path):
         detail = str(screen.query_one("#cli-detail").render())
         assert "antigravity" in detail and "1.2.3" in detail  # executable + version shown
         await _continue(pilot)
-        assert screen.step == "cli_config"
-        screen.query_one("#name", Input).value = "agy-coder"
+        await _model_default_then_details(pilot, screen)
+        await _details_then_review(pilot, screen, "agy-coder")
         await _create(pilot)
     agent = oa.agents.get("agy-coder")
     assert agent is not None and agent.runtime.cli == "antigravity"
@@ -256,16 +281,18 @@ async def test_cli_model_discovery_populates_select_and_pins_model(tmp_path: Pat
         await _continue(pilot)
         await _pick_radio(pilot, screen, "cli", 2)  # Antigravity
         await _continue(pilot)
-        assert screen.step == "cli_config"
-        screen._load_cli_models()
+        assert screen.step == "model"
+        screen._refresh_models()  # explicit Refresh on the Model step
         await pilot.pause()
         await pilot.pause()
-        options = _model_option_values(screen.query_one("#cli_model_select", Select))
+        options = _model_option_values(screen.query_one("#model_select", Select))
         assert options == ["Gemini 3.5 Flash (Low)", "Claude Sonnet 4.6"]
-        assert "found 2 model(s)" in str(screen.query_one("#cli-model-status").render())
-        # Pin a discovered model via the manual id field (the captured source of truth).
-        screen.query_one("#cli_model", Input).value = "Gemini 3.5 Flash (Low)"
-        screen.query_one("#name", Input).value = "agy-pinned"
+        assert "found 2 model(s)" in str(screen.query_one("#model-status").render())
+        # Discovered mode (default) + pick a discovered model.
+        screen.query_one("#model_select", Select).value = "Gemini 3.5 Flash (Low)"
+        await pilot.pause()
+        await _continue(pilot)
+        await _details_then_review(pilot, screen, "agy-pinned")
         await _create(pilot)
     agent = oa.agents.get("agy-pinned")
     assert agent is not None and agent.runtime.model == "Gemini 3.5 Flash (Low)"
@@ -289,18 +316,91 @@ async def test_cli_model_discovery_unavailable_keeps_manual_and_default_paths(tm
         await _continue(pilot)
         await _pick_radio(pilot, screen, "cli", 0)  # Codex — no offline model listing
         await _continue(pilot)
-        screen._load_cli_models()
+        assert screen.step == "model"
+        screen._refresh_models()
         await pilot.pause()
         await pilot.pause()
-        status = str(screen.query_one("#cli-model-status").render())
+        status = str(screen.query_one("#model-status").render())
         assert "unavailable" in status
-        assert _model_option_values(screen.query_one("#cli_model_select", Select)) == []
+        assert _model_option_values(screen.query_one("#model_select", Select)) == []
         # Manual id still works — nothing is blocked or faked.
-        screen.query_one("#cli_model", Input).value = "o3"
-        screen.query_one("#name", Input).value = "codex-manual"
+        await _model_manual_then_details(pilot, screen, "o3")
+        await _details_then_review(pilot, screen, "codex-manual")
         await _create(pilot)
     agent = oa.agents.get("codex-manual")
     assert agent is not None and agent.runtime.model == "o3"
+
+
+# --------------------------------------------------------------------------- model step (item 11)
+
+async def test_model_selection_is_its_own_step_before_details(tmp_path: Path):
+    """Model is a dedicated step between the backend choice and Agent Details (item 11)."""
+    oa = _app(tmp_path)
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        screen = await _open(pilot)
+        assert screen._step_list() == ["backend", "cli", "model", "details", "review"]
+        await _pick_radio(pilot, screen, "backend", 0)
+        await _continue(pilot)
+        await _pick_radio(pilot, screen, "cli", 0)
+        await _continue(pilot)
+        assert screen.step == "model"
+        # Agent Details is NOT shown on the model step (it used to be the same screen).
+        assert screen.query_one("#step-model").display is True
+        assert screen.query_one("#common-fields").display is False
+
+
+async def test_switching_cli_resets_the_discovered_model_list(tmp_path: Path, monkeypatch):
+    """A discovered list must not leak across a CLI change (item 11)."""
+    from openagent.runtimes.cli.registry import CliModelDiscovery
+
+    async def _fake_discover(cli_type, executable=None):
+        if cli_type == "antigravity":
+            return CliModelDiscovery("antigravity", True, ["Gemini 3.5 Flash (Low)"], "agy models")
+        return CliModelDiscovery(cli_type, False, [], "", "does not expose model listing")
+
+    monkeypatch.setattr("openagent.tui.screens.add_agent.discover_cli_models", _fake_discover)
+    oa = _app(tmp_path)
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        screen = await _open(pilot)
+        await _pick_radio(pilot, screen, "backend", 0)
+        await _continue(pilot)
+        await _pick_radio(pilot, screen, "cli", 2)  # Antigravity
+        await _continue(pilot)
+        screen._refresh_models()
+        await pilot.pause()
+        await pilot.pause()
+        assert _model_option_values(screen.query_one("#model_select", Select)) == ["Gemini 3.5 Flash (Low)"]
+        screen.query_one("#model_select", Select).value = "Gemini 3.5 Flash (Low)"
+        await pilot.pause()
+
+        # Back to CLI, switch to Codex, forward to the model step: the old list is gone.
+        await pilot.click("#back")
+        await pilot.pause()
+        await _pick_radio(pilot, screen, "cli", 0)  # Codex
+        await _continue(pilot)
+        assert screen.step == "model"
+        assert _model_option_values(screen.query_one("#model_select", Select)) == [], "stale list leaked"
+        assert screen.state.model is None, "a stale model selection leaked across CLIs"
+
+
+async def test_review_shows_the_real_model(tmp_path: Path):
+    """The Review step displays the actual chosen model (item 11)."""
+    oa = _app(tmp_path)
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        screen = await _open(pilot)
+        await _pick_radio(pilot, screen, "backend", 0)
+        await _continue(pilot)
+        await _pick_radio(pilot, screen, "cli", 0)  # Codex
+        await _continue(pilot)
+        await _model_manual_then_details(pilot, screen, "gpt-5.5")
+        await _details_then_review(pilot, screen, "codex-coder")
+        review = str(screen.query_one("#review-card").render())
+        assert "gpt-5.5" in review
+        assert "not verified" in review  # a manual id is flagged as unverified
+        assert "codex-coder" in review
 
 
 # --------------------------------------------------------------------------- API path: new connection
@@ -321,10 +421,9 @@ async def test_api_new_connection_creates_provider_and_agent(tmp_path: Path):
         assert screen.query_one("#api_key", Input).password is True
         screen.query_one("#conn_name", Input).value = "deepseek-main"
         screen.query_one("#api_key", Input).value = "sk-secret"
-        screen.query_one("#model", Input).value = "deepseek-chat"
-        await _continue(pilot)
-        assert screen.step == "api_config"
-        screen.query_one("#name", Input).value = "ds-coder"
+        await _continue(pilot)  # -> model step (item 11)
+        await _model_manual_then_details(pilot, screen, "deepseek-chat")
+        await _details_then_review(pilot, screen, "ds-coder")
         await _create(pilot)
 
     provider = oa.providers.get("deepseek-main")
@@ -384,9 +483,9 @@ async def test_api_local_provider_no_key_manual_model(tmp_path: Path):
         assert screen.query_one("#key-row").display is False
         assert screen.query_one("#env-row").display is False
         screen.query_one("#conn_name", Input).value = "local-llm"
-        screen.query_one("#model", Input).value = "llama3"
-        await _continue(pilot)
-        screen.query_one("#name", Input).value = "local-agent"
+        await _continue(pilot)  # -> model step
+        await _model_manual_then_details(pilot, screen, "llama3")
+        await _details_then_review(pilot, screen, "local-agent")
         await _create(pilot)
     agent = oa.agents.get("local-agent")
     provider = oa.providers.get("local-llm")
@@ -411,9 +510,9 @@ async def test_api_existing_connection_no_key_field(tmp_path: Path):
         # No API-key field for an existing connection.
         assert screen.query_one("#key-row").display is False
         screen.query_one("#existing-provider", Select).value = "deepseek-main"
-        screen.query_one("#model", Input).value = "deepseek-chat"
-        await _continue(pilot)
-        screen.query_one("#name", Input).value = "reuse-agent"
+        await _continue(pilot)  # -> model step
+        await _model_manual_then_details(pilot, screen, "deepseek-chat")
+        await _details_then_review(pilot, screen, "reuse-agent")
         await _create(pilot)
     agent = oa.agents.get("reuse-agent")
     assert agent is not None and agent.runtime.provider == "deepseek-main"
@@ -602,11 +701,13 @@ async def test_max_steps_is_validated_rather_than_silently_defaulted(tmp_path: P
         await _continue(pilot)
         await _pick_radio(pilot, screen, "cli", _cli_index("codex"))
         await _continue(pilot)
+        await _model_default_then_details(pilot, screen)
 
         screen.query_one("#name", Input).value = "steps-agent"
         screen.query_one("#max_steps", Input).value = "5000"
-        await _create(pilot)
+        await _continue(pilot)  # validation happens leaving Agent Details
 
+        assert screen.step == "details", "advanced past Agent Details with an invalid max_steps"
         assert isinstance(pilot.app.screen, AddAgentScreen), "the agent was created anyway"
         assert "between 1 and 500" in str(screen.query_one("#err-steps", Label).content)
     assert oa.agents.get("steps-agent") is None
@@ -619,7 +720,9 @@ async def test_max_steps_is_validated_rather_than_silently_defaulted(tmp_path: P
         await _continue(pilot)
         await _pick_radio(pilot, screen, "cli", _cli_index("codex"))
         await _continue(pilot)
+        await _model_default_then_details(pilot, screen)
         screen.query_one("#name", Input).value = "steps-agent"
         screen.query_one("#max_steps", Input).value = "120"
+        await _continue(pilot)  # -> review
         await _create(pilot)
     assert oa.agents.get("steps-agent").max_steps == 120

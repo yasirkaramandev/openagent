@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..core.cancellation import RunCancellation
 from ..core.permissions import PermissionProfile
 from ..security.approvals import ApprovalGate, ApprovalRequest
 
@@ -54,6 +55,10 @@ class ToolContext:
     #: default: an API agent's commands never inherit provider keys or the parent environment
     #: (spec §7). Populate only with credentials a specific operation explicitly needs.
     command_env: dict[str, str] = field(default_factory=dict)
+    #: The run's cancellation controller (item 9.2). A blocking tool subprocess (``run_command`` /
+    #: ``run_tests``) polls it so a Cancel kills the whole process tree *while the command is still
+    #: running* — not only after it exits. ``None`` in contexts without a live run (unit tests).
+    cancellation: RunCancellation | None = None
 
     def request_approval(
         self, action: str, detail: str, *, command: str = "", reason: str = ""

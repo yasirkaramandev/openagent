@@ -91,11 +91,19 @@ async def run_api_agent(
         tool_calls = []
         error_type = error_message = None
         stream = adapter.stream_response(request)
+        iterator = stream.__aiter__()
         try:
-            async for event in stream:
-                # Checked on every chunk: cancelling abandons the stream, and leaving the async-for
-                # closes the underlying HTTP response rather than draining it in the background.
-                cancel.check()
+            while True:
+                # Consume the stream one event at a time through ``cancel.guard`` (item 9.1). A plain
+                # ``async for`` only re-checks cancellation when a *new* chunk arrives, so a provider
+                # that accepts the request and then goes silent would hang forever despite a Cancel.
+                # ``guard`` races the pending ``__anext__`` against the cancellation event: the moment
+                # cancellation is requested it cancels that read (tearing down the HTTP response) and
+                # raises ``RunCancelled`` — even if no chunk ever comes.
+                try:
+                    event = await cancel.guard(iterator.__anext__())
+                except StopAsyncIteration:
+                    break
                 if event.type == ModelEventType.TEXT_DELTA and event.text:
                     text_parts.append(event.text)
                     _emit(EventType.MESSAGE_DELTA, text=event.text, step=step)

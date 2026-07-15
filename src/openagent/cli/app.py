@@ -23,6 +23,7 @@ from ..providers.factory import PRESETS, preset_names
 from ..services.agent_service import AgentError
 from ..services.provider_service import ProviderInUseError, ProviderValidationError
 from ..services.run_service import RunError
+from ..tui.markup import safe_line, safe_markup
 
 app = typer.Typer(
     add_completion=False, no_args_is_help=False,
@@ -46,7 +47,9 @@ def _run(coro):
 
 
 def _fail(message: str) -> NoReturn:
-    err.print(f"[red]error:[/red] {message}")
+    # Error messages routinely carry user/model-derived names (provider, agent, model ids); escape so
+    # a crafted name can't forge or corrupt the terminal output (item 12).
+    err.print(f"[red]error:[/red] {safe_markup(message)}")
     raise typer.Exit(1)
 
 
@@ -83,7 +86,8 @@ def discover() -> None:
         if install:
             mark = "[green]✓[/green]"
             auth = "authenticated" if install.authenticated else "not authenticated"
-            console.print(f"{mark} {cli_type} CLI found — {install.version or install.executable} ({auth})")
+            detail = safe_markup(install.version or install.executable)
+            console.print(f"{mark} {cli_type} CLI found — {detail} ({auth})")
         else:
             console.print(f"[red]✗[/red] {cli_type} CLI not found")
     for extra in sorted(found - known):  # pragma: no cover
@@ -96,7 +100,7 @@ def add_agent(
     title: str = typer.Option("", "--title"),
     description: str = typer.Option("", "--description"),
     provider: str | None = typer.Option(None, "--provider", help="Provider name (API agent)."),
-    model: str | None = typer.Option(None, "--model", help="Remote model id (API agent)."),
+    model: str | None = typer.Option(None, "--model", help="Model id/label for API or CLI agents."),
     cli: str | None = typer.Option(None, "--cli", help="CLI type, e.g. codex/claude (CLI agent)."),
     tag: list[str] = typer.Option([], "--tag", help="Repeatable tag."),
     system_prompt: str = typer.Option("", "--system-prompt"),
@@ -106,9 +110,13 @@ def add_agent(
     oa = _app()
     try:
         if cli:
+            # A CLI agent may pin a model too (``codex -m`` / ``claude --model`` / ``agy --model``);
+            # ``None`` means "use the CLI's own default". This path used to silently drop --model,
+            # so a CLI agent could never be created with a pinned model from the CLI (item 10).
             agent = oa.agents.create(
                 name=name, title=title, description=description, runtime_type=RuntimeType.CLI,
-                cli=cli, tags=tag, system_prompt=system_prompt, permission_profile=profile,
+                cli=cli, model=model, tags=tag, system_prompt=system_prompt,
+                permission_profile=profile,
             )
         else:
             if not oa.providers.get(provider or ""):
@@ -120,7 +128,8 @@ def add_agent(
             )
     except AgentError as exc:
         _fail(str(exc))
-    console.print(f"[green]✓[/green] agent [bold]{agent.name}[/bold] created; OPENAGENT.md updated")
+    console.print(f"[green]✓[/green] agent [bold]{safe_markup(agent.name)}[/bold] created; "
+                  "OPENAGENT.md updated")
 
 
 @app.command("list")
@@ -136,8 +145,8 @@ def runs(limit: int = typer.Option(20, "--limit")) -> None:
     table = Table("ID", "Agent", "Status", "Started", "Files")
     for run in oa.runs.list(limit):
         status = enum_value(run.status)
-        table.add_row(run.id, run.agent, status, run.started_at.strftime("%m-%d %H:%M"),
-                      str(len(run.files_changed)))
+        table.add_row(safe_line(run.id), safe_line(run.agent), safe_line(status),
+                      run.started_at.strftime("%m-%d %H:%M"), str(len(run.files_changed)))
     console.print(table)
 
 
@@ -169,9 +178,10 @@ def run(
     result = _run(oa.runs.execute(run_obj, on_event=_print_event, approval_callback=approval))
     status = enum_value(result.status)
     color = "green" if status == "completed" else "red"
-    console.print(f"\n[{color}]● {status}[/{color}] — run {result.id}")
-    console.print(f"  files changed: {', '.join(result.files_changed) or '(none)'}")
-    console.print(f"  output: [bold]openagent output --id {result.id}[/bold]")
+    files = safe_markup(", ".join(result.files_changed) or "(none)")
+    console.print(f"\n[{color}]● {status}[/{color}] — run {safe_markup(result.id)}")
+    console.print(f"  files changed: {files}")
+    console.print(f"  output: [bold]openagent output --id {safe_markup(result.id)}[/bold]")
 
 
 @app.command()
@@ -229,8 +239,8 @@ def doctor(json_out: bool = typer.Option(False, "--json")) -> None:
         return
     marks = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
     for check in checks:
-        console.print(f"{marks.get(check.status, '?')} {check.name}"
-                      + (f" — [dim]{check.detail}[/dim]" if check.detail else ""))
+        console.print(f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
+                      + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else ""))
 
 
 @app.command("mcp")
@@ -270,9 +280,9 @@ def provider_add(
         )
     except ProviderValidationError as exc:
         _fail(str(exc))
-    console.print(f"[green]✓[/green] provider [bold]{name}[/bold] added "
-                  f"({provider.provider_type}, {provider.protocol.value})")
-    console.print(f"  test it: [bold]openagent provider test {name}[/bold]")
+    console.print(f"[green]✓[/green] provider [bold]{safe_markup(name)}[/bold] added "
+                  f"({safe_markup(provider.provider_type)}, {safe_markup(provider.protocol.value)})")
+    console.print(f"  test it: [bold]openagent provider test {safe_markup(name)}[/bold]")
 
 
 @provider_app.command("list")
@@ -285,7 +295,8 @@ def provider_list(json_out: bool = typer.Option(False, "--json")) -> None:
     table = Table("Name", "Type", "Protocol", "Base URL", "Key")
     for p in providers:
         cred = p.credential.type if isinstance(p.credential.type, str) else p.credential.type.value
-        table.add_row(p.name, p.provider_type, p.protocol.value, p.base_url or "(preset)", cred)
+        table.add_row(safe_line(p.name), safe_line(p.provider_type), safe_line(p.protocol.value),
+                      safe_line(p.base_url or "(preset)"), safe_line(cred))
     console.print(table)
 
 
@@ -294,7 +305,7 @@ def provider_test(name: str = typer.Argument(...)) -> None:
     oa = _app()
     result = _run(oa.providers.test(name))
     if result.ok:
-        console.print(f"[green]✓[/green] {name}: {result.detail}")
+        console.print(f"[green]✓[/green] {safe_markup(name)}: {safe_markup(result.detail)}")
     else:
         _fail(f"{name}: {result.detail}")
 
@@ -307,7 +318,7 @@ def provider_models(name: str = typer.Argument(...)) -> None:
         console.print("[yellow]no models returned (provider may lack a /models endpoint)[/yellow]")
         return
     for m in models:
-        console.print(f"  {m.id}")
+        console.print(f"  {safe_markup(m.id)}")
 
 
 @provider_app.command("remove")
@@ -317,7 +328,7 @@ def provider_remove(name: str = typer.Argument(...)) -> None:
     except ProviderInUseError as exc:
         _fail(str(exc))
     if removed:
-        console.print(f"[green]✓[/green] removed provider {name}")
+        console.print(f"[green]✓[/green] removed provider {safe_markup(name)}")
     else:
         _fail(f"provider {name!r} not found")
 
@@ -341,7 +352,7 @@ def agent_add(
     title: str = typer.Option("", "--title"),
     description: str = typer.Option("", "--description"),
     provider: str | None = typer.Option(None, "--provider"),
-    model: str | None = typer.Option(None, "--model"),
+    model: str | None = typer.Option(None, "--model", help="Model id/label for API or CLI agents."),
     cli: str | None = typer.Option(None, "--cli"),
     tag: list[str] = typer.Option([], "--tag"),
     system_prompt: str = typer.Option("", "--system-prompt"),
@@ -368,7 +379,7 @@ def agent_show(name: str = typer.Argument(...)) -> None:
 @agent_app.command("remove")
 def agent_remove(name: str = typer.Argument(...)) -> None:
     if _app().agents.remove(name):
-        console.print(f"[green]✓[/green] removed agent {name}; OPENAGENT.md updated")
+        console.print(f"[green]✓[/green] removed agent {safe_markup(name)}; OPENAGENT.md updated")
     else:
         _fail(f"agent {name!r} not found")
 
@@ -386,25 +397,33 @@ def _print_agents(oa: OpenAgentApp, json_out: bool) -> None:
         rt = a.runtime
         rtype = rt.type if isinstance(rt.type, str) else rt.type.value
         runtime = f"{rt.cli}-cli" if rtype == "cli" else f"api:{rt.provider}"
-        table.add_row(a.name, a.title or "—", runtime, ", ".join(a.tags) or "—", a.permission_profile)
+        table.add_row(safe_line(a.name), safe_line(a.title or "—"), safe_line(runtime),
+                      safe_line(", ".join(a.tags) or "—"), safe_line(a.permission_profile))
     console.print(table)
 
 
 def _print_event(event: NormalizedEvent) -> None:
     etype = event.type if isinstance(event.type, str) else event.type.value
     data = event.data
+    # Every value below is model- or command-controlled (a tool name, a shell command, a file path, a
+    # failure message). Escape each before it enters a Rich markup string, or a payload like
+    # "[green]✓ done[/green]" would forge a success line or corrupt the render (item 12).
+    tool = safe_markup(data.get("tool", ""))
+    command = safe_markup(data.get("command", ""))
+    path = safe_markup(data.get("path", ""))
+    message = safe_markup(data.get("message", ""))
     icons = {
         "run.started": "[dim]▶ run started[/dim]",
-        "tool.requested": f"[cyan]→[/cyan] {data.get('tool', '')}",
-        "tool.completed": f"[green]✓[/green] {data.get('tool', '')}",
-        "tool.failed": f"[red]✗[/red] {data.get('tool', '')}",
-        "command.started": f"[blue]$[/blue] {data.get('command', '')}",
-        "file.created": f"[green]+[/green] {data.get('path', '')}",
-        "file.modified": f"[yellow]✎[/yellow] {data.get('path', '')}",
-        "file.deleted": f"[red]-[/red] {data.get('path', '')}",
+        "tool.requested": f"[cyan]→[/cyan] {tool}",
+        "tool.completed": f"[green]✓[/green] {tool}",
+        "tool.failed": f"[red]✗[/red] {tool}",
+        "command.started": f"[blue]$[/blue] {command}",
+        "file.created": f"[green]+[/green] {path}",
+        "file.modified": f"[yellow]✎[/yellow] {path}",
+        "file.deleted": f"[red]-[/red] {path}",
         "test.completed": f"[magenta]tests[/magenta] {'passed' if data.get('passed') else 'failed'}",
         "run.completed": "[green]● completed[/green]",
-        "run.failed": f"[red]● failed[/red] {data.get('message', '')}",
+        "run.failed": f"[red]● failed[/red] {message}",
     }
     line = icons.get(etype)
     if line:

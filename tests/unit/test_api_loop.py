@@ -1,8 +1,10 @@
 """End-to-end test of the API agent loop with a fake adapter (no network)."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from openagent.core.cancellation import RunCancellation
 from openagent.core.events import (
     ModelEventType,
     NormalizedEvent,
@@ -141,3 +143,60 @@ async def test_loop_reports_error(tmp_path: Path):
     )
     assert not outcome.completed
     assert outcome.error_type == "authentication_failed"
+
+
+# --------------------------------------------------------------------------- stalled-stream cancel (9.1)
+
+
+class StallingAdapter:
+    """Accepts the request, then never yields another event — a hung/silent provider.
+
+    The whole point of item 9.1: with a plain ``async for`` the loop only re-checks cancellation when
+    a *new* chunk arrives, so a provider that goes quiet after the request pins the run forever. The
+    stream also records whether it was ``aclose()``d, so the test can prove the HTTP response is torn
+    down rather than left dangling.
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.aclosed = False
+
+    def stream_response(self, request: NormalizedModelRequest) -> "StallingAdapter._Stream":
+        return self._Stream(self)
+
+    class _Stream:
+        def __init__(self, parent: "StallingAdapter") -> None:
+            self.parent = parent
+
+        def __aiter__(self) -> "StallingAdapter._Stream":
+            return self
+
+        async def __anext__(self) -> NormalizedModelEvent:
+            self.parent.entered.set()
+            await asyncio.Event().wait()  # block forever: the provider produced nothing more
+            raise StopAsyncIteration  # pragma: no cover - unreachable
+
+        async def aclose(self) -> None:
+            self.parent.aclosed = True
+
+
+async def test_stalled_stream_is_cancelled_without_a_new_chunk(tmp_path: Path):
+    """Cancelling a run whose provider is mid-stream but silent really stops it (item 9.1)."""
+
+    adapter = StallingAdapter()
+    cancel = RunCancellation("run_stall")
+    events: list[NormalizedEvent] = []
+    task = asyncio.create_task(run_api_agent(
+        run_id="run_stall", agent=_agent(), prompt="x", adapter=adapter,
+        executor=_executor(tmp_path), workspace_root=tmp_path, emit=events.append,
+        cancellation=cancel,
+    ))
+
+    await asyncio.wait_for(adapter.entered.wait(), timeout=2)  # the loop is now awaiting __anext__
+    cancel.cancel("user requested stop")
+    outcome = await asyncio.wait_for(task, timeout=5)  # no hang: the guarded read is abandoned
+
+    assert outcome.cancelled and not outcome.completed
+    assert outcome.error_type == "user_cancelled"
+    assert adapter.aclosed, "the stalled stream must be aclose()d on cancel"
+    assert not any(e.type == "run.completed" for e in events)

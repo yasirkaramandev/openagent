@@ -4,6 +4,41 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-07-15
+
+Runtime hardening, one-command cross-platform install, and an AI skill.
+
+### Added
+- **Cross-platform bootstrap installers** — `setup.sh` (macOS/Linux) and `setup.bat` (Windows), built
+  on [uv](https://docs.astral.sh/uv/). No pre-installed Python needed.
+- **Managed Python through uv** — the installer downloads an isolated Python 3.12; the system Python
+  is never touched and no `.venv` is created in the repo.
+- **Terminal-wide `openagent` command** — the installers link `openagent` onto PATH so a new terminal
+  runs it directly; `OPENAGENT_SETUP_NO_LAUNCH=1` verifies without opening the TUI (for CI).
+- **AI skill documentation** — `skills/openagent/SKILL.md` (+ `skills/README.md`) teaches assistants
+  the safe CLI workflow: setup, model selection, running, artifacts, cancellation, resume, security.
+- **Installer CI** — Ubuntu/macOS/Windows jobs that run the installers without `actions/setup-python`.
+
+### Fixed
+- **Runtime cancellation hardening** — a stalled provider stream (no new chunk) is now cancellable
+  (the read is guarded by the cancellation event), and a blocking `run_command`/`run_tests` is
+  cancelled mid-flight, terminating the whole child + grandchild process tree.
+- **Bounded API tool output** — `run_command`/`run_tests` enforce a real byte limit as the process
+  runs (`OutputLimitExceeded` → a safe `ToolError`), instead of only truncating afterward.
+- **Artifact lifecycle hardening** — the whole run is inside one exception boundary with atomic
+  (temp-file + replace) artifact writes; a setup/finalize failure can never leave a run "running" or
+  make an artifact-write failure look like success.
+- **Orphan recovery correction** — a live but unowned run (a restart can't reattach its stream) is
+  marked `orphaned_unattached_process` (recorded, not killed), not left "running".
+- **CLI model persistence** — `openagent add --cli … --model …` now persists the model and it reaches
+  the run argv (previously silently dropped on the CLI path); `--model` help text corrected.
+- **Separate model-selection wizard step** — model choice is its own page in the Add-Agent wizard,
+  with per-backend discovery, manual/default/verified status, and no leakage across backend changes.
+- **CLI markup escaping** — the CLI event renderer and tables escape model/command/path/error values.
+- **Repository rename URL cleanup** — all `open-agent` URLs updated to `openagent`.
+
+[0.1.1]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.1
+
 ## [0.1.0] — 2026-07-15
 
 First tagged release (alpha). Local-first control plane for AI APIs, coding CLIs, and agents.
@@ -45,4 +80,4 @@ First tagged release (alpha). Local-first control plane for AI APIs, coding CLIs
 - No OS-level/kernel sandbox — isolation is by workspace, not by process.
 - `agy` plan-mode reviews can exceed its print timeout on large multi-file prompts.
 
-[0.1.0]: https://github.com/yasirkaramandev/open-agent/releases/tag/v0.1.0
+[0.1.0]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.0

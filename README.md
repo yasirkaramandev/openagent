@@ -1,6 +1,6 @@
 # OpenAgent
 
-[![CI](https://github.com/yasirkaramandev/open-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/yasirkaramandev/open-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/yasirkaramandev/openagent/actions/workflows/ci.yml/badge.svg)](https://github.com/yasirkaramandev/openagent/actions/workflows/ci.yml)
 
 **Local-first control plane for AI APIs, coding CLIs, and autonomous agents.**
 
@@ -52,14 +52,96 @@ capture), **Offline contract tested** (mocked transport), **Experimental**, **Un
 Everything except the live-CLI/live-API rows runs in the **offline test suite in CI**
 (Ubuntu 3.10/3.11/3.12) with no API keys and no installed CLIs.
 
-## Install
+## Quick Install
 
-Requires **Python 3.10+**. From a clone:
+**No pre-installed Python required.** The installer sets up an isolated Python runtime for OpenAgent
+via [uv](https://docs.astral.sh/uv/) — it never touches your system Python and never creates a
+`.venv` in the repo.
+
+### macOS and Linux
 
 ```bash
-python3.10 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+git clone https://github.com/yasirkaramandev/openagent.git
+cd openagent
+bash setup.sh
 ```
+
+After it finishes:
+
+```bash
+openagent
+```
+
+### Windows
+
+```bat
+git clone https://github.com/yasirkaramandev/openagent.git
+cd openagent
+setup.bat
+```
+
+After it finishes:
+
+```bat
+openagent
+```
+
+**What the installer does — and does not do:**
+
+- You do **not** need Python installed first: the script installs a **managed Python 3.12** in an
+  isolated location, just for OpenAgent.
+- You never activate a `.venv`. OpenAgent is installed as an isolated `uv` tool and linked onto your
+  PATH.
+- **Nothing** is installed into your system Python, and no `.venv` is created inside the repo.
+- **Re-running the script updates** your install; your agents, providers, runs, and keychain entries
+  are preserved.
+- OpenAgent **opens automatically** at the end of a normal install.
+- In a **new terminal**, `openagent` works directly (the installer puts it on your PATH).
+
+CI/automation can set `OPENAGENT_SETUP_NO_LAUNCH=1` to verify the install without opening the TUI.
+
+### Updating
+
+macOS/Linux:
+
+```bash
+git pull
+bash setup.sh
+```
+
+Windows:
+
+```bat
+git pull
+setup.bat
+```
+
+### Developer install (contributors only)
+
+This is **not** the end-user install. To hack on OpenAgent itself, use a manual editable environment
+with the dev tools:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+### Troubleshooting
+
+- **`uv` download failed / corporate proxy or certificate** — the installer fetches `uv` over HTTPS
+  from `astral.sh`. Behind a proxy, set `HTTPS_PROXY` / `SSL_CERT_FILE`, or install `uv` manually
+  (<https://docs.astral.sh/uv/>) and re-run the script (it reuses an existing `uv`).
+- **`openagent: command not found` after install** — open a **new** terminal; PATH changes apply to
+  new shells. The installer also prints the exact executable path it linked.
+- **`permission denied` running setup.sh** — run it as `bash setup.sh` (no execute bit needed), or
+  `chmod +x setup.sh` first.
+- **Windows execution/path issue** — run `setup.bat` from CMD, or `.\setup.bat` from PowerShell; paths
+  with spaces are handled.
+- **A different `openagent` is already on PATH** — the installer detects and reports the existing
+  command, and prints the path of the one it just installed.
+- **`doctor` warns about missing Codex/Claude/agy** — those are **optional** CLIs; their absence is a
+  warning, **not** an install failure.
 
 ## Quickstart
 
@@ -91,6 +173,19 @@ openagent output --id <run-id> --format diff
 openagent message --id <run-id> -p "now add a test"
 openagent cancel --id <run-id>
 ```
+
+## AI Agent Skill
+
+AI assistants can learn OpenAgent's safe CLI workflow from a bundled **skill**:
+
+- [OpenAgent skill](skills/openagent/SKILL.md)
+- [Skills index](skills/README.md)
+
+The skill covers agent/provider setup, model selection, run execution, artifact inspection,
+cancellation, resume, and the security boundaries an AI must respect (never put keys in `argv`, default
+to `--worktree auto`, trust `status` not exit text, treat `failed`/`cancelled`/`orphaned` as *not*
+completed, inspect the diff before accepting a change). Every command in it is accepted by the current
+`openagent` CLI.
 
 ## Example: a real multi-agent build
 

@@ -21,6 +21,7 @@ model messages) is bounded before it is written.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -168,8 +169,19 @@ class ArtifactWriter:
         self._text(name, json.dumps(data, indent=2))
 
     def _text(self, name: str, text: str) -> None:
+        # Atomic write (item 9.4): render into a sibling temp file, then ``os.replace`` it into place.
+        # A reader (the TUI, the CLI, another agent) therefore only ever sees a *complete* artifact —
+        # never a half-written result.json — even if the process dies mid-write or the disk fills.
         path = self.run_dir / name
-        path.write_text(text, encoding="utf-8")
+        tmp = path.with_name(f".{name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            _secure_file(tmp)
+            os.replace(tmp, path)  # atomic on POSIX and Windows when src/dst share a directory
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
         _secure_file(path)
 
 

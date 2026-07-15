@@ -122,3 +122,48 @@ def test_provider_presets():
 def test_runs_empty():
     result = runner.invoke(app, ["runs"])
     assert result.exit_code == 0
+
+
+# --------------------------------------------------------------------------- CLI agent --model (item 10)
+
+
+def test_cli_agent_add_persists_model_and_reaches_run_argv():
+    """`openagent add --cli … --model …` must persist the model AND have it reach the run argv.
+
+    The top-level `add` used to drop `--model` on the CLI path entirely, so a CLI agent could never
+    be created with a pinned model from the CLI — it silently inherited the CLI's global default.
+    """
+    import json
+
+    from openagent.runtimes.cli.antigravity import AntigravityAdapter
+    from openagent.runtimes.cli.base import CliRunRequest
+
+    result = runner.invoke(app, [
+        "add", "--name", "agy-worker", "--cli", "antigravity", "--model", "Gemini 3.5 Flash (Low)",
+    ])
+    assert result.exit_code == 0, result.stdout
+
+    shown = runner.invoke(app, ["agent", "show", "agy-worker"])
+    assert shown.exit_code == 0, shown.stdout
+    agent = json.loads(shown.stdout)
+    assert agent["runtime"]["model"] == "Gemini 3.5 Flash (Low)"
+
+    # And the persisted model is exactly what a real run would hand the CLI (RunService._run_cli
+    # builds the request with ``model=agent.runtime.model or None``).
+    args = AntigravityAdapter(executable="agy", allow_experimental_edit=False)._build_args(
+        CliRunRequest(run_id="r", prompt="x", workspace=Path.cwd(), permission_profile="read-only",
+                      model=agent["runtime"]["model"] or None),
+        "x",
+    )
+    assert args[args.index("--model") + 1] == "Gemini 3.5 Flash (Low)"
+
+
+def test_agent_add_subcommand_also_persists_cli_model():
+    import json
+
+    result = runner.invoke(app, [
+        "agent", "add", "--name", "codex-coder", "--cli", "codex", "--model", "gpt-5.5",
+    ])
+    assert result.exit_code == 0, result.stdout
+    agent = json.loads(runner.invoke(app, ["agent", "show", "codex-coder"]).stdout)
+    assert agent["runtime"]["model"] == "gpt-5.5"

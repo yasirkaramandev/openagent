@@ -1,12 +1,11 @@
-"""Add-Agent wizard — a backend-first, multi-step flow (spec §31, parts 1-3, 16).
+"""Add-Agent wizard — a backend-first, multi-step flow (spec §31, parts 1-3, 16; item 11).
 
 The first screen asks *what kind of backend* to add (CLI Agent vs API Model) — never the full form.
-From there the path forks:
+From there the path forks, and **model selection is its own step** (item 11), never buried in Agent
+Details:
 
-* **CLI**: Backend → choose an installed CLI (Codex / Claude Code / Antigravity, from the live CLI
-  registry) → configure the agent. An uninstalled CLI blocks Continue with a clear reason.
-* **API**: Backend → choose a provider preset → connection (new *or* an existing saved connection) →
-  configure the agent.
+* **CLI**:  Backend → CLI → Model → Agent Details → Review → Create
+* **API**:  Backend → Provider → Connection → Model → Agent Details → Review → Create
 
 All state lives in an :class:`AddAgentWizardState` (the API key as a ``SecretStr``); the final Create
 reads only that state and calls the existing application services — no business rules are duplicated
@@ -56,6 +55,9 @@ from ..wizard_state import AddAgentWizardState, BackendType
 #: A single agent-loop bound. 40 is the default; anything outside this is a mistake, not a preference.
 MIN_STEPS, MAX_STEPS = 1, 500
 
+#: Model-selection modes on the dedicated Model step (item 11).
+_MODEL_MODES = ["discovered", "manual", "default"]
+
 
 class WizardRadioSet(RadioSet):
     """A RadioSet where **Space selects** and **Enter advances** the wizard (part 19).
@@ -93,7 +95,8 @@ _PROTOCOLS = [
     ("anthropic-messages", Protocol.ANTHROPIC_MESSAGES.value),
 ]
 
-_FINAL_STEPS = ("cli_config", "api_config")
+#: The Create button lives only on the Review step (item 11).
+_FINAL_STEPS = ("review",)
 
 
 class AddAgentScreen(Screen):
@@ -118,6 +121,8 @@ class AddAgentScreen(Screen):
     AddAgentScreen #action-bar Button { margin: 0 2 0 0; }
     AddAgentScreen #conn-actions { height: auto; margin: 1 0 0 0; }
     AddAgentScreen #conn-actions Button { margin: 0 2 0 0; }
+    AddAgentScreen #model-actions { height: auto; margin: 1 0 0 0; }
+    AddAgentScreen #review-card { border: round $accent; padding: 0 1; margin: 0 0 1 0; height: auto; }
     """
 
     def __init__(self) -> None:
@@ -130,6 +135,11 @@ class AddAgentScreen(Screen):
         self._cred_values = ["keychain", "env", "none"]
         self._preset_values = preset_names()
         self._provider_names: list[str] = []
+        #: What the currently-shown model list was discovered for — so switching CLI/provider resets
+        #: it and a stale model never leaks across backends (item 11).
+        self._model_context: tuple[str, ...] | None = None
+        self._model_method = ""          # e.g. "agy models" / "provider models"
+        self._model_status = "default"   # discovered | manual | default (shown on Review)
 
     # ------------------------------------------------------------------ compose
 
@@ -213,36 +223,25 @@ class AddAgentScreen(Screen):
                         yield Input(placeholder="e.g. DEEPSEEK_API_KEY", id="key_env")
                     with Horizontal(id="conn-actions"):
                         yield Button("Test Connection", id="test")
-
-                yield Label("Model")
-                yield Select([], id="model_select", allow_blank=True,
-                             prompt="load models, or type an id below")
-                yield Input(placeholder="remote model id, e.g. deepseek-chat", id="model")
-                yield Label("", id="err-model", classes="field-error")
-                with Horizontal():
-                    yield Button("Load Models", id="load-models")
                 yield Static("", id="conn-status")
 
-            # ---- Step 3A final info (CLI) ---------------------------------
-            with Vertical(id="cli-model-row"):
-                yield Static("", id="cli-runtime-info", classes="card")
-                yield Label("Model (optional)")
-                yield Static(
-                    "Leave blank to use the CLI's own configured default. Pinning a model makes the "
-                    "agent reproducible — an unset model inherits the CLI's global config, which may "
-                    "name a model this CLI version cannot run.",
-                    classes="hint",
-                )
-                yield Input(placeholder="e.g. gpt-5.5", id="cli_model")
-                yield Select([], id="cli_model_select", allow_blank=True,
-                             prompt="discover models, or type an id above")
-                yield Static("", id="cli-model-status", classes="hint")
-                with Horizontal():
-                    yield Button("Discover Models", id="cli-load-models")
-            # ---- Step 4B final info (API) ---------------------------------
-            yield Static("", id="api-summary", classes="card")
+            # ---- Model step (shared by CLI + API) -------------------------
+            with Vertical(id="step-model"):
+                yield Static("Choose the model", classes="hint")
+                yield Static("", id="model-info", classes="card")
+                with WizardRadioSet(id="model-mode"):
+                    yield RadioButton("Choose a discovered model", value=True, id="model-mode-discovered")
+                    yield RadioButton("Enter a model ID manually (not verified)", id="model-mode-manual")
+                    yield RadioButton("Use the CLI's default model (CLI agents only)", id="model-mode-default")
+                yield Select([], id="model_select", allow_blank=True,
+                             prompt="discovered models (Refresh to load)")
+                yield Input(placeholder="model id/label, e.g. deepseek-chat", id="model")
+                yield Static("", id="model-status", classes="hint")
+                with Horizontal(id="model-actions"):
+                    yield Button("Refresh Models", id="model-refresh")
+                yield Label("", id="err-model", classes="field-error")
 
-            # ---- shared common agent fields (both final steps) ------------
+            # ---- Agent Details step (common fields) -----------------------
             with Vertical(id="common-fields"):
                 yield Label("Agent name")
                 yield Input(placeholder="e.g. deepseek-coder (required)", id="name")
@@ -260,6 +259,12 @@ class AddAgentScreen(Screen):
                 yield Label("", id="err-steps", classes="field-error")
                 yield Label("System prompt (optional)")
                 yield TextArea(id="system_prompt")
+
+            # ---- Review step ----------------------------------------------
+            with Vertical(id="step-review"):
+                yield Static("Review — press Create to add this agent", classes="hint")
+                yield Static("", id="review-card", classes="review-card")
+
             yield Static("", id="error-summary")
 
         with Horizontal(id="action-bar"):
@@ -291,16 +296,14 @@ class AddAgentScreen(Screen):
     def _step_list(self) -> list[str]:
         backend = self.state.backend_type or "cli"
         if backend == "api":
-            return ["backend", "provider", "connection", "api_config"]
-        return ["backend", "cli", "cli_config"]
+            return ["backend", "provider", "connection", "model", "details", "review"]
+        return ["backend", "cli", "model", "details", "review"]
 
     def _show_step(self, step: str) -> None:
         self.step = step
-        for sid in ("step-backend", "step-cli", "step-provider", "step-connection"):
+        for sid in ("step-backend", "step-cli", "step-provider", "step-connection",
+                    "step-model", "common-fields", "step-review"):
             self.query_one(f"#{sid}").display = False
-        self.query_one("#cli-model-row").display = False
-        self.query_one("#api-summary").display = False
-        self.query_one("#common-fields").display = False
 
         if step == "backend":
             self.query_one("#step-backend").display = True
@@ -313,17 +316,14 @@ class AddAgentScreen(Screen):
         elif step == "connection":
             self.query_one("#step-connection").display = True
             self._sync_connection_fields()
-        elif step == "cli_config":
-            self.query_one("#cli-model-row").display = True
+        elif step == "model":
+            self.query_one("#step-model").display = True
+            self._enter_model_step()
+        elif step == "details":
             self.query_one("#common-fields").display = True
-            self._render_cli_runtime_info()
-            # Clear any model list discovered for a previously-selected CLI so it can't leak across.
-            self.query_one("#cli_model_select", Select).set_options([])
-            self._set_cli_model_status("")
-        elif step == "api_config":
-            self.query_one("#api-summary").display = True
-            self.query_one("#common-fields").display = True
-            self._render_api_summary()
+        elif step == "review":
+            self.query_one("#step-review").display = True
+            self._render_review()
 
         self._update_indicator()
         self._update_action_bar()
@@ -333,8 +333,8 @@ class AddAgentScreen(Screen):
         steps = self._step_list()
         titles = {
             "backend": "Backend", "cli": "CLI", "provider": "Provider",
-            "connection": "Connection", "cli_config": "Agent details",
-            "api_config": "Agent details",
+            "connection": "Connection", "model": "Model", "details": "Agent details",
+            "review": "Review",
         }
         idx = steps.index(self.step) + 1
         self.query_one("#step-indicator", Static).update(
@@ -350,7 +350,8 @@ class AddAgentScreen(Screen):
     def _focus_step(self, step: str) -> None:
         focus_map = {
             "backend": "#backend", "cli": "#cli", "provider": "#provider",
-            "connection": "#conn-mode", "cli_config": "#name", "api_config": "#name",
+            "connection": "#conn-mode", "model": "#model-mode", "details": "#name",
+            "review": "#create",
         }
         try:
             self.query_one(focus_map[step]).focus()
@@ -371,10 +372,8 @@ class AddAgentScreen(Screen):
             self._cancel()
         elif bid == "test":
             self._test_connection()
-        elif bid == "load-models":
-            self._load_models()
-        elif bid == "cli-load-models":
-            self._load_cli_models()
+        elif bid == "model-refresh":
+            self._refresh_models()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in a field advances (Continue) on non-final steps (part 16).
@@ -413,7 +412,7 @@ class AddAgentScreen(Screen):
     def _go_back(self) -> None:
         # Persist whatever the current step holds (non-secret) before stepping back.
         try:
-            self._capture_step(self.step)
+            self._capture_step(self.step, validate=False)
         except _EXPECTED_ERRORS:
             pass
         steps = self._step_list()
@@ -459,26 +458,21 @@ class AddAgentScreen(Screen):
             return True
         if step == "connection":
             return self._capture_connection(validate=validate)
-        if step in ("cli_config", "api_config"):
-            if step == "cli_config":
-                self.state.model = self._input("cli_model") or None
+        if step == "model":
+            return self._capture_model(validate=validate)
+        if step == "details":
             return self._capture_common(validate=validate)
-        return True
+        return True  # review: nothing to capture
 
     def _capture_connection(self, *, validate: bool) -> bool:
         mode = self._radio_value("#conn-mode", ["new", "existing"]) or "new"
         self.state.set_provider_mode(mode)  # type: ignore[arg-type]
-        model = self._input("model") or None
         if mode == "existing":
             provider = selected_string(self.query_one("#existing-provider", Select))
             if validate and not provider:
                 self._field_error("err-provider", "choose a saved connection")
                 return False
             self.state.set_existing_provider(provider or "")
-            self.state.model = model
-            if validate and not model:
-                self._field_error("err-model", "choose or type a model id")
-                return False
             return True
         # new connection
         conn_name = self._input("conn_name")
@@ -496,12 +490,8 @@ class AddAgentScreen(Screen):
         key = self.query_one("#api_key", Input).value if cred == "keychain" else ""
         self.state.api_key = SecretStr(key) if key else None
         self.state.key_env = self._input("key_env") or None if cred == "env" else None
-        self.state.model = model
 
         if validate and not self._validate_credential(conn_name, cred, key):
-            return False
-        if validate and not model:
-            self._field_error("err-model", "choose or type a model id")
             return False
         return True
 
@@ -551,17 +541,168 @@ class AddAgentScreen(Screen):
             return False
         return True
 
-    # ------------------------------------------------------------------ create
+    # ------------------------------------------------------------------ model step (item 11)
+
+    def _model_backend_key(self) -> tuple[str, ...]:
+        """Identity of the backend the model list belongs to — changes reset the list."""
+        s = self.state
+        if s.backend_type == "cli":
+            return ("cli", s.cli_type or "")
+        return ("api", s.provider_mode or "new", s.provider_name or "", s.provider_type or "")
+
+    def _enter_model_step(self) -> None:
+        key = self._model_backend_key()
+        if key != self._model_context:
+            # A different CLI/provider: drop any stale discovered list and selection (item 11).
+            self._model_context = key
+            self.query_one("#model_select", Select).set_options([])
+            self.query_one("#model", Input).value = ""
+            self.state.model = None
+            self._model_method = ""
+            self._set_model_status(
+                "[dim]Refresh to discover models, or enter an id / use the CLI default[/dim]"
+            )
+        self.query_one("#model-info", Static).update(self._model_info_text())
+        self._sync_model_fields()
+        # Discovery is explicit (Refresh) — never an automatic network call on entry, and never a
+        # blocking one when it runs (it dispatches a worker).
+
+    def _model_info_text(self) -> str:
+        s = self.state
+        if s.backend_type == "cli":
+            return (f"[b]Backend:[/b] CLI · {safe_markup(s.cli_type or '')}\n"
+                    "Discovery: Refresh to list models (if the CLI exposes them), or enter an id / "
+                    "use the CLI default.")
+        conn = s.provider_name or "(new connection)"
+        return (f"[b]Backend:[/b] API · {safe_markup(conn)}\n"
+                "Discovery: the provider's models endpoint (best-effort). A model is required.")
+
+    def _sync_model_fields(self) -> None:
+        mode = self._radio_value("#model-mode", _MODEL_MODES) or "discovered"
+        self.query_one("#model_select", Select).display = mode == "discovered"
+        self.query_one("#model", Input).display = mode == "manual"
+
+    def _refresh_models(self) -> None:
+        self._set_model_status("[dim]discovering models…[/dim]")
+        if self.state.backend_type == "cli":
+            cli = self.state.cli_type
+            if not cli:
+                self._set_model_status("[red]choose a CLI first[/red]")
+                return
+            self.run_worker(self._do_discover_cli(cli, self.state.cli_executable), exclusive=True)
+        else:
+            self.run_worker(self._do_discover_api(), exclusive=True)
+
+    async def _do_discover_cli(self, cli_type: str, executable: str | None) -> None:
+        result = await discover_cli_models(cli_type, executable)
+        self._apply_cli_models(result)
+
+    def _apply_cli_models(self, result: CliModelDiscovery) -> None:
+        select = self.query_one("#model_select", Select)
+        if not result.available:
+            # Honest: this CLI does not expose a model listing — keep manual + "CLI default".
+            select.set_options([])
+            self._set_model_status(
+                f"[yellow]{safe_markup(result.error or 'this CLI does not expose model listing')}"
+                "[/yellow] — enter an id manually, or use the CLI default"
+            )
+            return
+        if not result.models:
+            select.set_options([])
+            self._set_model_status("[yellow]no models reported — enter an id, or use the CLI default[/yellow]")
+            return
+        self._model_method = result.method or ""
+        select.set_options([(m, m) for m in result.models])
+        via = f" (via {safe_markup(result.method)})" if result.method else ""
+        self._set_model_status(f"[green]found {len(result.models)} model(s){via}[/green] — pick one below")
+
+    async def _do_discover_api(self) -> None:
+        oa = self.app.oa  # type: ignore[attr-defined]
+        s = self.state
+        try:
+            if s.provider_mode == "existing" and s.provider_name:
+                models = await oa.providers.remote_models(s.provider_name)
+            else:
+                models = await oa.providers.remote_models_config(
+                    provider_type=s.provider_type or "custom", protocol=s.protocol,
+                    base_url=s.base_url, region=s.region, workspace_id=s.workspace_id,
+                    api_key=s.api_key.get_secret_value() if s.api_key else None,
+                    key_env=s.key_env,
+                )
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            self._set_model_status(f"[red]could not load models: {safe_markup(str(exc), 200)}[/red]")
+            self.query_one("#model_select", Select).set_options([])
+            return
+        self._apply_api_models(models)
+
+    def _apply_api_models(self, models) -> None:
+        ids = [m.id for m in models]
+        select = self.query_one("#model_select", Select)
+        if not ids:
+            select.set_options([])
+            self._set_model_status("[yellow]no models reported — enter a model id manually below[/yellow]")
+            return
+        self._model_method = "provider models"
+        select.set_options([(mid, mid) for mid in ids])
+        self._set_model_status(f"[green]loaded {len(ids)} model(s)[/green] — pick one below")
+
+    def _capture_model(self, *, validate: bool) -> bool:
+        mode = self._radio_value("#model-mode", _MODEL_MODES) or "discovered"
+        if mode == "default":
+            if self.state.backend_type != "cli":
+                if validate:
+                    self._field_error("err-model", "an API agent needs a model — pick or type one")
+                    return False
+                return True
+            self.state.model = None  # CLI's own default; persisted as no pinned model (item 11)
+            self._model_status = "default"
+            return True
+        if mode == "manual":
+            model = self._input("model") or None
+            if validate and not model:
+                self._field_error("err-model", "type a model id, or choose another option")
+                return False
+            self.state.model = model
+            self._model_status = "manual"
+            return True
+        # discovered
+        chosen = selected_string(self.query_one("#model_select", Select))
+        if validate and not chosen:
+            self._field_error("err-model", "pick a discovered model, or switch to manual/default")
+            return False
+        self.state.model = chosen
+        self._model_status = "discovered"
+        return True
+
+    # ------------------------------------------------------------------ review + create
+
+    def _render_review(self) -> None:
+        s = self.state
+        if s.backend_type == "cli":
+            backend = f"CLI · {safe_markup(s.cli_type or '')}"
+        else:
+            backend = f"API · {safe_markup(s.provider_name or '(new connection)')} ({s.provider_mode or 'new'})"
+        model = safe_markup(s.model) if s.model else "(CLI default — no pinned model)"
+        status = {"discovered": "discovered", "manual": "manual — not verified",
+                  "default": "CLI default"}.get(self._model_status, self._model_status)
+        method = f" · via {safe_markup(self._model_method)}" if (s.model and self._model_method
+                                                                 and self._model_status == "discovered") else ""
+        lines = [
+            f"[b]Backend:[/b] {backend}",
+            f"[b]Model:[/b] {model}  [dim]({status}{method})[/dim]",
+            f"[b]Name:[/b] {safe_markup(s.agent_name or '(unset)')}",
+            f"[b]Profile:[/b] {safe_markup(s.permission_profile)}",
+            f"[b]Max steps:[/b] {s.max_steps}",
+        ]
+        if s.tags:
+            lines.append(f"[b]Tags:[/b] {safe_markup(', '.join(s.tags))}")
+        self.query_one("#review-card", Static).update("\n".join(lines))
 
     def action_create(self) -> None:
         if self.step not in _FINAL_STEPS:
             return
         self._clear_errors()
         try:
-            if self.step == "cli_config":
-                self.state.model = self._input("cli_model") or None
-            if not self._capture_common(validate=True):
-                return
             self._create()
         except _EXPECTED_ERRORS as exc:
             self._summary([str(exc)])
@@ -606,13 +747,11 @@ class AddAgentScreen(Screen):
                 model=s.model, name=s.agent_name, **common,
             )
         except ProviderValidationError as exc:
-            field = "err-conn" if exc.field == "name" else "err-name"
+            # A credential/connection problem sends the user back to the connection step to fix it.
             if exc.field in ("api_key", "key_env"):
-                # Surface a key/env error on the connection step, and step back to it.
                 self._show_step("connection")
-                self._field_error("err-model", "")
-                self.query_one("#conn-status", Static).update(f"[red]✗ {exc}[/red]")
-            self._field_error(field, "invalid")
+                self.query_one("#conn-status", Static).update(f"[red]✗ {safe_markup(str(exc), 200)}[/red]")
+                self._field_error("err-conn", str(exc))
             self._summary([str(exc)])
             return None
 
@@ -644,16 +783,15 @@ class AddAgentScreen(Screen):
         elif rid == "conn-mode":
             self._clear_secret_widget()
             self._sync_connection_fields()
+        elif rid == "model-mode":
+            self._sync_model_fields()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "model_select":
             chosen = selected_string(event.select)
             if chosen:
+                # Mirror the pick into the manual field so switching modes keeps the value visible.
                 self.query_one("#model", Input).value = chosen
-        elif event.select.id == "cli_model_select":
-            chosen = selected_string(event.select)
-            if chosen:
-                self.query_one("#cli_model", Input).value = chosen
 
     def _sync_cli_detail(self) -> None:
         entry = self._entry_for(self._radio_value("#cli", self._cli_values))
@@ -678,6 +816,8 @@ class AddAgentScreen(Screen):
                 pass
         self.query_one("#model_select", Select).set_options([])
         self.state.api_key = None
+        self.state.model = None
+        self._model_context = None
         self._status("")
 
     def _clear_secret_widget(self) -> None:
@@ -728,22 +868,10 @@ class AddAgentScreen(Screen):
                 f"no saved connection for {family} — create a new one instead",
             )
 
-    def _render_cli_runtime_info(self) -> None:
-        entry = self._entry_for(self.state.cli_type)
-        self.query_one("#cli-runtime-info", Static).update(_cli_detail_text(entry))
-
-    def _render_api_summary(self) -> None:
-        s = self.state
-        conn = s.provider_name or "(unnamed)"
-        self.query_one("#api-summary", Static).update(
-            f"[b]Provider connection:[/b] {conn}\n[b]Model:[/b] {s.model or '(none)'}\n"
-            f"[b]Mode:[/b] {s.provider_mode or 'new'}"
-        )
-
-    # ------------------------------------------------------------------ workers (test / load models)
+    # ------------------------------------------------------------------ workers (test connection)
 
     def _new_conn_params(self) -> dict:
-        # Read the live connection widgets for a transient test/discovery (never persisted).
+        # Read the live connection widgets for a transient test (never persisted).
         protocol_val = selected_string(self.query_one("#protocol", Select))
         protocol = None if protocol_val in (None, "preset") else Protocol(protocol_val)
         cred = self._radio_value("#cred", self._cred_values) or "keychain"
@@ -770,88 +898,10 @@ class AddAgentScreen(Screen):
                 api_key=p["api_key"], key_env=p["key_env"],
             )
         except Exception as exc:  # noqa: BLE001 - surface any failure as an unhealthy result
-            self._status(f"[red]✗ {exc}[/red]")
+            self._status(f"[red]✗ {safe_markup(str(exc), 200)}[/red]")
             return
-        self._status(f"[green]✓ connection ok[/green] — {result.detail}" if result.ok
-                     else f"[red]✗ {result.detail}[/red]")
-
-    def _load_models(self) -> None:
-        self._status("[dim]loading models…[/dim]")
-        mode = self._radio_value("#conn-mode", ["new", "existing"]) or "new"
-        if mode == "existing":
-            provider = selected_string(self.query_one("#existing-provider", Select))
-            if not provider:
-                self._status("[red]select a provider connection first[/red]")
-                return
-            self.run_worker(self._load_models_existing(provider), exclusive=True)
-        else:
-            self.run_worker(self._load_models_new(self._new_conn_params()), exclusive=True)
-
-    async def _load_models_existing(self, provider: str) -> None:
-        oa = self.app.oa  # type: ignore[attr-defined]
-        try:
-            models = await oa.providers.remote_models(provider)
-        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
-            self._status(f"[red]could not load models: {exc}[/red]")
-            return
-        self._populate_models(models)
-
-    async def _load_models_new(self, p: dict) -> None:
-        oa = self.app.oa  # type: ignore[attr-defined]
-        try:
-            models = await oa.providers.remote_models_config(
-                provider_type=p["provider_type"], protocol=p["protocol"], base_url=p["base_url"],
-                region=p["region"], workspace_id=p["workspace_id"],
-                api_key=p["api_key"], key_env=p["key_env"],
-            )
-        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
-            self._status(f"[red]could not load models: {exc}[/red]")
-            return
-        self._populate_models(models)
-
-    def _populate_models(self, models) -> None:
-        ids = [m.id for m in models]
-        select = self.query_one("#model_select", Select)
-        if not ids:
-            self._status("[yellow]no models reported — type a model id manually below[/yellow]")
-            select.set_options([])
-            return
-        select.set_options([(mid, mid) for mid in ids])
-        self._status(f"[green]loaded {len(ids)} model(s)[/green] — pick one, or type an id below")
-
-    # ------------------------------------------------------------------ CLI model discovery (Phase 4)
-
-    def _load_cli_models(self) -> None:
-        cli = self.state.cli_type or self._radio_value("#cli", self._cli_values)
-        if not cli:
-            self._set_cli_model_status("[red]choose a CLI first[/red]")
-            return
-        self._set_cli_model_status("[dim]discovering models…[/dim]")
-        self.run_worker(self._do_load_cli_models(cli, self.state.cli_executable), exclusive=True)
-
-    async def _do_load_cli_models(self, cli_type: str, executable: str | None) -> None:
-        result = await discover_cli_models(cli_type, executable)
-        self._populate_cli_models(result)
-
-    def _populate_cli_models(self, result: CliModelDiscovery) -> None:
-        select = self.query_one("#cli_model_select", Select)
-        if not result.available:
-            # Honest: discovery is not available/failed — keep the manual id + "CLI default" paths.
-            select.set_options([])
-            self._set_cli_model_status(f"[yellow]{safe_markup(result.error or 'model discovery unavailable', 200)}[/yellow]")
-            return
-        if not result.models:
-            select.set_options([])
-            self._set_cli_model_status("[yellow]no models reported — type an id above, or leave blank for the CLI default[/yellow]")
-            return
-        select.set_options([(m, m) for m in result.models])
-        via = f" (via {safe_markup(result.method)})" if result.method else ""
-        self._set_cli_model_status(
-            f"[green]found {len(result.models)} model(s){via}[/green] — pick one, or type an id above"
-        )
-
-    def _set_cli_model_status(self, msg: str) -> None:
-        self.query_one("#cli-model-status", Static).update(msg)
+        self._status(f"[green]✓ connection ok[/green] — {safe_markup(result.detail, 200)}" if result.ok
+                     else f"[red]✗ {safe_markup(result.detail, 200)}[/red]")
 
     # ------------------------------------------------------------------ helpers
 
@@ -870,6 +920,9 @@ class AddAgentScreen(Screen):
 
     def _status(self, message: str) -> None:
         self.query_one("#conn-status", Static).update(message)
+
+    def _set_model_status(self, message: str) -> None:
+        self.query_one("#model-status", Static).update(message)
 
     def _field_error(self, wid: str, message: str) -> None:
         self.query_one(f"#{wid}", Label).update(f"✗ {message}" if message else "")

@@ -22,6 +22,8 @@ from pathlib import Path
 
 import psutil
 
+from ..core.cancellation import RunCancellation, RunCancelled
+
 IS_WINDOWS = sys.platform.startswith("win")
 
 #: Environment variables that are safe/necessary to inherit for a child CLI to function.
@@ -230,6 +232,11 @@ class OutputLimitExceeded(RuntimeError):
         self.limit = limit
 
 
+#: The bounded reader always runs when a cancellation controller is supplied; without an explicit
+#: output cap it uses this (effectively unbounded) ceiling so cancellation still works.
+_UNBOUNDED = 1 << 62
+
+
 def run_capture(
     argv: Sequence[str] | str,
     *,
@@ -238,6 +245,7 @@ def run_capture(
     timeout: int,
     shell: bool = False,
     max_output_bytes: int | None = None,
+    cancellation: RunCancellation | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command to completion in its own process group, capturing bounded text output.
 
@@ -245,12 +253,16 @@ def run_capture(
     :class:`subprocess.TimeoutExpired` is re-raised. ``env`` is used as-is (callers pass a minimal
     environment); the parent environment is never inherited.
 
-    ``max_output_bytes`` is a **real** memory bound (item 18). The previous implementation called
+    ``max_output_bytes`` is a **real** memory bound (item 9.3/18). The previous implementation called
     ``communicate()`` and only checked the size afterwards — by which point the whole output was
     already in memory, so a command emitting gigabytes would exhaust the host before the check ever
     ran. Output is now read incrementally, and the moment the combined total crosses the limit the
     process tree is killed and :class:`OutputLimitExceeded` is raised. Nothing beyond the limit is
     ever buffered.
+
+    ``cancellation`` makes a *blocking* command interruptible (item 9.2). The reader polls the
+    controller while the child runs; the instant a cancel is requested the whole process tree is
+    terminated and :class:`RunCancelled` is raised — the command never gets to return a success.
     """
 
     popen = subprocess.Popen(  # noqa: S603 - argv is policy-screened; shell only on approval
@@ -265,7 +277,7 @@ def run_capture(
         start_new_session=not IS_WINDOWS,
     )
     cmd = argv if shell else list(argv)
-    if max_output_bytes is None:
+    if max_output_bytes is None and cancellation is None:
         try:
             raw_out, raw_err = popen.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -279,8 +291,15 @@ def run_capture(
             cmd, popen.returncode, _decode(raw_out), _decode(raw_err)
         )
 
-    out, err, exceeded = _read_bounded(popen, timeout=timeout, limit=max_output_bytes)
-    if exceeded:
+    limit = max_output_bytes if max_output_bytes is not None else _UNBOUNDED
+    out, err, exceeded = _read_bounded(
+        popen, timeout=timeout, limit=limit, cancellation=cancellation
+    )
+    # A cancel that arrived while the command was running wins over any output it managed to produce:
+    # the tree was already terminated by the reader; surface it as a cancellation, not a result.
+    if cancellation is not None and cancellation.cancelled:
+        raise RunCancelled(cancellation.reason or "cancelled by user")
+    if exceeded and max_output_bytes is not None:
         raise OutputLimitExceeded(max_output_bytes)
     return subprocess.CompletedProcess(cmd, popen.returncode, _decode(out), _decode(err))
 
@@ -290,13 +309,15 @@ def _decode(raw: bytes | None) -> str:
 
 
 def _read_bounded(
-    popen: subprocess.Popen, *, timeout: float, limit: int
+    popen: subprocess.Popen, *, timeout: float, limit: int,
+    cancellation: RunCancellation | None = None,
 ) -> tuple[bytes, bytes, bool]:
     """Stream a process's stdout/stderr with a hard combined byte cap and a deadline.
 
     Reads both pipes on threads (portable, including Windows, where ``select`` cannot poll pipes),
-    stopping the instant the cap is crossed. The process tree is terminated on breach *or* timeout,
-    so a runaway producer cannot keep writing into a pipe nobody is draining.
+    stopping the instant the cap is crossed. The process tree is terminated on breach, timeout, *or*
+    a cancellation request (item 9.2), so neither a runaway producer nor a blocking command can keep
+    running once we have stopped caring about its output.
     """
 
     import threading
@@ -341,8 +362,12 @@ def _read_bounded(
 
     deadline = time.monotonic() + timeout
     timed_out = False
+    cancelled = False
     while True:
         if breached.is_set():
+            break
+        if cancellation is not None and cancellation.cancelled:
+            cancelled = True
             break
         if popen.poll() is not None:
             break
@@ -351,7 +376,7 @@ def _read_bounded(
             break
         time.sleep(0.02)
 
-    if breached.is_set() or timed_out:
+    if breached.is_set() or timed_out or cancelled:
         terminate_process_tree(popen.pid)
     for thread in threads:
         thread.join(timeout=2.0)

@@ -22,6 +22,7 @@ the source — and it lands in ``events.jsonl``, ``status.json``, ``result.json`
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
@@ -140,175 +141,234 @@ class RunService:
         cancel.bind()
 
         run_dir = self.paths.run_dir(run.id)
-        event_log = EventLog(run_dir, index=self.repos.event_index)
-        writer = ArtifactWriter(run_dir)
-        writer.write_request(run)
         art = RunArtifacts()
         projection = RunProjection(run.id)
         state: dict[str, Any] = {"terminal": None}  # RunStatus | None
 
-        def sink(event: NormalizedEvent) -> None:
-            # ``run.phase`` means "the phase *changed*" (item 4). A backend that re-announces the
-            # phase it is already in (Codex sends turn.started for every turn) is not a transition,
-            # so it is dropped rather than written to the log twice.
-            if _is_redundant_phase(event, run):
-                return
-            if _is_terminal_event(event):
-                # The terminal event must be the LAST log entry and the final projection update
-                # (item 1). Every CLI adapter (via run_managed_cli) emits its own terminal event
-                # mid-stream; if we logged it here, the later ``finalizing`` phase + diff would land
-                # *after* it, leaving events[-1] == run.phase and projection "completed/finalizing".
-                # So capture its meaning now (status, failure, summary) but buffer it — the finalize
-                # block writes exactly one terminal event, last.
-                _capture(event, art, run, state)
-                state["pending_terminal"] = event
-                return
-            saved = event_log.append(event)
-            projection.apply(saved)
-            _capture(saved, art, run, state)  # this is what advances run.phase
-            self._persist_progress(saved, run)
-            if on_event is not None:
-                on_event(saved)
-
-        def phase(new: RunPhase, **data: Any) -> None:
-            sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
-                                 data={"phase": new.value, **data}))
-            self.repos.runs.upsert(run)
-
-        # The one and only run.started for this run — OpenAgent's, never a backend's (item 4).
-        run.status = RunStatus.STARTING
-        self.repos.runs.upsert(run)
-        sink(NormalizedEvent(
-            run_id=run.id, type=EventType.RUN_STARTED, source="openagent",
-            data={"agent": run.agent, "workspace": run.workspace,
-                  "permission_profile": run.permission_profile,
-                  "worktree_strategy": run.worktree_strategy},
-        ))
-
-        workspace = None
-        wt = WorktreeManager(self.paths.project_root, self.paths.worktrees_dir)
+        # The whole run — setup, execution, and finalization — lives inside one lifecycle boundary
+        # (item 9.4). A disk-full during setup, a PermissionError writing an artifact, or a failed
+        # terminal-event append must never leave the run "running", and an artifact-write failure
+        # must never be mistaken for success. Whatever happens, the run reaches a terminal state, the
+        # DB is authoritative, and the *first* real error — not a later cleanup error — is recorded.
         try:
-            # ---- preflight: prove the agent can run before creating anything (item 7) --------
-            phase(RunPhase.PREFLIGHT)
-            report = await self.preflight.check(
-                agent_name=run.agent, permission_profile=run.permission_profile,
-            )
-            sink(NormalizedEvent(
-                run_id=run.id, type=EventType.LOG, source="openagent",
-                data={"kind": "preflight", "ok": report.ok,
-                      "checks": [c.line() for c in report.checks]},
-            ))
-            for warning in report.warnings:
-                art.warnings.append(f"preflight: {warning.line()}")
-            if not report.ok:
-                raise PreflightFailed(report)
-            cancel.check()
+            event_log = EventLog(run_dir, index=self.repos.event_index)
+            writer = ArtifactWriter(run_dir)
+            writer.write_request(run)
 
-            # ---- workspace ------------------------------------------------------------------
-            phase(RunPhase.PREPARING_WORKSPACE)
+            def sink(event: NormalizedEvent) -> None:
+                # ``run.phase`` means "the phase *changed*" (item 4). A backend that re-announces the
+                # phase it is already in (Codex sends turn.started for every turn) is not a
+                # transition, so it is dropped rather than written to the log twice.
+                if _is_redundant_phase(event, run):
+                    return
+                if _is_terminal_event(event):
+                    # The terminal event must be the LAST log entry and the final projection update
+                    # (item 1). Every CLI adapter (via run_managed_cli) emits its own terminal event
+                    # mid-stream; if we logged it here, the later ``finalizing`` phase + diff would
+                    # land *after* it, leaving events[-1] == run.phase. So capture its meaning now
+                    # (status, failure, summary) but buffer it — the finalize block writes exactly
+                    # one terminal event, last.
+                    _capture(event, art, run, state)
+                    state["pending_terminal"] = event
+                    return
+                saved = event_log.append(event)
+                projection.apply(saved)
+                _capture(saved, art, run, state)  # this is what advances run.phase
+                self._persist_progress(saved, run)
+                if on_event is not None:
+                    on_event(saved)
+
+            def phase(new: RunPhase, **data: Any) -> None:
+                sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
+                                     data={"phase": new.value, **data}))
+                self.repos.runs.upsert(run)
+
+            # The one and only run.started for this run — OpenAgent's, never a backend's (item 4).
+            run.status = RunStatus.STARTING
+            self.repos.runs.upsert(run)
+            sink(NormalizedEvent(
+                run_id=run.id, type=EventType.RUN_STARTED, source="openagent",
+                data={"agent": run.agent, "workspace": run.workspace,
+                      "permission_profile": run.permission_profile,
+                      "worktree_strategy": run.worktree_strategy},
+            ))
+
+            workspace = None
+            wt = WorktreeManager(self.paths.project_root, self.paths.worktrees_dir)
             try:
-                workspace = wt.create(run.id, strategy=run.worktree_strategy or "auto")
-            except Exception as exc:  # noqa: BLE001 - a workspace failure is its own failure type
-                raise _typed(exc, "workspace_failed") from exc
-            run.worktree = str(workspace.root)
-            run.worktree_strategy = workspace.strategy
-            run.branch = workspace.branch
-            run.base_commit = workspace.base_commit
-            run.is_copy = workspace.is_copy
-            run.in_place = workspace.in_place
-            run.source_path = str(workspace.source)
-            run.baseline_dir = str(workspace.baseline_dir) if workspace.baseline_dir else None
-            self.repos.runs.upsert(run)
-            if workspace.lower_safety:
-                art.warnings.append(_lower_safety_warning(workspace))
-            sink(NormalizedEvent(
-                run_id=run.id, type=EventType.WORKSPACE_PREPARED, source="openagent",
-                data={"workspace": str(workspace.root), "strategy": workspace.strategy,
-                      "branch": workspace.branch, "in_place": workspace.in_place},
-            ))
-            cancel.check()
-
-            # ---- backend --------------------------------------------------------------------
-            phase(RunPhase.STARTING_BACKEND)
-            run.status = RunStatus.RUNNING
-            self.repos.runs.upsert(run)
-            phase(RunPhase.RUNNING)
-
-            rtype = agent.runtime.type
-            if rtype is RuntimeType.API_AGENT or rtype == RuntimeType.API_AGENT.value:
-                await self._run_api(run, agent, workspace.root, sink, art, state,
-                                    approval_callback, workspace.describe_for_agent(),
-                                    ask_user_callback, cancel)
-            else:
-                await self._run_cli(run, agent, workspace.root, sink, state, run_dir)
-        except RunCancelled as exc:
-            state["terminal"] = RunStatus.CANCELLED
-            self._cancelled.add(run.id)
-            run.failure_type = "user_cancelled"
-            if state.get("emitted_terminal") is not True:
+                # ---- preflight: prove the agent can run before creating anything (item 7) --------
+                phase(RunPhase.PREFLIGHT)
+                report = await self.preflight.check(
+                    agent_name=run.agent, permission_profile=run.permission_profile,
+                )
                 sink(NormalizedEvent(
-                    run_id=run.id, type=EventType.RUN_CANCELLED, source="openagent",
-                    data={"reason": exc.reason, "phase": run.phase},
+                    run_id=run.id, type=EventType.LOG, source="openagent",
+                    data={"kind": "preflight", "ok": report.ok,
+                          "checks": [c.line() for c in report.checks]},
                 ))
-        except Exception as exc:  # noqa: BLE001 - every runtime error becomes a persisted failure
-            self._fail(run, sink, state, exc)
+                for warning in report.warnings:
+                    art.warnings.append(f"preflight: {warning.line()}")
+                if not report.ok:
+                    raise PreflightFailed(report)
+                cancel.check()
+
+                # ---- workspace --------------------------------------------------------------
+                phase(RunPhase.PREPARING_WORKSPACE)
+                try:
+                    workspace = wt.create(run.id, strategy=run.worktree_strategy or "auto")
+                except Exception as exc:  # noqa: BLE001 - a workspace failure is its own failure type
+                    raise _typed(exc, "workspace_failed") from exc
+                run.worktree = str(workspace.root)
+                run.worktree_strategy = workspace.strategy
+                run.branch = workspace.branch
+                run.base_commit = workspace.base_commit
+                run.is_copy = workspace.is_copy
+                run.in_place = workspace.in_place
+                run.source_path = str(workspace.source)
+                run.baseline_dir = str(workspace.baseline_dir) if workspace.baseline_dir else None
+                self.repos.runs.upsert(run)
+                if workspace.lower_safety:
+                    art.warnings.append(_lower_safety_warning(workspace))
+                sink(NormalizedEvent(
+                    run_id=run.id, type=EventType.WORKSPACE_PREPARED, source="openagent",
+                    data={"workspace": str(workspace.root), "strategy": workspace.strategy,
+                          "branch": workspace.branch, "in_place": workspace.in_place},
+                ))
+                cancel.check()
+
+                # ---- backend ----------------------------------------------------------------
+                phase(RunPhase.STARTING_BACKEND)
+                run.status = RunStatus.RUNNING
+                self.repos.runs.upsert(run)
+                phase(RunPhase.RUNNING)
+
+                rtype = agent.runtime.type
+                if rtype is RuntimeType.API_AGENT or rtype == RuntimeType.API_AGENT.value:
+                    await self._run_api(run, agent, workspace.root, sink, art, state,
+                                        approval_callback, workspace.describe_for_agent(),
+                                        ask_user_callback, cancel)
+                else:
+                    await self._run_cli(run, agent, workspace.root, sink, state, run_dir)
+            except RunCancelled as exc:
+                state["terminal"] = RunStatus.CANCELLED
+                self._cancelled.add(run.id)
+                run.failure_type = "user_cancelled"
+                if state.get("emitted_terminal") is not True:
+                    sink(NormalizedEvent(
+                        run_id=run.id, type=EventType.RUN_CANCELLED, source="openagent",
+                        data={"reason": exc.reason, "phase": run.phase},
+                    ))
+            except Exception as exc:  # noqa: BLE001 - every runtime error becomes a persisted failure
+                self._fail(run, sink, state, exc)
+            finally:
+                self.cancellations.discard(run.id)
+
+            # ---- finalize (items 1 + 9.4) -------------------------------------------------
+            # The ``finalizing`` phase and the diff happen BEFORE the single terminal event, which is
+            # written LAST — so events[-1] is always the terminal event and the projection never
+            # settles on "status: completed / phase: finalizing".
+            sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
+                                 data={"phase": RunPhase.FINALIZING.value}))
+            if workspace is not None:
+                try:
+                    # Collect diff + changed files from the workspace (git worktrees and copies).
+                    art.diff = wt.diff(workspace)
+                    art.files_changed = wt.changed_files(workspace)
+                    run.files_changed = art.files_changed
+                except Exception as exc:  # noqa: BLE001 - a finalization failure is its own terminal state
+                    # A finalization error invalidates a prior *success* (item 1) but must not mask
+                    # an earlier failure/cancellation (item 5): only an otherwise-completing run flips.
+                    if state.get("terminal") in (None, RunStatus.COMPLETED):
+                        state["terminal"] = RunStatus.FAILED
+                        run.failure_type = "finalization_failed"
+                        state["pending_terminal"] = None  # the buffered success no longer holds
+                        if not art.error:
+                            art.error = {"error_type": "finalization_failed",
+                                         "message": str(exc) or exc.__class__.__name__,
+                                         "phase": RunPhase.FINALIZING.value, "source": "openagent"}
+
+            final = self._resolve_final(run, state)
+            run.status = final
+            run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
+            run.completed_at = _now()
+            if final is RunStatus.COMPLETED:
+                run.failure_type = None  # a completed run carries no failure type (item 18)
+                if not art.summary:
+                    art.summary = projection.final_message or "Run completed."
+            self.repos.runs.upsert(run)
+
+            # Reuse the backend's own terminal event when it still matches the resolved outcome
+            # (keeps its richer data); otherwise synthesize one for the reconciled status.
+            pending = state.get("pending_terminal")
+            if pending is not None and _status_of_terminal(pending) is final:
+                terminal_event = pending
+            else:
+                terminal_event = NormalizedEvent(
+                    run_id=run.id, type=_terminal_event_type(final), source="openagent",
+                    data={"status": final.value} if final is RunStatus.COMPLETED
+                    else {"status": final.value, "error_type": run.failure_type},
+                )
+            # Reflect the terminal outcome in the projection, write the artifact bundle (each file
+            # atomically), and only THEN append the terminal event — last in events.jsonl (item 1).
+            # Writing artifacts *before* the terminal event means a failed artifact write is caught
+            # before the log ever says "done", so result.json can never be missing while the log
+            # claims success (item 9.4).
+            projection.apply(terminal_event)
+            writer.write_status(run)
+            writer.write_results(run, art, projection)
+            writer.write_timeline(run, projection)
+            saved = event_log.append(terminal_event)
+            state["terminal_written"] = True
+            if on_event is not None:
+                with contextlib.suppress(Exception):  # a UI-notify failure must not fail the run
+                    on_event(saved)
+            return run
+        except Exception as exc:  # noqa: BLE001 - the outer lifecycle boundary (item 9.4)
+            return self._finalize_failure(run, run_dir, art, state, exc)
         finally:
             self.cancellations.discard(run.id)
 
-        # ---- finalize (item 1) ------------------------------------------------------------
-        # The ``finalizing`` phase and the diff happen BEFORE the single terminal event, which is
-        # then written LAST — so events[-1] is always the terminal event and the projection never
-        # settles on "status: completed / phase: finalizing".
-        sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
-                             data={"phase": RunPhase.FINALIZING.value}))
-        if workspace is not None:
-            try:
-                # Collect diff + changed files from the workspace (git worktrees and copies alike).
-                art.diff = wt.diff(workspace)
-                art.files_changed = wt.changed_files(workspace)
-                run.files_changed = art.files_changed
-            except Exception as exc:  # noqa: BLE001 - a finalization failure is its own terminal state
-                # A finalization error invalidates a prior *success* (item 1) but must not mask an
-                # earlier failure/cancellation (item 5): only an otherwise-completing run flips.
-                if state.get("terminal") in (None, RunStatus.COMPLETED):
-                    state["terminal"] = RunStatus.FAILED
-                    run.failure_type = "finalization_failed"
-                    state["pending_terminal"] = None  # the buffered success no longer holds
-                    if not art.error:
-                        art.error = {"error_type": "finalization_failed",
-                                     "message": str(exc) or exc.__class__.__name__,
-                                     "phase": RunPhase.FINALIZING.value, "source": "openagent"}
+    def _finalize_failure(
+        self, run: Run, run_dir: Path, art: RunArtifacts, state: dict, exc: Exception
+    ) -> Run:
+        """Force a terminal state after a setup/finalize error (item 9.4), best-effort throughout.
 
-        final = self._resolve_final(run, state)
+        A run never stays running, and an artifact-write failure never looks like success. The first
+        real error wins (item 5): a run already resolved to failed/cancelled keeps that terminal
+        type; one heading for *completed* (or unresolved) is flipped to FAILED, because its result
+        could not be finished. The writers are recreated fresh here in case the originals never
+        existed, and every recovery step is suppressed so recording the failure cannot itself raise.
+        """
+
+        prior = state.get("terminal")
+        final = prior if prior in (RunStatus.CANCELLED, RunStatus.FAILED) else RunStatus.FAILED
+        if final is RunStatus.FAILED:
+            run.failure_type = run.failure_type or "artifact_write_failed"
+            if not art.error:
+                art.error = {"error_type": run.failure_type,
+                             "message": str(exc) or exc.__class__.__name__,
+                             "phase": run.phase, "source": "openagent"}
         run.status = final
         run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
         run.completed_at = _now()
-        if final is RunStatus.COMPLETED:
-            run.failure_type = None  # a completed run carries no failure type (item 18)
-            if not art.summary:
-                art.summary = projection.final_message or "Run completed."
-        self.repos.runs.upsert(run)
-
-        # Write exactly one terminal event, LAST. Reuse the backend's own event when it still
-        # matches the resolved outcome (keeps its richer data, e.g. the final message/error);
-        # otherwise synthesize one for the reconciled status.
-        pending = state.get("pending_terminal")
-        if pending is not None and _status_of_terminal(pending) is final:
-            terminal_event = pending
-        else:
-            terminal_event = NormalizedEvent(
-                run_id=run.id, type=_terminal_event_type(final), source="openagent",
-                data={"status": final.value} if final is RunStatus.COMPLETED
-                else {"status": final.value, "error_type": run.failure_type},
-            )
-        saved = event_log.append(terminal_event)
-        projection.apply(saved)
-        if on_event is not None:
-            on_event(saved)
-
-        writer.write_status(run)
-        writer.write_results(run, art, projection)
-        writer.write_timeline(run, projection)
+        # The DB is the source of truth for status — persist the terminal state above all else.
+        with contextlib.suppress(Exception):
+            self.repos.runs.upsert(run)
+        # Best-effort audit: exactly one terminal event (only if the normal path never wrote one),
+        # then a minimal, explicitly-partial artifact set.
+        if not state.get("terminal_written"):
+            with contextlib.suppress(Exception):
+                EventLog(run_dir, index=self.repos.event_index).append(
+                    NormalizedEvent(
+                        run_id=run.id, type=_terminal_event_type(final), source="openagent",
+                        data={"status": final.value, "error_type": run.failure_type},
+                    )
+                )
+                state["terminal_written"] = True
+        with contextlib.suppress(Exception):
+            writer = ArtifactWriter(run_dir)
+            writer.write_status(run)
+            writer.write_results(run, art, None)
         return run
 
     def _fail(self, run: Run, sink: EventHook, state: dict, exc: Exception) -> None:
@@ -374,6 +434,9 @@ class RunService:
                 callback=approval_callback, emit=tool_emit, run_id=run.id,
             ),
             run_id=run.id, emit=tool_emit, ask_user_callback=ask_user_callback,
+            # A blocking command (run_command/run_tests) polls this so a Cancel kills its process
+            # tree mid-run instead of waiting for it to finish (item 9.2).
+            cancellation=cancel,
         )
         executor = ToolExecutor(ctx)
         try:
@@ -666,28 +729,72 @@ class RunService:
     # ------------------------------------------------------------------ maintenance
 
     def recover_orphans(self) -> Sequence[str]:
-        """Mark active runs whose process is gone (or reused) as orphaned (spec §45).
+        """Mark active runs this process no longer owns as orphaned (spec §45, item 9.5).
 
-        Uses **PID + start-time identity** (the same check as cross-process cancellation): a run is
-        only left running when its recorded PID is live *and* its OS create-time still matches. A
-        missing PID, a dead PID, a PID reused by an unrelated process, or a PID whose identity can't
-        be verified all orphan the run — and the reason is recorded — so OpenAgent never adopts or
-        acts on a stranger's process.
+        A run is left running **only** while it is live *in this very process* — its CLI adapter or
+        its cancellation controller is still registered here. Anything else is orphaned, and the
+        reason is recorded:
+
+        * a missing / dead PID → ``orphaned_pid_gone``;
+        * a PID reused by an unrelated process → ``orphaned_pid_reused``;
+        * a PID we can't tie to our run → ``orphaned_pid_unknown``;
+        * a PID that is *still alive* but which we do not own → ``orphaned_unattached_process``.
+
+        The last case is the item 9.5 correction. A restarted OpenAgent cannot reattach to a previous
+        run's stdout/event stream, so continuing to report that run as "running" would be a lie: no
+        one is observing it and a follow-up could never be delivered. We fail closed — mark it
+        orphaned — and, crucially, **do not kill** the live process; we record its PID and a safe
+        summary so the user can decide whether to terminate it (via ``openagent cancel``).
         """
 
         recovered: list[str] = []
         for run in self.repos.runs.list_active():
-            if run.id in self._cli_adapters:
-                continue  # still running in this process
+            # Owned by *this* process (a live CLI adapter or an in-flight API/CLI cancellation
+            # controller) → genuinely still running here; leave it alone.
+            if run.id in self._cli_adapters or self.cancellations.get(run.id) is not None:
+                continue
             status = run_process_status(run.pid, run.pid_started_at)
             if status == PID_ALIVE:
-                continue
+                run.failure_type = run.failure_type or "orphaned_unattached_process"
+                self._record_orphan_event(run, status)
+            else:
+                run.failure_type = run.failure_type or f"orphaned_pid_{status}"
             run.status = RunStatus.ORPHANED
             run.completed_at = _now()
-            run.failure_type = run.failure_type or f"orphaned_pid_{status}"
             self.repos.runs.upsert(run)
             recovered.append(run.id)
         return recovered
+
+    def _record_orphan_event(self, run: Run, status: str) -> None:
+        """Write an audit event for an orphaned run whose process is still alive (item 9.5).
+
+        Records the live PID and a safe, actionable summary — and states plainly that the process was
+        **not** terminated. Best-effort: a failure to write this note must never crash recovery.
+        """
+
+        run_dir = self.paths.run_dir(run.id)
+        if not run_dir.exists():
+            return
+        try:
+            EventLog(run_dir, index=self.repos.event_index).append(
+                NormalizedEvent(
+                    run_id=run.id, type=EventType.LOG, source="openagent",
+                    data={
+                        "kind": "orphan",
+                        "reason": "unattached_live_process",
+                        "pid": run.pid,
+                        "pid_status": status,
+                        "killed": False,
+                        "message": (
+                            f"pid {run.pid} is still alive but this OpenAgent process cannot "
+                            "reattach to its output; marked orphaned and left running. Cancel it "
+                            f"explicitly with `openagent cancel --id {run.id}` to stop it."
+                        ),
+                    },
+                )
+            )
+        except OSError:  # pragma: no cover - the audit note is best-effort
+            pass
 
     def output(self, run_id: str, fmt: str = "md") -> str:
         run_dir = self.paths.run_dir(run_id)

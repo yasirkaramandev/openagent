@@ -64,6 +64,7 @@ class AddAgentWizardState(BaseModel):
     def set_cli(self, cli_type: str, executable: str | None) -> None:
         if self.cli_type != cli_type:
             self._clear_cli_fields()
+            self.model = None  # a different CLI invalidates any pinned model (item 11)
         self.cli_type = cli_type
         self.cli_executable = executable
 

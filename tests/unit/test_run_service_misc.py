@@ -27,8 +27,14 @@ def test_orphan_recovery_marks_dead_runs(app: OpenAgentApp):
     assert app.repos.runs.get("run_dead").status == RunStatus.ORPHANED
 
 
-def test_orphan_recovery_leaves_live_matching_run_running(app: OpenAgentApp):
-    """A run whose PID is live *and* whose start-time matches is genuinely still running (item 11)."""
+def test_orphan_recovery_fails_closed_on_unattached_live_run(app: OpenAgentApp):
+    """A live PID this process does not own is orphaned, not left "running", and not killed (9.5).
+
+    A restarted OpenAgent cannot reattach to a previous run's stdout/event stream, so a live PID it
+    does not own (no CLI adapter, no cancellation controller) must fail closed: mark it orphaned,
+    record the PID, and leave the process alone for the user to terminate.
+    """
+    import json
     import subprocess
     import sys
 
@@ -40,9 +46,23 @@ def test_orphan_recovery_leaves_live_matching_run_running(app: OpenAgentApp):
         run = Run(id="run_live", agent="x", status=RunStatus.RUNNING,
                   pid=proc.pid, pid_started_at=created)
         app.repos.runs.upsert(run)
+        app.paths.run_dir(run.id).mkdir(parents=True, exist_ok=True)  # so the audit note can be written
+
         recovered = app.runs.recover_orphans()
-        assert "run_live" not in recovered
-        assert app.repos.runs.get("run_live").status == RunStatus.RUNNING
+
+        assert "run_live" in recovered
+        reloaded = app.repos.runs.get("run_live")
+        assert reloaded.status == RunStatus.ORPHANED
+        assert reloaded.failure_type == "orphaned_unattached_process"
+        # Fail-closed must never mean "kill a process we don't own": it is still alive.
+        assert psutil.pid_exists(proc.pid)
+
+        # The live PID and a "not terminated" note are recorded for the user (event/artifact).
+        events = [json.loads(line) for line in
+                  (app.paths.run_dir(run.id) / "events.jsonl").read_text().splitlines() if line.strip()]
+        orphan = next(e for e in events if e["data"].get("kind") == "orphan")
+        assert orphan["data"]["pid"] == proc.pid
+        assert orphan["data"]["killed"] is False
     finally:
         proc.kill()
         proc.wait()

@@ -17,10 +17,12 @@ from __future__ import annotations
 import subprocess
 
 from ..security.command_policy import Decision, evaluate
-from ..security.process import minimal_environment, run_capture
+from ..security.process import OutputLimitExceeded, minimal_environment, run_capture
 from .base import ToolContext, ToolError, ToolResult
 
-_MAX_OUTPUT = 20_000
+#: A hard **byte** cap on a single command's combined stdout+stderr (item 9.3). Enforced inside
+#: ``run_capture`` as the process runs — nothing beyond it is ever buffered — not sliced afterwards.
+_MAX_OUTPUT_BYTES = 20_000
 _DEFAULT_TIMEOUT = 300
 
 
@@ -43,9 +45,13 @@ def _run(ctx: ToolContext, command: str, timeout: int) -> subprocess.CompletedPr
     try:
         return run_capture(
             argv, cwd=ctx.workspace_root, env=env, timeout=timeout, shell=policy.needs_shell,
+            max_output_bytes=_MAX_OUTPUT_BYTES, cancellation=ctx.cancellation,
         )
     except subprocess.TimeoutExpired as exc:
         raise ToolError(f"command timed out after {timeout}s") from exc
+    except OutputLimitExceeded as exc:
+        # Never echo the runaway output back in the error — that would defeat the memory bound.
+        raise ToolError(f"command output exceeded {_MAX_OUTPUT_BYTES} bytes") from exc
     except FileNotFoundError as exc:
         raise ToolError(f"executable not found: {exc}") from exc
 
@@ -54,7 +60,7 @@ def run_command(ctx: ToolContext, command: str, timeout: int = _DEFAULT_TIMEOUT)
     if not ctx.profile.can_run_commands:
         raise ToolError("this permission profile does not allow running commands")
     proc = _run(ctx, command, timeout)
-    output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT]
+    output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT_BYTES]
     if ctx.emit:
         ctx.emit("command.completed", {"command": command, "exit_code": proc.returncode})
     ok = proc.returncode == 0
@@ -65,7 +71,7 @@ def run_tests(ctx: ToolContext, command: str = "pytest -q", timeout: int = _DEFA
     if not ctx.profile.can_run_commands:
         raise ToolError("this permission profile does not allow running commands")
     proc = _run(ctx, command, timeout)
-    output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT]
+    output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT_BYTES]
     passed = proc.returncode == 0
     if ctx.emit:
         ctx.emit("test.completed", {"command": command, "passed": passed, "exit_code": proc.returncode})
