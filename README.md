@@ -1,6 +1,6 @@
 # OpenAgent
 
-[![CI](https://github.com/yasirkaramandev/open-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/yasirkaramandev/open-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/yasirkaramandev/openagent/actions/workflows/ci.yml/badge.svg)](https://github.com/yasirkaramandev/openagent/actions/workflows/ci.yml)
 
 **Local-first control plane for AI APIs, coding CLIs, and autonomous agents.**
 

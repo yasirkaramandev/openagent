@@ -45,4 +45,4 @@ First tagged release (alpha). Local-first control plane for AI APIs, coding CLIs
 - No OS-level/kernel sandbox — isolation is by workspace, not by process.
 - `agy` plan-mode reviews can exceed its print timeout on large multi-file prompts.
 
-[0.1.0]: https://github.com/yasirkaramandev/open-agent/releases/tag/v0.1.0
+[0.1.0]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.0

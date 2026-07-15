@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openagent"
-version = "0.1.0"
+# Single source of truth: the version lives in ``src/openagent/__init__.py`` and hatchling reads it
+# from there at build time (see ``[tool.hatch.version]``). ``openagent version`` prints the same
+# ``__version__``, so the CLI, the installed distribution metadata, and the wheel can never drift.
+dynamic = ["version"]
 description = "Local-first control plane for AI APIs, coding CLIs, and autonomous agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -56,8 +59,11 @@ dev = [
 openagent = "openagent.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/yasirkaramandev/open-agent"
-Repository = "https://github.com/yasirkaramandev/open-agent"
+Homepage = "https://github.com/yasirkaramandev/openagent"
+Repository = "https://github.com/yasirkaramandev/openagent"
+
+[tool.hatch.version]
+path = "src/openagent/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openagent"]
