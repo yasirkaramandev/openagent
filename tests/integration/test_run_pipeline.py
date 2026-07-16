@@ -1,5 +1,6 @@
 """End-to-end run pipeline for an API agent (mocked HTTP) — spec §27, §35, §50.10."""
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -120,6 +121,7 @@ async def test_full_api_run_produces_bundle(app: OpenAgentApp, httpx_mock: HTTPX
         "changes.diff",
         "tests.json",
         "handoff.md",
+        "integrity.json",
     ):
         assert (run_dir / name).exists(), f"missing {name}"
 
@@ -127,6 +129,12 @@ async def test_full_api_run_produces_bundle(app: OpenAgentApp, httpx_mock: HTTPX
     assert result_json["status"] == "completed"
     assert "main.py" in result_json["files_changed"]
     assert "value to 2" in result_json["summary"]
+    integrity = json.loads((run_dir / "integrity.json").read_text())
+    assert (
+        integrity["files"]["result.json"]
+        == hashlib.sha256((run_dir / "result.json").read_bytes()).hexdigest()
+    )
+    assert result.artifact_integrity == integrity["files"]
 
     # Live events were streamed.
     types = {e.type for e in events}

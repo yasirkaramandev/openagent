@@ -276,8 +276,12 @@ def test_successful_provider_agent_transaction_clears_previous_secret(tmp_path: 
         model="m",
         name="acme-coder",
     )
-    # Success: the new key is stored and the previous value is retained nowhere in the service.
-    assert oa.credentials.resolve(ref) == "new-secret"
+    # Success: the new key lives under the connection's revision-scoped account; the legacy account
+    # is removed only after the provider row is durable.
+    provider = oa.providers.get("acme")
+    assert provider is not None
+    assert oa.credentials.resolve(provider.credential) == "new-secret"
+    assert oa.credentials.resolve(ref) is None
     assert not hasattr(oa.providers, "_rollbacks")
 
 
@@ -333,6 +337,8 @@ def test_stale_rollback_cannot_affect_a_later_provider(
             name="beta-coder",
         )
     # alpha's key is untouched by beta's rollback; alpha still exists, beta does not.
-    assert oa.credentials.resolve(_ref("alpha")) == "alpha-key"
+    alpha = oa.providers.get("alpha")
+    assert alpha is not None
+    assert oa.credentials.resolve(alpha.credential) == "alpha-key"
     assert oa.providers.get("alpha") is not None
     assert oa.providers.get("beta") is None

@@ -50,13 +50,13 @@ class ModelService:
         provider = self.repos.providers.get(model.provider_connection)
         if not provider:
             return None
-        adapter = self.app.providers.adapter_for(provider)
-        try:
-            probed = await adapter.probe_model(model.remote_model_id)
-        finally:
-            transport = getattr(adapter, "transport", None)
-            if transport is not None:
-                await transport.aclose()
+        with self.app.providers.adapter_scope(provider) as adapter:
+            try:
+                probed = await adapter.probe_model(model.remote_model_id)
+            finally:
+                transport = getattr(adapter, "transport", None)
+                if transport is not None:
+                    await transport.aclose()
         updated = apply_probe(model, probed)
         self.repos.models.upsert(updated)
         return updated

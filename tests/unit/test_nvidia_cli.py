@@ -272,10 +272,13 @@ def test_agent_add_allows_explicit_unverified_override(catalog):
             "--model",
             "nvidia/nemotron-test",
             "--allow-unverified-model",
+            "--model-override-reason",
+            "manual compatibility review",
         ],
     )
     assert result.exit_code == 0, result.stdout
-    assert "NOT verified agent-compatible" in result.stdout  # the override is loudly reported
+    assert "model verification OVERRIDDEN" in result.stdout
+    assert "manual compatibility review" in result.stdout
     agents = json.loads(runner.invoke(app, ["agent", "list", "--json"]).stdout)
     assert [a["name"] for a in agents] == ["nvidia-coder"]
 

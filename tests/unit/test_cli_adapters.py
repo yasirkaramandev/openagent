@@ -6,8 +6,10 @@ These parse recorded JSONL fixtures without invoking the real binary.
 import json
 from pathlib import Path
 
-from openagent.runtimes.cli.claude import map_claude_event
-from openagent.runtimes.cli.codex import map_codex_event
+from openagent.core.limits import RUNTIME_LIMITS
+from openagent.runtimes.cli.base import CliRunRequest, StreamOutcome
+from openagent.runtimes.cli.claude import ClaudeAdapter, map_claude_event
+from openagent.runtimes.cli.codex import final_message_fallback, map_codex_event
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -124,6 +126,60 @@ def test_codex_usage_limit_capture():
 
 
 # --------------------------------------------------------------------------- claude
+
+
+def test_claude_uses_pinned_opus_and_max_effort(tmp_path: Path):
+    adapter = ClaudeAdapter(executable="/usr/local/bin/claude")
+    request = CliRunRequest(
+        run_id="run_audit",
+        prompt="audit",
+        workspace=tmp_path,
+        model="claude-opus-4-8",
+        reasoning_effort="max",
+    )
+    args = adapter._build_args(request)  # noqa: SLF001 - invocation contract
+    assert ["--model", "claude-opus-4-8"] == args[args.index("--model") : args.index("--model") + 2]
+    assert ["--effort", "max"] == args[args.index("--effort") : args.index("--effort") + 2]
+
+
+def test_codex_final_message_path_is_allocated_once(tmp_path: Path):
+    from openagent.runtimes.cli.codex import CodexAdapter
+
+    adapter = CodexAdapter(executable="/usr/local/bin/codex")
+    request = CliRunRequest(run_id="run_x", prompt="x", workspace=tmp_path)
+    first = adapter._final_message_path(request)  # noqa: SLF001
+    second = adapter._final_message_path(request)  # noqa: SLF001
+    try:
+        assert first == second
+    finally:
+        first.unlink(missing_ok=True)
+
+
+def test_codex_final_message_is_byte_bounded_and_marks_truncation(tmp_path: Path):
+    path = tmp_path / "codex-final.txt"
+    path.write_bytes(b"x" * (RUNTIME_LIMITS.final_message_bytes + 1))
+
+    events = final_message_fallback(
+        "run_x", path, StreamOutcome(exit_code=0, cancelled=False, saw_message=False)
+    )
+
+    assert len(events[0].data["text"].encode()) == RUNTIME_LIMITS.final_message_bytes
+    assert events[0].data["truncated"] is True
+    assert not path.exists()
+
+
+def test_codex_final_message_refuses_symlink(tmp_path: Path):
+    target = tmp_path / "outside.txt"
+    target.write_text("must not be read")
+    path = tmp_path / "codex-final.txt"
+    path.symlink_to(target)
+
+    events = final_message_fallback(
+        "run_x", path, StreamOutcome(exit_code=0, cancelled=False, saw_message=False)
+    )
+
+    assert events == []
+    assert target.read_text() == "must not be read"
 
 
 def test_claude_session_and_result():

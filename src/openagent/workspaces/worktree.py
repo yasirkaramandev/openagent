@@ -480,6 +480,16 @@ class WorktreeManager:
         _git(["commit", "-m", message], ws.root)
         return _git(["rev-parse", "HEAD"], ws.root).strip()
 
+    def revert_commit(self, ws: Workspace, commit_sha: str) -> str:
+        if not ws.is_git or ws.is_copy or ws.in_place:
+            raise GitError("agent commit can only be reverted in its OpenAgent git worktree")
+        self._verify_ownership(ws)
+        actual = _git(["rev-parse", commit_sha], ws.root).strip()
+        if actual != commit_sha:
+            raise GitError("recorded agent commit does not resolve exactly")
+        _git(["revert", "--no-edit", commit_sha], ws.root)
+        return _git(["rev-parse", "HEAD"], ws.root).strip()
+
 
 def _read_text(root: Path, relative: str) -> str | None:
     try:

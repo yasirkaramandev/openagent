@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ..core.models import AgentProfile, AgentRuntime, RuntimeType
+from ..core.models import (
+    AgentProfile,
+    AgentRuntime,
+    ModelCapabilities,
+    ModelVerification,
+    RuntimeType,
+)
 from ..core.permissions import get_profile
 from ..reporting.openagent_md import write_openagent_md
 
@@ -48,11 +55,14 @@ class AgentService:
         system_prompt: str = "",
         permission_profile: str = "safe-edit",
         max_steps: int = 40,
+        reasoning_effort: str | None = None,
+        model_override_reason: str | None = None,
     ) -> AgentProfile:
         # Reject non-string bindings *before* Pydantic so a leaked Textual sentinel (Select.NULL)
         # or any other non-string never reaches AgentRuntime and blows up with a raw ValidationError.
         name = _require_str(name, "agent name is required")
         get_profile(permission_profile)  # validate
+        verification: ModelVerification | None = None
         if runtime_type is RuntimeType.API_AGENT:
             provider = _require_str(provider, "API agent requires a valid provider connection")
             model = _require_str(model, "API agent requires a valid model id")
@@ -61,6 +71,23 @@ class AgentService:
             # actually exists, so a run never dies later with "provider not found" (item 7).
             if self.app.providers.get(provider) is None:
                 raise AgentError(f"provider {provider!r} does not exist")
+            connection = self.app.providers.get(provider)
+            assert connection is not None
+            probe = self.app.providers.cached_probe(provider, model)
+            verified = bool(probe and probe.agent_compatible and probe.category == "verified")
+            reason = (model_override_reason or "").strip() or None
+            verification = ModelVerification(
+                status="verified" if verified else "overridden" if reason else "unverified",
+                verified_at=probe.tested_at if verified and probe else None,
+                probe_version=probe.probe_version if probe else None,
+                capability_snapshot=probe.capabilities if probe else ModelCapabilities(),
+                override_reason=reason,
+                provider_fingerprint=_fingerprint(
+                    f"{connection.id}|{connection.base_url}|{connection.protocol.value}|"
+                    f"{connection.credential_revision}"
+                ),
+                model_fingerprint=_fingerprint(model),
+            )
         elif runtime_type is RuntimeType.CLI:
             cli = _require_str(cli, "CLI agent requires a valid CLI selection")
             provider = None
@@ -78,20 +105,33 @@ class AgentService:
             name=name,
             title=title,
             description=description,
-            runtime=AgentRuntime(type=runtime_type, provider=provider, model=model, cli=cli),
+            runtime=AgentRuntime(
+                type=runtime_type,
+                provider=provider,
+                model=model,
+                cli=cli,
+                reasoning_effort=reasoning_effort,
+                model_verification=verification,
+            ),
             tags=tags or [],
             system_prompt=system_prompt,
             permission_profile=permission_profile,
             max_steps=max_steps,
         )
+        operation = self.app.journal.begin(
+            "agent_document_sync", {"path": str(self.app.paths.openagent_md())}
+        )
         self.repos.agents.upsert(agent)
+        operation.advance("db_written")
         try:
             self.sync_openagent_md()
         except Exception:
             # Keep the agent row and OPENAGENT.md consistent: if the doc write fails, don't leave a
             # persisted agent the file doesn't mention (item 3).
             self.repos.agents.delete(name)
+            operation.complete()
             raise
+        operation.complete()
         return agent
 
     def create_with_new_provider(
@@ -187,8 +227,18 @@ class AgentService:
             if v is not None
         }
         updated = agent.model_copy(update=updates)
+        operation = self.app.journal.begin(
+            "agent_document_sync", {"path": str(self.app.paths.openagent_md())}
+        )
         self.repos.agents.upsert(updated)
-        self.sync_openagent_md()
+        operation.advance("db_written")
+        try:
+            self.sync_openagent_md()
+        except Exception:
+            self.repos.agents.upsert(agent)
+            operation.complete()
+            raise
+        operation.complete()
         return updated
 
     def list(self) -> Sequence[AgentProfile]:
@@ -198,10 +248,27 @@ class AgentService:
         return self.repos.agents.get(name)
 
     def remove(self, name: str) -> bool:
+        existing = self.repos.agents.get(name)
+        if existing is None:
+            return False
+        operation = self.app.journal.begin(
+            "agent_document_sync", {"path": str(self.app.paths.openagent_md())}
+        )
         removed = self.repos.agents.delete(name)
         if removed:
-            self.sync_openagent_md()
+            operation.advance("db_deleted")
+            try:
+                self.sync_openagent_md()
+            except Exception:
+                self.repos.agents.upsert(existing)
+                operation.complete()
+                raise
+        operation.complete()
         return removed
 
     def sync_openagent_md(self) -> None:
         write_openagent_md(self.app.paths.openagent_md(), self.list())
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]

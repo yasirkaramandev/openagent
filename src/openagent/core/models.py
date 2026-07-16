@@ -178,6 +178,20 @@ class ModelProfile(BaseModel):
     context_window: int | None = None
 
 
+class ModelVerification(BaseModel):
+    """Evidence attached to an agent runtime; catalog presence is never evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    verified_at: datetime | None = None
+    probe_version: str | None = None
+    capability_snapshot: ModelCapabilities = Field(default_factory=ModelCapabilities)
+    override_reason: str | None = None
+    provider_fingerprint: str
+    model_fingerprint: str
+
+
 # --------------------------------------------------------------------------- agents
 
 
@@ -192,6 +206,8 @@ class AgentRuntime(BaseModel):
     model: str | None = None
     # CLI-agent fields
     cli: str | None = None
+    reasoning_effort: str | None = None
+    model_verification: ModelVerification | None = None
 
 
 class AgentProfile(BaseModel):
@@ -333,6 +349,7 @@ class Run(BaseModel):
     container_image: str | None = None
     artifact_integrity: dict[str, str] = Field(default_factory=dict)
     agent_commit_sha: str | None = None
+    commit_agent_changes: bool = False
     #: Worktree isolation strategy actually used: ``auto`` | ``none`` | ``copy``.
     worktree_strategy: str = "auto"
     #: Workspace metadata persisted so a resume reconstructs the exact same diff baseline (item 5).

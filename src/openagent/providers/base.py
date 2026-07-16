@@ -7,6 +7,7 @@ never learns which provider it is talking to.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,7 +15,9 @@ from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..core.events import NormalizedModelEvent, TokenUsage, ToolCall
+from ..core.errors import ErrorType
+from ..core.events import ModelEventType, NormalizedModelEvent, TokenUsage, ToolCall
+from ..core.limits import RUNTIME_LIMITS
 from ..core.models import ModelCapabilities, RemoteModel
 
 
@@ -121,6 +124,63 @@ async def collect(events: AsyncIterator[NormalizedModelEvent]) -> CollectedRespo
             result.response_id = event.response_id
     result.text = "".join(text_parts)
     return result
+
+
+def normalized_tool_call(
+    *,
+    call_id: object,
+    name: object,
+    arguments: object,
+    response_id: str | None = None,
+) -> NormalizedModelEvent:
+    """Validate provider tool-call structure without inventing missing or malformed fields."""
+
+    if (
+        not isinstance(call_id, str)
+        or not call_id.strip()
+        or not isinstance(name, str)
+        or not name.strip()
+    ):
+        return NormalizedModelEvent(
+            type=ModelEventType.ERROR,
+            error_type=ErrorType.INVALID_TOOL_CALL.value,
+            error_message="provider tool call is missing a non-empty id or name",
+            response_id=response_id,
+        )
+    parsed: object = arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return NormalizedModelEvent(
+                type=ModelEventType.ERROR,
+                error_type=ErrorType.INVALID_TOOL_ARGUMENTS.value,
+                error_message="provider tool arguments are not valid JSON",
+                response_id=response_id,
+            )
+    if not isinstance(parsed, dict):
+        return NormalizedModelEvent(
+            type=ModelEventType.ERROR,
+            error_type=ErrorType.INVALID_TOOL_ARGUMENTS.value,
+            error_message="provider tool arguments must be a JSON object",
+            response_id=response_id,
+        )
+    try:
+        size = len(json.dumps(parsed, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        size = RUNTIME_LIMITS.tool_arguments_bytes + 1
+    if size > RUNTIME_LIMITS.tool_arguments_bytes:
+        return NormalizedModelEvent(
+            type=ModelEventType.ERROR,
+            error_type=ErrorType.INVALID_TOOL_ARGUMENTS.value,
+            error_message="provider tool arguments exceed 64 KiB",
+            response_id=response_id,
+        )
+    return NormalizedModelEvent(
+        type=ModelEventType.TOOL_CALL,
+        tool_call=ToolCall(id=call_id, name=name, arguments=parsed),
+        response_id=response_id,
+    )
 
 
 _PROBE_SENTINEL = "PROBE_OK_7F"

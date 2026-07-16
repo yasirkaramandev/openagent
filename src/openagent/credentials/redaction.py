@@ -43,7 +43,7 @@ _PATTERNS: list[re.Pattern[str]] = [
 _MIN_REGISTER_LEN = 8
 
 
-class _SecretRegistry:
+class ScopedSecretRegistry:
     """Exact secret values held for the lifetime of the runs that need them (spec §8).
 
     This replaces a module-level ``set`` that was never scoped, never emptied, and was iterated by
@@ -67,27 +67,41 @@ class _SecretRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._counts: dict[str, int] = {}
+        self._scopes: dict[str, dict[str, int]] = {}
         self._snapshot: tuple[str, ...] = ()
 
     def _rebuild(self) -> None:
         self._snapshot = tuple(sorted(self._counts, key=len, reverse=True))
 
-    def acquire(self, secret: str | None) -> str | None:
+    def acquire(self, scope_id: str, secret: str | None) -> str | None:
         """Register ``secret`` (or bump its refcount). Returns it if it was actually taken."""
 
         if not secret or len(secret) < _MIN_REGISTER_LEN:
             return None
         with self._lock:
             self._counts[secret] = self._counts.get(secret, 0) + 1
+            scope = self._scopes.setdefault(scope_id, {})
+            scope[secret] = scope.get(secret, 0) + 1
             self._rebuild()
         return secret
 
-    def release(self, secret: str | None) -> None:
+    def release(self, scope_id: str, secret: str | None) -> None:
         """Drop one reference; forget the value entirely when the last holder is gone."""
 
         if not secret:
             return
         with self._lock:
+            scope = self._scopes.get(scope_id)
+            scoped_count = scope.get(secret) if scope else None
+            if scoped_count is None:
+                return
+            assert scope is not None
+            if scoped_count <= 1:
+                del scope[secret]
+            else:
+                scope[secret] = scoped_count - 1
+            if scope == {}:
+                self._scopes.pop(scope_id, None)
             count = self._counts.get(secret)
             if count is None:
                 return
@@ -95,6 +109,17 @@ class _SecretRegistry:
                 del self._counts[secret]
             else:
                 self._counts[secret] = count - 1
+            self._rebuild()
+
+    def release_scope(self, scope_id: str) -> None:
+        with self._lock:
+            held = self._scopes.pop(scope_id, {})
+            for secret, references in held.items():
+                remaining = self._counts.get(secret, 0) - references
+                if remaining <= 0:
+                    self._counts.pop(secret, None)
+                else:
+                    self._counts[secret] = remaining
             self._rebuild()
 
     def snapshot(self) -> tuple[str, ...]:
@@ -107,6 +132,7 @@ class _SecretRegistry:
     def clear(self) -> None:
         with self._lock:
             self._counts.clear()
+            self._scopes.clear()
             self._rebuild()
 
     def __repr__(self) -> str:
@@ -115,7 +141,8 @@ class _SecretRegistry:
         return f"<SecretRegistry: {len(self._counts)} active>"
 
 
-_SECRETS = _SecretRegistry()
+_SECRETS = ScopedSecretRegistry()
+_GLOBAL_SCOPE = "__global__"
 
 
 def register_secret(secret: str | None) -> None:
@@ -127,17 +154,17 @@ def register_secret(secret: str | None) -> None:
     to the run that needs it. It remains for callers that genuinely cannot bound the lifetime.
     """
 
-    _SECRETS.acquire(secret)
+    _SECRETS.acquire(_GLOBAL_SCOPE, secret)
 
 
 def release_secret(secret: str | None) -> None:
     """Drop one reference taken by :func:`register_secret`."""
 
-    _SECRETS.release(secret)
+    _SECRETS.release(_GLOBAL_SCOPE, secret)
 
 
 @contextmanager
-def secret_scope(*secrets: str | None) -> Iterator[None]:
+def secret_scope(*secrets: str | None, scope_id: str | None = None) -> Iterator[None]:
     """Scrub ``secrets`` for the duration of the block, then forget them (spec §8).
 
     Reference counted, so overlapping runs sharing a key are safe, and released on the way out of an
@@ -145,12 +172,21 @@ def secret_scope(*secrets: str | None) -> Iterator[None]:
     in an error body.
     """
 
-    taken = [s for s in (_SECRETS.acquire(s) for s in secrets) if s is not None]
+    scope = scope_id or f"scope:{id(secrets)}:{threading.get_ident()}"
+    taken = [s for s in (_SECRETS.acquire(scope, s) for s in secrets) if s is not None]
     try:
         yield
     finally:
         for secret in taken:
-            _SECRETS.release(secret)
+            _SECRETS.release(scope, secret)
+
+
+def acquire_scoped_secret(scope_id: str, secret: str | None) -> None:
+    _SECRETS.acquire(scope_id, secret)
+
+
+def release_secret_scope(scope_id: str) -> None:
+    _SECRETS.release_scope(scope_id)
 
 
 def active_secret_count() -> int:

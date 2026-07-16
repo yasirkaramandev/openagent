@@ -36,6 +36,7 @@ from ..core.events import EventType, NormalizedEvent, RunPhase
 from ..core.models import AgentProfile, ProcessIdentity, Run, RunStatus, RuntimeType, enum_value
 from ..core.permissions import get_profile
 from ..core.projection import RunProjection
+from ..credentials.redaction import acquire_scoped_secret, release_secret_scope
 from ..reporting.artifacts import ArtifactWriter, RunArtifacts, TestSummary
 from ..runtimes.api_agent.loop import run_api_agent
 from ..runtimes.cli.base import CliAdapter, CliRunRequest
@@ -196,6 +197,7 @@ class RunService:
         execution_backend: str = "host-restricted",
         container_runtime: str | None = None,
         container_image: str | None = None,
+        commit_agent_changes: bool = False,
     ) -> Run:
         agent = self.repos.agents.get(agent_name)
         if not agent:
@@ -237,6 +239,7 @@ class RunService:
             execution_backend=execution_backend,
             container_runtime=container_runtime,
             container_image=container_image,
+            commit_agent_changes=commit_agent_changes,
         )
         self.repos.runs.upsert(run)
         return run
@@ -504,6 +507,22 @@ class RunService:
                                 "phase": RunPhase.FINALIZING.value,
                                 "source": "openagent",
                             }
+                if run.commit_agent_changes and state.get("terminal") is RunStatus.COMPLETED:
+                    try:
+                        run.agent_commit_sha = wt.commit_all(
+                            workspace,
+                            _agent_commit_message(agent),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - requested commit is a release gate
+                        state["terminal"] = RunStatus.FAILED
+                        run.failure_type = "agent_commit_failed"
+                        state["pending_terminal"] = None
+                        art.error = {
+                            "error_type": "agent_commit_failed",
+                            "message": str(exc),
+                            "phase": RunPhase.FINALIZING.value,
+                            "source": "openagent",
+                        }
 
             final = self._resolve_final(run, state)
             run.status = final
@@ -538,6 +557,8 @@ class RunService:
             writer.write_status(run)
             writer.write_results(run, art, projection)
             writer.write_timeline(run, projection)
+            writer.write_integrity(run)
+            self.repos.runs.upsert(run)
             saved = event_log.append(terminal_event)
             state["terminal_written"] = True
             if on_event is not None:
@@ -729,7 +750,19 @@ class RunService:
         provider = self.repos.providers.get_by_name(agent.runtime.provider or "")
         if not provider:
             raise RunError(f"provider {agent.runtime.provider!r} not found")
-        adapter = self.app.providers.adapter_for(provider)
+        api_key = self.app.credentials.resolve(provider.credential)
+        acquire_scoped_secret(run.id, api_key)
+        try:
+            # Go through the service seam so tests and alternate provider factories can replace the
+            # adapter without bypassing the run-scoped secret lifetime above. ``adapter_for`` is
+            # intentionally side-effect free; this scope owns registration and release.
+            adapter = self.app.providers.adapter_for(provider)
+        except BaseException:
+            release_secret_scope(run.id)
+            raise
+        transport = getattr(adapter, "transport", None)
+        if transport is not None:
+            transport.cancellation = cancel
         profile = get_profile(run.permission_profile)
 
         def tool_emit(name: str, data: dict) -> None:
@@ -749,6 +782,10 @@ class RunService:
             )
             execution_backend.validate()
         except ExecutionBackendError as exc:
+            transport = getattr(adapter, "transport", None)
+            if transport is not None:
+                await transport.aclose()
+            release_secret_scope(run.id)
             raise _typed(exc, "execution_backend_unavailable") from exc
         ctx = ToolContext(
             workspace_root=root,
@@ -785,6 +822,7 @@ class RunService:
             transport = getattr(adapter, "transport", None)
             if transport is not None:
                 await transport.aclose()
+            release_secret_scope(run.id)
 
         art.summary = outcome.summary or art.summary
         art.usage = outcome.usage.model_dump()
@@ -823,6 +861,7 @@ class RunService:
             # the user's project — keep them out of the workspace and out of the diff (item 6).
             artifacts_dir=run_dir,
             model=agent.runtime.model or None,
+            reasoning_effort=agent.runtime.reasoning_effort,
         )
         try:
             async for event in adapter.start_run(request):
@@ -905,6 +944,7 @@ class RunService:
             session_id=session_id,
             artifacts_dir=run_dir,
             model=agent.runtime.model or None,
+            reasoning_effort=agent.runtime.reasoning_effort,
         )
         try:
             event_log = EventLog(run_dir, index=self.repos.event_index)
@@ -1058,6 +1098,8 @@ class RunService:
         writer.write_status(run)
         writer.write_results(run, art, projection)
         writer.write_timeline(run, projection)
+        writer.write_integrity(run)
+        self.repos.runs.upsert(run)
         saved = event_log.append(terminal_event)  # LAST log entry for the turn (item 1)
         turn_state["terminal_written"] = True
         if on_event is not None:
@@ -1474,6 +1516,39 @@ class RunService:
             "repaired": True,
         }
 
+    def rerun(
+        self,
+        run_id: str,
+        *,
+        all_projects: bool = False,
+        confirm_in_place: bool = False,
+    ) -> Run:
+        previous = self._require_run(run_id, all_projects=all_projects)
+        return self.create(
+            agent_name=previous.agent,
+            prompt=previous.prompt,
+            worktree=previous.worktree_strategy,
+            permission_profile=previous.permission_profile,
+            confirm_in_place=confirm_in_place,
+            execution_backend=previous.execution_backend,
+            container_runtime=previous.container_runtime,
+            container_image=previous.container_image,
+            commit_agent_changes=previous.commit_agent_changes,
+        )
+
+    def revert_agent_commit(self, run_id: str, *, all_projects: bool = False) -> str:
+        run = self._require_run(run_id, all_projects=all_projects)
+        if not run.agent_commit_sha:
+            raise RunError(f"run {run_id!r} has no recorded agent commit")
+        workspace = self._reconstruct_workspace(run)
+        project_root = Path(run.project_root or self.paths.project_root)
+        state_dir = Path(run.project_state_dir or project_root / ".openagent")
+        manager = WorktreeManager(project_root, state_dir / "worktrees")
+        try:
+            return manager.revert_commit(workspace, run.agent_commit_sha)
+        except Exception as exc:
+            raise RunError(f"could not revert agent commit: {exc}") from exc
+
     def output(self, run_id: str, fmt: str = "md", *, all_projects: bool = False) -> str:
         run_dir = self._run_dir_by_id(run_id, all_projects=all_projects)
         mapping = {
@@ -1567,6 +1642,15 @@ def _lower_safety_warning(workspace) -> str:
     if workspace.in_place:
         return "Ran in place (worktree 'none'): edits were applied directly to your project."
     return "Ran in a non-git copy (lower safety): changes are not versioned."
+
+
+def _agent_commit_message(agent: AgentProfile) -> str:
+    model = agent.runtime.model or agent.runtime.cli or "unspecified"
+    return (
+        f"openagent: apply {agent.name} changes\n\n"
+        f"OpenAgent-Agent: {agent.name}\n"
+        f"OpenAgent-Model: {model}"
+    )
 
 
 def _capture(event: NormalizedEvent, art: RunArtifacts | None, run: Run, state: dict) -> None:

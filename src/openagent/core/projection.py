@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .events import EventType, ItemStatus, NormalizedEvent, RunPhase
+from .limits import RUNTIME_LIMITS
 
 #: Per-item bound on retained command output, so one chatty command can't grow the projection without
 #: limit. Persisted logs keep their own (also bounded) copy.
@@ -34,6 +35,29 @@ MAX_TIMELINE_ITEMS = 2_000
 
 def _etype(event: NormalizedEvent) -> str:
     return event.type if isinstance(event.type, str) else event.type.value
+
+
+def _item_bytes(item: Item | None) -> int:
+    """Exact UTF-8 payload retained by an item (plus small fixed structural overhead)."""
+
+    if item is None:
+        return 0
+    strings = (
+        *item.key,
+        item.kind,
+        item.status,
+        item.title,
+        item.text,
+        item.command,
+        item.output,
+        item.path,
+        item.change,
+        item.tool,
+        item.query,
+        item.timestamp,
+        *(plan.text for plan in item.plan),
+    )
+    return 128 + sum(len(str(value).encode("utf-8", errors="replace")) for value in strings)
 
 
 @dataclass
@@ -142,6 +166,8 @@ class RunProjection:
         self._order: list[tuple[str, int, str]] = []
         self._seq = 0
         self._anon = 0
+        self._retained_bytes = 0
+        self.truncated = False
         self.turns: dict[int, TurnView] = {1: TurnView(number=1)}
 
     # ------------------------------------------------------------------ views
@@ -225,7 +251,10 @@ class RunProjection:
         if kind is None:
             return None
         item = self._touch(event, kind)
+        before = _item_bytes(item)
         _ITEM_APPLY[etype](self, item, data)
+        self._retained_bytes += _item_bytes(item) - before
+        self._evict()
         return item
 
     # ------------------------------------------------------------------ internals
@@ -240,13 +269,13 @@ class RunProjection:
             item_id = f"_{kind}_{self._anon}"
         key = (event.source, self.turn, item_id)
         item = self._items.get(key)
+        before = _item_bytes(item) if item is not None else 0
         if item is None:
             self._seq += 1
             item = Item(key=key, kind=kind, seq=self._seq, turn=self.turn)
             self._items[key] = item
             self._order.append(key)
             self.turns.setdefault(self.turn, TurnView(number=self.turn)).item_keys.append(key)
-            self._evict()
         item.timestamp = event.timestamp
         status = event.data.get("status")
         if status:
@@ -254,12 +283,22 @@ class RunProjection:
         title = event.data.get("title")
         if title:
             item.title = str(title)
+        self._retained_bytes += _item_bytes(item) - before
         return item
 
     def _evict(self) -> None:
-        while len(self._order) > MAX_TIMELINE_ITEMS:
+        while len(self._order) > MAX_TIMELINE_ITEMS or (
+            self._retained_bytes > RUNTIME_LIMITS.projection_bytes and self._order
+        ):
             key = self._order.pop(0)
-            self._items.pop(key, None)
+            removed = self._items.pop(key, None)
+            if removed is not None:
+                self._retained_bytes = max(0, self._retained_bytes - _item_bytes(removed))
+            for turn in self.turns.values():
+                if key in turn.item_keys:
+                    turn.item_keys.remove(key)
+                    break
+            self.truncated = True
 
     # -- run-level handlers -------------------------------------------------
 

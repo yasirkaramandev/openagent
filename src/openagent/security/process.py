@@ -84,6 +84,8 @@ class ManagedProcess:
         cwd: Path,
         env: Mapping[str, str] | None = None,
         max_stderr_bytes: int = MAX_STDERR_BYTES,
+        max_stdout_line_bytes: int = RUNTIME_LIMITS.cli_stdout_line_bytes,
+        max_stdout_total_bytes: int = RUNTIME_LIMITS.cli_stdout_total_bytes,
     ) -> None:
         self.args = list(args)
         self.cwd = cwd
@@ -99,6 +101,11 @@ class ManagedProcess:
         self._stderr_total = 0
         self._stderr_truncated = False
         self._max_stderr_bytes = max_stderr_bytes
+        self._max_stdout_line_bytes = max_stdout_line_bytes
+        self._max_stdout_total_bytes = max_stdout_total_bytes
+        self._stdout_total = 0
+        self._stdout_limit_exceeded = False
+        self._stdout_limit_detail = ""
         self._cancelled = False
         self._identity: ProcessIdentity | None = None
 
@@ -141,14 +148,53 @@ class ManagedProcess:
             raise RuntimeError("could not capture backend process identity")
 
     async def stream_stdout(self) -> AsyncIterator[str]:
-        """Yield decoded stdout lines. Drains stderr concurrently to avoid buffer deadlock."""
+        """Yield bounded decoded stdout lines while draining stderr concurrently.
+
+        ``StreamReader``'s line iterator has its own small implementation limit and raises on a
+        newline-free payload. Reading chunks here lets OpenAgent enforce its documented 1 MiB/line
+        and 16 MiB/stream byte limits itself. Exceeding either limit terminates the backend and is
+        exposed to the adapter as ``output_limit_exceeded``; it is never a silent truncation.
+        """
 
         assert self._proc is not None and self._proc.stdout is not None
         stderr_task = asyncio.create_task(self._drain_stderr())
+        pending = bytearray()
         try:
-            async for raw in self._proc.stdout:
-                yield raw.decode("utf-8", errors="replace").rstrip("\n")
+            while True:
+                raw = await self._proc.stdout.read(64 * 1024)
+                if not raw:
+                    break
+                self._stdout_total += len(raw)
+                if self._stdout_total > self._max_stdout_total_bytes:
+                    self._mark_stdout_limit(
+                        f"stdout exceeded {self._max_stdout_total_bytes} total bytes"
+                    )
+                    break
+                pending.extend(raw)
+                while True:
+                    newline = pending.find(b"\n")
+                    if newline < 0:
+                        break
+                    if newline > self._max_stdout_line_bytes:
+                        self._mark_stdout_limit(
+                            f"stdout line exceeded {self._max_stdout_line_bytes} bytes"
+                        )
+                        break
+                    line = bytes(pending[:newline])
+                    del pending[: newline + 1]
+                    yield line.decode("utf-8", errors="replace")
+                if self._stdout_limit_exceeded:
+                    break
+                if len(pending) > self._max_stdout_line_bytes:
+                    self._mark_stdout_limit(
+                        f"stdout line exceeded {self._max_stdout_line_bytes} bytes"
+                    )
+                    break
+            if not self._stdout_limit_exceeded and pending:
+                yield bytes(pending).decode("utf-8", errors="replace")
         finally:
+            if self._stdout_limit_exceeded:
+                self._terminate_for_output_limit()
             # stdout is exhausted (the child exited or was killed). Give the stderr reader a bounded
             # moment to finish draining, then stop it: a cancelled run must not leave a reader task
             # attached to a dead pipe (§13).
@@ -161,6 +207,31 @@ class ManagedProcess:
                         await stderr_task
             else:
                 await stderr_task
+
+    def _mark_stdout_limit(self, detail: str) -> None:
+        self._stdout_limit_exceeded = True
+        self._stdout_limit_detail = detail
+
+    def _terminate_for_output_limit(self) -> None:
+        if self._proc is None or self._proc.returncode is not None:
+            return
+        if self._identity is not None:
+            terminate_process_tree(self._identity, grace=0.25)
+            return
+        with contextlib.suppress(ProcessLookupError):
+            self._proc.kill()
+
+    @property
+    def stdout_total_bytes(self) -> int:
+        return self._stdout_total
+
+    @property
+    def stdout_limit_exceeded(self) -> bool:
+        return self._stdout_limit_exceeded
+
+    @property
+    def stdout_limit_detail(self) -> str:
+        return self._stdout_limit_detail
 
     async def _drain_stderr(self) -> None:
         """Read stderr in fixed-size chunks into the bounded ring.

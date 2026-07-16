@@ -50,6 +50,10 @@ class Paths:
     def runtime_dir(self) -> Path:
         return self.project_state_dir / "runtime"
 
+    @property
+    def journal_dir(self) -> Path:
+        return self.data_dir / "journal"
+
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / run_id
 
@@ -89,5 +93,6 @@ def ensure_dirs(paths: Paths) -> None:
         paths.runs_dir,
         paths.worktrees_dir,
         paths.runtime_dir,
+        paths.journal_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)

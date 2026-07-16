@@ -79,6 +79,16 @@ class ProviderRepository:
                 sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider_id)
             )
 
+    def delete_with_probes(self, provider_id: str) -> bool:
+        with self.db.engine.begin() as conn:
+            conn.execute(
+                sa_delete(t.model_probes).where(t.model_probes.c.provider_id == provider_id)
+            )
+            result = conn.execute(
+                sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider_id)
+            )
+        return bool(result.rowcount)
+
 
 class ModelRepository:
     def __init__(self, database: Database) -> None:

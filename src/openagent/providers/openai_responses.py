@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..core.errors import ErrorType
-from ..core.events import ModelEventType, NormalizedModelEvent, TokenUsage, ToolCall
+from ..core.events import ModelEventType, NormalizedModelEvent, TokenUsage
 from ..core.models import ModelCapabilities, RemoteModel
 from .base import (
     HealthResult,
@@ -19,6 +19,7 @@ from .base import (
     Role,
     TokenEstimate,
     default_probe,
+    normalized_tool_call,
     rough_token_estimate,
 )
 from .transport import Transport, TransportError
@@ -183,13 +184,10 @@ def _events_from_response(
         for item in output:
             if item.get("type") == "function_call":
                 events.append(
-                    NormalizedModelEvent(
-                        type=ModelEventType.TOOL_CALL,
-                        tool_call=ToolCall(
-                            id=item.get("call_id") or item.get("id") or "call_0",
-                            name=item.get("name", ""),
-                            arguments=_loads(item.get("arguments", "")),
-                        ),
+                    normalized_tool_call(
+                        call_id=item.get("call_id") or item.get("id"),
+                        name=item.get("name"),
+                        arguments=item.get("arguments", ""),
                         response_id=response_id,
                     )
                 )
@@ -256,13 +254,3 @@ def _parse_usage(usage: dict[str, Any]) -> TokenUsage:
         cached_input_tokens=details.get("cached_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
     )
-
-
-def _loads(raw: str) -> dict[str, Any]:
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    except json.JSONDecodeError:
-        return {}

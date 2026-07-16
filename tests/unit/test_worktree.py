@@ -118,3 +118,27 @@ def test_discard_refuses_when_ownership_metadata_is_missing(tmp_path: Path):
     with pytest.raises(GitError, match="ownership metadata missing"):
         mgr.discard(ws)
     assert (ws.root / "file.txt").read_text() == "user data"
+
+
+def test_owned_worktree_agent_commit_and_revert(git_project: Path):
+    manager = WorktreeManager(git_project, git_project / ".openagent" / "worktrees")
+    workspace = manager.create("run_commit")
+    (workspace.root / "main.py").write_text("print('agent')\n")
+    commit = manager.commit_all(
+        workspace,
+        "openagent: apply coder changes\n\nOpenAgent-Agent: coder\nOpenAgent-Model: model-x",
+    )
+    assert commit is not None
+    message = subprocess.run(
+        ["git", "show", "-s", "--format=%B", commit],
+        cwd=workspace.root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "OpenAgent-Agent: coder" in message
+    assert "OpenAgent-Model: model-x" in message
+
+    revert = manager.revert_commit(workspace, commit)
+    assert revert != commit
+    assert (workspace.root / "main.py").read_text() == "print('v1')\n"

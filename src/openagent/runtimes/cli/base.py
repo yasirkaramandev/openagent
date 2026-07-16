@@ -48,6 +48,8 @@ class CliRunRequest:
     #: Pin the model a CLI backend should use. ``None`` → the CLI's own configured default. This is
     #: how a Codex agent avoids inheriting a ~/.codex/config.toml model its installed CLI cannot run.
     model: str | None = None
+    reasoning_effort: str | None = None
+    codex_final_message_path: Path | None = field(default=None, init=False, repr=False)
 
 
 @dataclass
@@ -285,6 +287,19 @@ async def run_managed_cli(
                 saw_message = True
             yield event
     code = await proc.wait()
+    if proc.stdout_limit_exceeded:
+        yield NormalizedEvent(
+            run_id=run_id,
+            type=EventType.RUN_FAILED,
+            source=source,
+            data={
+                "error_type": "output_limit_exceeded",
+                "message": proc.stdout_limit_detail,
+                "truncated": True,
+                "stdout_bytes": proc.stdout_total_bytes,
+            },
+        )
+        return
     if finalizer is not None:
         outcome = StreamOutcome(exit_code=code, cancelled=proc.cancelled, saw_message=saw_message)
         for event in finalizer(outcome):

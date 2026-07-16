@@ -194,6 +194,72 @@ async def test_loop_reports_error(tmp_path: Path):
     assert outcome.error_type == "authentication_failed"
 
 
+async def test_provider_error_precedes_message_completion(tmp_path: Path):
+    events: list[NormalizedEvent] = []
+    adapter = ScriptedAdapter(
+        [
+            [
+                NormalizedModelEvent(type=ModelEventType.TEXT_DELTA, text="partial"),
+                NormalizedModelEvent(
+                    type=ModelEventType.ERROR,
+                    error_type="provider_overloaded",
+                    error_message="failed after partial output",
+                ),
+            ]
+        ]
+    )
+    outcome = await run_api_agent(
+        run_id="r",
+        agent=_agent(),
+        prompt="x",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
+        emit=events.append,
+    )
+    assert outcome.error_type == "provider_overloaded"
+    assert not any(event.type == "message.completed" for event in events)
+
+
+async def test_missing_tool_identity_is_a_distinct_failure(tmp_path: Path):
+    adapter = ScriptedAdapter(
+        [
+            [
+                NormalizedModelEvent(
+                    type=ModelEventType.TOOL_CALL,
+                    tool_call=ToolCall(id="", name="", arguments={}),
+                )
+            ]
+        ]
+    )
+    outcome = await run_api_agent(
+        run_id="r",
+        agent=_agent(),
+        prompt="x",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
+        emit=lambda _event: None,
+    )
+    assert outcome.error_type == "invalid_tool_call"
+
+
+async def test_model_text_limit_is_visible(tmp_path: Path):
+    adapter = ScriptedAdapter(
+        [[NormalizedModelEvent(type=ModelEventType.TEXT_DELTA, text="x" * (1024 * 1024 + 1))]]
+    )
+    outcome = await run_api_agent(
+        run_id="r",
+        agent=_agent(),
+        prompt="x",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
+        emit=lambda _event: None,
+    )
+    assert outcome.error_type == "output_limit_exceeded"
+
+
 # --------------------------------------------------------------------------- stalled-stream cancel (9.1)
 
 

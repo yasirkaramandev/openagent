@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from openagent.core.errors import ErrorType
-from openagent.providers.transport import Transport, TransportError
+from openagent.providers.transport import Transport, TransportError, _retry_after
 
 
 class _Stream:
@@ -86,3 +86,22 @@ async def test_disconnect_before_event_is_retried():
     received = [obj async for obj in transport.stream_sse("/chat", {})]
     assert client.calls == 2  # retried once
     assert received and received[0]["choices"][0]["delta"]["content"] == "hi"
+
+
+async def test_completely_malformed_stream_has_a_distinct_failure():
+    client = _Client([_Stream(200, ["data: {broken", "data: [1, 2]"])])
+    transport = _transport(client)
+    with pytest.raises(TransportError) as exc:
+        _ = [event async for event in transport.stream_sse("/chat", {})]
+    assert exc.value.error_type is ErrorType.MALFORMED_STREAM
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "-inf", "not-a-number"])
+def test_retry_after_rejects_non_finite_negative_and_invalid_values(value: str):
+    response = httpx.Response(429, headers={"retry-after": value})
+    assert _retry_after(response) is None
+
+
+def test_retry_after_is_capped_at_thirty_seconds():
+    response = httpx.Response(429, headers={"retry-after": "999"})
+    assert _retry_after(response) == 30.0

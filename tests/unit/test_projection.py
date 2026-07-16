@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from openagent.core.events import EventType, ItemStatus, NormalizedEvent
+from openagent.core.limits import RuntimeLimits
 from openagent.core.projection import RunProjection
 from openagent.runtimes.cli.codex import map_codex_event
 
@@ -257,3 +258,22 @@ def test_within_one_turn_the_same_item_id_still_projects_onto_one_card():
         _event(EventType.COMMAND_COMPLETED, item_id="item_2", command="pytest", exit_code=0)
     )
     assert len(projection.commands) == 1
+
+
+def test_projection_byte_budget_evicts_oldest_and_marks_truncation(monkeypatch):
+    import openagent.core.projection as projection_module
+
+    monkeypatch.setattr(projection_module, "RUNTIME_LIMITS", RuntimeLimits(projection_bytes=700))
+    projection = RunProjection("run_1")
+    for index in range(8):
+        projection.apply(
+            _event(
+                EventType.MESSAGE_COMPLETED,
+                item_id=f"m{index}",
+                text=f"{index}:" + ("x" * 180),
+            )
+        )
+
+    assert projection.truncated is True
+    assert len(projection.messages) < 8
+    assert projection.messages[-1].text.startswith("7:")

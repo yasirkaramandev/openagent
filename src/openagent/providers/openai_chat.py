@@ -17,7 +17,6 @@ from ..core.events import (
     ModelEventType,
     NormalizedModelEvent,
     TokenUsage,
-    ToolCall,
 )
 from ..core.models import ModelCapabilities, RemoteModel
 from .base import (
@@ -26,6 +25,7 @@ from .base import (
     Role,
     TokenEstimate,
     default_probe,
+    normalized_tool_call,
     rough_token_estimate,
 )
 from .compat.profiles import CompatibilityProfile, get_compat
@@ -125,9 +125,11 @@ class OpenAIChatAdapter:
                 type=ModelEventType.TEXT_DELTA, text=text, response_id=response_id
             )
         for call in message.get("tool_calls") or []:
-            yield NormalizedModelEvent(
-                type=ModelEventType.TOOL_CALL,
-                tool_call=_parse_tool_call(call),
+            fn = call.get("function") or {}
+            yield normalized_tool_call(
+                call_id=call.get("id"),
+                name=fn.get("name"),
+                arguments=fn.get("arguments", ""),
                 response_id=response_id,
             )
         if data.get("usage"):
@@ -168,13 +170,10 @@ class OpenAIChatAdapter:
                         frag["arguments"] += fn["arguments"]
         for idx in sorted(tool_frags):
             frag = tool_frags[idx]
-            yield NormalizedModelEvent(
-                type=ModelEventType.TOOL_CALL,
-                tool_call=ToolCall(
-                    id=frag["id"] or f"call_{idx}",
-                    name=frag["name"],
-                    arguments=_loads_args(frag["arguments"]),
-                ),
+            yield normalized_tool_call(
+                call_id=frag["id"],
+                name=frag["name"],
+                arguments=frag["arguments"],
                 response_id=response_id,
             )
         if usage is not None:
@@ -233,15 +232,6 @@ def _to_openai_messages(request: NormalizedModelRequest) -> list[dict[str, Any]]
     return messages
 
 
-def _parse_tool_call(call: dict[str, Any]) -> ToolCall:
-    fn = call.get("function") or {}
-    return ToolCall(
-        id=call.get("id") or "call_0",
-        name=fn.get("name", ""),
-        arguments=_loads_args(fn.get("arguments", "")),
-    )
-
-
 def _parse_usage(usage: dict[str, Any]) -> TokenUsage:
     details = usage.get("prompt_tokens_details") or {}
     completion_details = usage.get("completion_tokens_details") or {}
@@ -252,13 +242,3 @@ def _parse_usage(usage: dict[str, Any]) -> TokenUsage:
         output_tokens=usage.get("completion_tokens", 0),
         reasoning_tokens=int(completion_details.get("reasoning_tokens", 0) or 0),
     )
-
-
-def _loads_args(raw: str) -> dict[str, Any]:
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    except json.JSONDecodeError:
-        return {}

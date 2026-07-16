@@ -60,10 +60,10 @@ def safe_display(value: object, *, limit: int | None = None, single_line: bool =
         return ""
     text = strip_control(str(value))
     text = redact(text)
-    if single_line:
-        text = " ".join(text.split())
     if limit is not None and len(text) > limit:
         text = text[: max(0, limit - 1)] + DEFAULT_ELLIPSIS
+    if single_line:
+        text = " ".join(text.split())
     return escape(text)
 
 

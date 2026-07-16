@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import KEYCHAIN_SERVICE, Paths, ensure_dirs, get_paths
 from .credentials.store import CredentialStore
+from .security.journal import OperationJournal
 from .storage.db import Database
 from .storage.projects import ensure_project_marker, write_project_marker
 from .storage.repositories import Repositories
@@ -32,6 +33,8 @@ class OpenAgentApp:
             self.repos.projects.upsert(project)
         self.project = project
         self.credentials = CredentialStore(KEYCHAIN_SERVICE)
+        self.journal = OperationJournal(paths.journal_dir)
+        self._recover_operations()
         self._services: dict[str, object] = {}
 
     @classmethod
@@ -86,3 +89,40 @@ class OpenAgentApp:
         if key not in self._services:
             self._services[key] = factory()
         return self._services[key]
+
+    def _recover_operations(self) -> None:
+        """Finish/compensate operations interrupted after a durable journal write."""
+
+        from .core.models import CredentialRef
+        from .reporting.openagent_md import write_openagent_md
+
+        for operation in self.journal.pending():
+            if operation.kind in {"provider_add", "provider_remove"}:
+                provider_id = str(operation.payload.get("provider_id") or "")
+                provider = self.repos.providers.get(provider_id) if provider_id else None
+                raw_ref = operation.payload.get("credential")
+                if isinstance(raw_ref, dict):
+                    credential = CredentialRef.model_validate(raw_ref)
+                    if operation.kind == "provider_add":
+                        if (
+                            operation.stage
+                            in {
+                                "secret_write_intent",
+                                "secret_written",
+                                "db_written",
+                            }
+                            and provider is None
+                        ):
+                            self.credentials.delete_secret(credential, strict=True)
+                    elif provider is None:
+                        self.credentials.delete_secret(credential, strict=True)
+                legacy_ref = operation.payload.get("legacy_credential")
+                if provider is not None and isinstance(legacy_ref, dict):
+                    self.credentials.delete_secret(
+                        CredentialRef.model_validate(legacy_ref), strict=True
+                    )
+                operation.complete()
+            elif operation.kind == "agent_document_sync":
+                path = Path(str(operation.payload["path"]))
+                write_openagent_md(path, self.repos.agents.list())
+                operation.complete()

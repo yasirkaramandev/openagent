@@ -90,3 +90,22 @@ def test_api_agent_with_existing_provider_reference_succeeds(tmp_path: Path):
         name="ok", runtime_type=RuntimeType.API_AGENT, provider="ds", model="deepseek-chat"
     )
     assert agent.runtime.provider == "ds" and agent.runtime.model == "deepseek-chat"
+    assert agent.runtime.model_verification is not None
+    assert agent.runtime.model_verification.status == "unverified"
+
+
+def test_model_override_reason_is_persisted_and_never_marked_verified(tmp_path: Path):
+    oa = _oa(tmp_path)
+    oa.providers.add(name="ds", provider_type="deepseek", key_env="DS_KEY", credential_source="env")
+    agent = oa.agents.create(
+        name="override",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="ds",
+        model="deepseek-chat",
+        model_override_reason="temporary provider outage during probe",
+    )
+    verification = agent.runtime.model_verification
+    assert verification is not None
+    assert verification.status == "overridden"
+    assert verification.override_reason == "temporary provider outage during probe"
+    assert verification.verified_at is None

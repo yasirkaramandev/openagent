@@ -2,10 +2,12 @@ import pytest
 
 from openagent.credentials.redaction import (
     REDACTED,
+    acquire_scoped_secret,
     clear_registered_secrets,
     redact,
     redact_mapping,
     register_secret,
+    release_secret_scope,
 )
 
 
@@ -82,6 +84,17 @@ def test_short_values_not_registered():
 def test_empty_string_untouched():
     assert redact("") == ""
     assert redact("hello world") == "hello world"
+
+
+def test_run_scopes_are_reference_counted_and_released_independently():
+    secret = "prefixless-run-scoped-secret-123"
+    acquire_scoped_secret("run_a", secret)
+    acquire_scoped_secret("run_b", secret)
+    assert secret not in redact(secret)
+    release_secret_scope("run_a")
+    assert secret not in redact(secret), "run_b still holds the same credential"
+    release_secret_scope("run_b")
+    assert redact(secret) == secret
 
 
 # --------------------------------------------------------------------------- NVIDIA keys (§19)

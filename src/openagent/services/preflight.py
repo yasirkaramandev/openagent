@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from ..core.models import AgentProfile, CredentialType, RuntimeType
 from ..core.permissions import PROFILES, get_profile
+from ..credentials.redaction import redact, secret_scope
 from ..providers.factory import build_adapter, resolve_base_url
 from ..runtimes.cli.antigravity import AntigravityAdapter
 from ..runtimes.cli.base import detect_version, find_executable
@@ -222,6 +223,8 @@ class PreflightService:
 
         if cli_type == "codex":
             self._check_codex(report, executable, profile_name)
+        elif cli_type == "claude":
+            self._check_claude(report, executable, agent)
         elif cli_type == "antigravity":
             allowed, reason = adapter.permission_status(profile_name)  # type: ignore[attr-defined]
             report.add(
@@ -273,6 +276,31 @@ class PreflightService:
             if supported
             else f"this codex build does not accept --sandbox {sandbox}",
             error_type="permission_mode_unsupported",
+        )
+
+    def _check_claude(self, report: PreflightReport, executable: str, agent: AgentProfile) -> None:
+        help_text = _root_help(executable)
+        if help_text is None:
+            report.add(
+                "Claude CLI help is available",
+                False,
+                "`claude --help` did not run; model/effort support cannot be verified",
+                error_type="cli_version_unsupported",
+            )
+            return
+        requested_model = agent.runtime.model
+        requested_effort = agent.runtime.reasoning_effort
+        report.add(
+            "Claude model flag is supported",
+            not requested_model or "--model" in help_text,
+            requested_model or "CLI default model",
+            error_type="cli_version_unsupported",
+        )
+        report.add(
+            "Claude effort flag is supported",
+            not requested_effort or "--effort" in help_text,
+            requested_effort or "CLI default effort",
+            error_type="cli_version_unsupported",
         )
 
     # ------------------------------------------------------------------ API
@@ -328,13 +356,18 @@ class PreflightService:
             error_type="model_missing",
         )
 
-        try:
-            build_adapter(provider, self.app.credentials.resolve(cred))
-            report.add("Provider adapter builds", True, provider.protocol.value)
-        except Exception as exc:  # noqa: BLE001 - surface a construction failure as a blocker
-            report.add(
-                "Provider adapter builds", False, str(exc), error_type="provider_adapter_failed"
-            )
+        key = self.app.credentials.resolve(cred)
+        with secret_scope(key):
+            try:
+                build_adapter(provider, key)
+                report.add("Provider adapter builds", True, provider.protocol.value)
+            except Exception as exc:  # noqa: BLE001 - construction failure is a blocker
+                report.add(
+                    "Provider adapter builds",
+                    False,
+                    redact(str(exc)),
+                    error_type="provider_adapter_failed",
+                )
 
 
 # --------------------------------------------------------------------------- helpers
@@ -378,6 +411,23 @@ def _exec_help(executable: str) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         _HELP_CACHE[executable] = None
     return _HELP_CACHE[executable]
+
+
+def _root_help(executable: str) -> str | None:
+    key = f"{executable}::__root__"
+    if key not in _HELP_CACHE:
+        try:
+            result = subprocess.run(
+                [executable, "--help"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            _HELP_CACHE[key] = result.stdout + result.stderr if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            _HELP_CACHE[key] = None
+    return _HELP_CACHE[key]
 
 
 def antigravity_permission_status(profile_name: str) -> tuple[bool, str]:

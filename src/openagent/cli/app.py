@@ -137,6 +137,12 @@ def add_agent(
         "--allow-unverified-model",
         help="Create the agent even though its model has no verified capability probe.",
     ),
+    model_override_reason: str | None = typer.Option(
+        None,
+        "--model-override-reason",
+        help="Required reason when overriding model verification.",
+    ),
+    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort"),
 ) -> None:
     """Add an agent (API or CLI). Shortcut for `agent add`."""
     oa = _app()
@@ -155,13 +161,21 @@ def add_agent(
                 tags=tag,
                 system_prompt=system_prompt,
                 permission_profile=profile,
+                reasoning_effort=reasoning_effort,
             )
         else:
             if not oa.providers.get(provider or ""):
                 _fail(
                     f"provider {provider!r} not found. Add it first: openagent provider add {provider} --type <type>"
                 )
-            _require_verified_model(oa, provider or "", model or "", allow_unverified_model)
+            if allow_unverified_model and not (model_override_reason or "").strip():
+                _fail("--allow-unverified-model requires --model-override-reason")
+            _require_verified_model(
+                oa,
+                provider or "",
+                model or "",
+                bool((model_override_reason or "").strip()),
+            )
             agent = oa.agents.create(
                 name=name,
                 title=title,
@@ -172,6 +186,8 @@ def add_agent(
                 tags=tag,
                 system_prompt=system_prompt,
                 permission_profile=profile,
+                reasoning_effort=reasoning_effort,
+                model_override_reason=model_override_reason,
             )
     except AgentError as exc:
         _fail(str(exc))
@@ -179,10 +195,10 @@ def add_agent(
         f"[green]✓[/green] agent [bold]{safe_markup(agent.name)}[/bold] created; "
         "OPENAGENT.md updated"
     )
-    if allow_unverified_model and not cli:
+    if model_override_reason and not cli:
         console.print(
-            "[yellow]⚠ this agent's model was NOT verified agent-compatible "
-            "(--allow-unverified-model). It may fail to operate OpenAgent tools.[/yellow]"
+            "[yellow]⚠ model verification OVERRIDDEN; this agent is not shown as Verified. "
+            f"Reason: {safe_markup(model_override_reason)}[/yellow]"
         )
 
 
@@ -262,6 +278,7 @@ def run(
     container_image: str | None = typer.Option(
         None, "--container-image", help="Required local image for container-sandbox"
     ),
+    commit_agent_changes: bool = typer.Option(False, "--commit-agent-changes"),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -285,6 +302,7 @@ def run(
             execution_backend=execution_backend,
             container_runtime=container_runtime,
             container_image=container_image,
+            commit_agent_changes=commit_agent_changes,
         )
     except RunError as exc:
         _fail(str(exc))
@@ -344,6 +362,45 @@ def resume(
 ) -> None:
     """Resume a run (spec §32)."""
     message(id=id, prompt=prompt, all_projects=all_projects)
+
+
+@app.command("rerun")
+def rerun_command(
+    id: str = typer.Option(..., "--id"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Run the same request under a new run id."""
+
+    oa = _app()
+    try:
+        new_run = oa.runs.rerun(id, all_projects=all_projects, confirm_in_place=yes)
+    except RunError as exc:
+        _fail(str(exc))
+    console.print(f"[dim]rerun {new_run.id} starting (from {safe_markup(id)})…[/dim]")
+    approval = (lambda _request: True) if yes else None
+    result = _run(oa.runs.execute(new_run, on_event=_print_event, approval_callback=approval))
+    console.print(
+        f"[bold]{safe_markup(enum_value(result.status))}[/bold] — {safe_markup(result.id)}"
+    )
+
+
+@app.command("revert")
+def revert_command(
+    id: str = typer.Option(..., "--id"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Revert the optional agent commit in its owned worktree."""
+
+    try:
+        commit = _app().runs.revert_agent_commit(id, all_projects=all_projects)
+    except RunError as exc:
+        _fail(str(exc))
+    if json_out:
+        emit_json({"run_id": id, "revert_commit": commit})
+    else:
+        console.print(f"[green]✓[/green] reverted {safe_markup(id)} as {safe_markup(commit)}")
 
 
 @app.command()
@@ -741,6 +798,8 @@ def agent_add(
         "--allow-unverified-model",
         help="Create the agent even though its model has no verified capability probe.",
     ),
+    model_override_reason: str | None = typer.Option(None, "--model-override-reason"),
+    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort"),
 ) -> None:
     """Add an agent (same as top-level `add`)."""
     add_agent(
@@ -754,6 +813,8 @@ def agent_add(
         system_prompt=system_prompt,
         profile=profile,
         allow_unverified_model=allow_unverified_model,
+        model_override_reason=model_override_reason,
+        reasoning_effort=reasoning_effort,
     )
 
 

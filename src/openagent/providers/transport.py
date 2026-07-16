@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
+from ..core.cancellation import RunCancellation
 from ..core.errors import ErrorType, classify_http_status, is_retryable
+from ..core.limits import RUNTIME_LIMITS
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
@@ -40,15 +44,22 @@ class TransportError(Exception):
 class Transport:
     base_url: str
     headers: dict[str, str] = field(default_factory=dict)
-    timeout: float = 120.0
-    max_retries: int = 4
+    timeout: float | None = None
+    total_timeout: float = 120.0
+    max_retries: int = 3
     backoff_base: float = 1.0
+    cancellation: RunCancellation | None = field(default=None, repr=False)
     _client: httpx.AsyncClient | None = field(default=None, repr=False)
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
+            timeout = (
+                httpx.Timeout(self.timeout)
+                if self.timeout is not None
+                else httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+            )
             self._client = httpx.AsyncClient(
-                base_url=self.base_url, headers=self.headers, timeout=self.timeout
+                base_url=self.base_url, headers=self.headers, timeout=timeout
             )
         return self._client
 
@@ -71,8 +82,15 @@ class Transport:
         attempt = 0
         while True:
             try:
-                response = await self.client().post(path, json=payload)
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                response = await asyncio.wait_for(
+                    self.client().post(path, json=payload), timeout=self.total_timeout
+                )
+            except (
+                TimeoutError,
+                asyncio.TimeoutError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ) as exc:
                 if attempt >= self.max_retries:
                     raise TransportError(ErrorType.TIMEOUT, str(exc)) from exc
                 await self._sleep(attempt, None)
@@ -92,7 +110,17 @@ class Transport:
                     _error_text(response),
                     status=response.status_code,
                 )
-            return response.json()
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise TransportError(
+                    ErrorType.INVALID_REQUEST, "provider returned invalid JSON"
+                ) from exc
+            if not isinstance(data, dict):
+                raise TransportError(
+                    ErrorType.INVALID_REQUEST, "provider returned a non-object JSON body"
+                )
+            return data
 
     async def stream_sse(self, path: str, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         """POST and yield decoded SSE ``data:`` JSON objects.
@@ -105,6 +133,9 @@ class Transport:
 
         attempt = 0
         received_event = False
+        malformed = 0
+        data_lines = 0
+        deadline = time.monotonic() + self.total_timeout
         while True:
             try:
                 async with self.client().stream("POST", path, json=payload) as response:
@@ -131,6 +162,10 @@ class Transport:
                             status=response.status_code,
                         )
                     async for line in response.aiter_lines():
+                        if time.monotonic() >= deadline:
+                            raise TransportError(
+                                ErrorType.TIMEOUT, "provider stream exceeded 120 seconds"
+                            )
                         stripped = line.strip()
                         if (
                             not stripped
@@ -139,15 +174,29 @@ class Transport:
                         ):
                             continue
                         payload_str = stripped[len("data:") :].strip()
+                        data_lines += 1
                         if payload_str == "[DONE]":
                             return
                         try:
                             obj = json.loads(payload_str)
                         except json.JSONDecodeError:
+                            malformed += 1
                             continue
                         if isinstance(obj, dict):
+                            if obj.get("error"):
+                                raise TransportError(
+                                    ErrorType.UNKNOWN,
+                                    str(obj.get("error"))[: RUNTIME_LIMITS.provider_error_bytes],
+                                )
                             received_event = True
                             yield obj
+                        else:
+                            malformed += 1
+                    if data_lines and malformed == data_lines and not received_event:
+                        raise TransportError(
+                            ErrorType.MALFORMED_STREAM,
+                            "provider stream contained only malformed data events",
+                        )
                     return
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 # If we already yielded events, replaying the request would double-apply its effects.
@@ -162,18 +211,35 @@ class Transport:
                 attempt += 1
 
     async def get_json(self, path: str) -> dict[str, Any]:
-        response = await self.client().get(path)
+        try:
+            response = await asyncio.wait_for(self.client().get(path), timeout=self.total_timeout)
+        except (
+            TimeoutError,
+            asyncio.TimeoutError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ) as exc:
+            raise TransportError(ErrorType.TIMEOUT, "provider request timed out") from exc
         if response.status_code >= 400:
             raise TransportError(
                 classify_http_status(response.status_code),
                 _error_text(response),
                 status=response.status_code,
             )
-        return response.json()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise TransportError(
+                ErrorType.INVALID_REQUEST, "provider returned a non-object JSON body"
+            )
+        return data
 
     async def _sleep(self, attempt: int, retry_after: float | None) -> None:
         delay = retry_after if retry_after is not None else self.backoff_base * (2**attempt)
-        await asyncio.sleep(delay)
+        delay = min(30.0, max(0.0, delay))
+        if self.cancellation is not None:
+            await self.cancellation.guard(asyncio.sleep(delay))
+        else:
+            await asyncio.sleep(delay)
 
 
 def _retry_after(response: httpx.Response) -> float | None:
@@ -181,9 +247,12 @@ def _retry_after(response: httpx.Response) -> float | None:
     if not value:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except ValueError:
         return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return min(parsed, 30.0)
 
 
 def _error_text(response: httpx.Response) -> str:
@@ -192,11 +261,11 @@ def _error_text(response: httpx.Response) -> str:
         if isinstance(data, dict):
             err = data.get("error")
             if isinstance(err, dict):
-                return str(err.get("message", data))
-            return str(err or data.get("message", data))
+                return str(err.get("message", data))[: RUNTIME_LIMITS.provider_error_bytes]
+            return str(err or data.get("message", data))[: RUNTIME_LIMITS.provider_error_bytes]
     except Exception:  # pragma: no cover - non-JSON error body
         pass
-    return response.text[:500]
+    return response.text[: RUNTIME_LIMITS.provider_error_bytes]
 
 
 def retryable_error(error_type: ErrorType) -> bool:

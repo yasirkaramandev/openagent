@@ -36,6 +36,10 @@ class ErrorType(str, Enum):
     #: runtime is synchronous and does not poll, so a 202 is an explicit failure, never an empty
     #: success (spec §15.5, some NVIDIA model types).
     ASYNC_UNSUPPORTED = "async_unsupported"
+    MALFORMED_STREAM = "malformed_stream"
+    INVALID_TOOL_CALL = "invalid_tool_call"
+    INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
+    OUTPUT_LIMIT_EXCEEDED = "output_limit_exceeded"
     UNKNOWN = "unknown"
 
 

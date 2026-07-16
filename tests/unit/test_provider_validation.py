@@ -172,9 +172,9 @@ def test_add_rolls_back_keychain_secret_when_row_write_fails(
     deleted: list[str] = []
     real_delete = oa.credentials.delete_secret
 
-    def _spy_delete(ref) -> None:
+    def _spy_delete(ref, **kwargs) -> None:
         deleted.append(ref.account or "")
-        real_delete(ref)
+        real_delete(ref, **kwargs)
 
     monkeypatch.setattr(oa.credentials, "delete_secret", _spy_delete)
 
@@ -191,7 +191,7 @@ def test_add_rolls_back_keychain_secret_when_row_write_fails(
             credential_source="keychain",
         )
 
-    assert deleted == ["provider/deepseek-main"]  # 3. delete_secret called for this account
+    assert len(deleted) == 1 and deleted[0].startswith("provider/deepseek-main/")
     assert oa.credentials.resolve(_keychain_ref("deepseek-main")) is None  # secret gone
     assert oa.providers.get("deepseek-main") is None  # 4. provider absent
     assert oa.agents.get("deepseek-main") is None  # 5. agent absent
@@ -241,13 +241,13 @@ def test_add_rejects_duplicate_provider_name(tmp_path: Path) -> None:
 def test_duplicate_add_leaves_original_secret_untouched(tmp_path: Path) -> None:
     """A rejected duplicate must not overwrite or create an orphaned replacement secret (item 6)."""
 
-    from openagent.core.models import CredentialRef
-
     oa = _app(tmp_path)
     oa.providers.add(
         name="dup", provider_type="deepseek", api_key="sk-first", credential_source="keychain"
     )
-    ref = CredentialRef(type=CredentialType.KEYCHAIN, service="openagent", account="provider/dup")
+    provider = oa.providers.get("dup")
+    assert provider is not None
+    ref = provider.credential
     assert oa.credentials.resolve(ref) == "sk-first"
     with pytest.raises(ProviderValidationError):
         oa.providers.add(

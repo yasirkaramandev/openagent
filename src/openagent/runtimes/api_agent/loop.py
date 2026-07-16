@@ -13,18 +13,22 @@ stops running tools, and returns a ``cancelled`` outcome — it never goes on to
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...core.cancellation import RunCancellation, RunCancelled
+from ...core.errors import ErrorType
 from ...core.events import (
     EventType,
     ItemStatus,
     ModelEventType,
     NormalizedEvent,
     TokenUsage,
+    ToolCall,
 )
+from ...core.limits import RUNTIME_LIMITS
 from ...core.models import AgentProfile
 from ...providers.base import Message, NormalizedModelRequest, ProviderAdapter, Role
 from ...tools.control import TaskFinished
@@ -86,6 +90,23 @@ async def run_api_agent(
             return _cancelled(step - 1)
 
         _emit(EventType.MESSAGE_STARTED, step=step)
+        history_bytes = len(
+            json.dumps(
+                [message.model_dump(mode="json") for message in conversation],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        if (
+            len(conversation) > RUNTIME_LIMITS.history_messages
+            or history_bytes > RUNTIME_LIMITS.history_bytes
+        ):
+            return ApiRunOutcome(
+                completed=False,
+                usage=total,
+                steps=step,
+                error_type=ErrorType.OUTPUT_LIMIT_EXCEEDED.value,
+                error_message="conversation history exceeded the configured byte/message limit",
+            )
         request = NormalizedModelRequest(
             model=model,
             messages=conversation,
@@ -96,7 +117,8 @@ async def run_api_agent(
         )
 
         text_parts: list[str] = []
-        tool_calls = []
+        text_bytes = 0
+        tool_calls: list[ToolCall] = []
         error_type = error_message = None
         stream = adapter.stream_response(request)
         iterator = stream.__aiter__()
@@ -114,8 +136,36 @@ async def run_api_agent(
                     break
                 if event.type == ModelEventType.TEXT_DELTA and event.text:
                     text_parts.append(event.text)
+                    text_bytes += len(event.text.encode("utf-8"))
+                    if text_bytes > RUNTIME_LIMITS.model_text_bytes:
+                        return ApiRunOutcome(
+                            completed=False,
+                            usage=total,
+                            steps=step,
+                            error_type=ErrorType.OUTPUT_LIMIT_EXCEEDED.value,
+                            error_message="model text exceeded 1 MiB",
+                        )
                     _emit(EventType.MESSAGE_DELTA, text=event.text, step=step)
                 elif event.type == ModelEventType.TOOL_CALL and event.tool_call is not None:
+                    call = event.tool_call
+                    if not call.id or not call.name:
+                        error_type = ErrorType.INVALID_TOOL_CALL.value
+                        error_message = "provider tool call is missing a non-empty id or name"
+                        continue
+                    try:
+                        argument_bytes = len(
+                            json.dumps(call.arguments, ensure_ascii=False).encode("utf-8")
+                        )
+                    except (TypeError, ValueError):
+                        argument_bytes = RUNTIME_LIMITS.tool_arguments_bytes + 1
+                    if argument_bytes > RUNTIME_LIMITS.tool_arguments_bytes:
+                        error_type = ErrorType.INVALID_TOOL_ARGUMENTS.value
+                        error_message = "provider tool arguments exceed 64 KiB or are not JSON"
+                        continue
+                    if len(tool_calls) >= RUNTIME_LIMITS.tool_calls_per_turn:
+                        error_type = ErrorType.OUTPUT_LIMIT_EXCEEDED.value
+                        error_message = "provider emitted more than 64 tool calls in one turn"
+                        continue
                     tool_calls.append(event.tool_call)
                 elif event.type == ModelEventType.USAGE and event.usage is not None:
                     total.input_tokens += event.usage.input_tokens
@@ -136,6 +186,14 @@ async def run_api_agent(
             await _aclose(stream)
 
         text = "".join(text_parts)
+        if error_type is not None:
+            return ApiRunOutcome(
+                completed=False,
+                usage=total,
+                steps=step,
+                error_type=error_type,
+                error_message=error_message,
+            )
         # An empty turn is a failure, not a silent success (§12). The provider stream closed having
         # produced no text AND no tool calls — a hiccup, a content filter, a truncated stream, or a
         # response whose every chunk failed to parse. Reporting `completed` with an empty summary
@@ -172,15 +230,6 @@ async def run_api_agent(
             tool_calls=[c.name for c in tool_calls],
             step=step,
         )
-
-        if error_type is not None:
-            return ApiRunOutcome(
-                completed=False,
-                usage=total,
-                steps=step,
-                error_type=error_type,
-                error_message=error_message,
-            )
 
         conversation.append(Message(role=Role.ASSISTANT, content=text, tool_calls=tool_calls))
 

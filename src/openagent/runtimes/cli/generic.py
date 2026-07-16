@@ -107,6 +107,19 @@ class GenericCliAdapter:
                         data={"text": line},
                     )
             code = await proc.wait()
+            if proc.stdout_limit_exceeded:
+                yield NormalizedEvent(
+                    run_id=request.run_id,
+                    type=EventType.RUN_FAILED,
+                    source=self.manifest.id,
+                    data={
+                        "error_type": "output_limit_exceeded",
+                        "message": proc.stdout_limit_detail,
+                        "truncated": True,
+                        "stdout_bytes": proc.stdout_total_bytes,
+                    },
+                )
+                return
             etype = EventType.RUN_COMPLETED if code == 0 else EventType.RUN_FAILED
             yield NormalizedEvent(
                 run_id=request.run_id, type=etype, source=self.manifest.id, data={"exit_code": code}

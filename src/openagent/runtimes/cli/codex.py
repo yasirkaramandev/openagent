@@ -45,12 +45,15 @@ counted (as :attr:`TokenUsage.reasoning_tokens`) but the tokens themselves are n
 from __future__ import annotations
 
 import json
+import os
+import stat
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 from ...core.events import EventType, ItemStatus, NormalizedEvent
+from ...core.limits import RUNTIME_LIMITS
 from ...core.models import CliInstallation
 from ...core.permissions import get_profile
 from ...security.process import (
@@ -191,14 +194,16 @@ class CodexAdapter:
         file the agent "created" in the user's project diff.
         """
 
+        if request.codex_final_message_path is not None:
+            return request.codex_final_message_path
         if request.artifacts_dir is not None:
             request.artifacts_dir.mkdir(parents=True, exist_ok=True)
-            return request.artifacts_dir / "codex-final.txt"
+            request.codex_final_message_path = request.artifacts_dir / "codex-final.txt"
+            return request.codex_final_message_path
         handle, path = tempfile.mkstemp(prefix="openagent-codex-final-", suffix=".txt")
-        import os
-
         os.close(handle)
-        return Path(path)
+        request.codex_final_message_path = Path(path)
+        return request.codex_final_message_path
 
     async def _drive(
         self, request: CliRunRequest, args: list[str]
@@ -258,9 +263,21 @@ def final_message_fallback(
     """
 
     text = ""
+    truncated = False
     try:
         if final_path.exists():
-            text = final_path.read_text(encoding="utf-8", errors="replace").strip()
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(final_path, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError("Codex final-message path is not a regular file")
+                raw = os.read(descriptor, RUNTIME_LIMITS.final_message_bytes + 1)
+            finally:
+                os.close(descriptor)
+            truncated = len(raw) > RUNTIME_LIMITS.final_message_bytes
+            text = (
+                raw[: RUNTIME_LIMITS.final_message_bytes].decode("utf-8", errors="replace").strip()
+            )
     except OSError:
         text = ""
     finally:
@@ -279,8 +296,9 @@ def final_message_fallback(
             data={
                 "item_id": "final_message",
                 "status": ItemStatus.COMPLETED.value,
-                "text": text[: MAX_COMMAND_OUTPUT_CHARS * 4],
+                "text": text,
                 "fallback": True,
+                "truncated": truncated,
             },
         )
     ]

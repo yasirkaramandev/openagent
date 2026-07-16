@@ -13,12 +13,11 @@ end-to-end or dropped in a later milestone; until then treat MiniMax fidelity as
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ..core.errors import ErrorType
-from ..core.events import ModelEventType, NormalizedModelEvent, TokenUsage, ToolCall
+from ..core.events import ModelEventType, NormalizedModelEvent, TokenUsage
 from ..core.models import ModelCapabilities, RemoteModel
 from .base import (
     HealthResult,
@@ -28,6 +27,7 @@ from .base import (
     TokenEstimate,
     collect,
     default_probe,
+    normalized_tool_call,
     rough_token_estimate,
 )
 from .transport import Transport, TransportError
@@ -128,13 +128,10 @@ class AnthropicMessagesAdapter:
                     type=ModelEventType.TEXT_DELTA, text=block["text"], response_id=response_id
                 )
             elif block.get("type") == "tool_use":
-                yield NormalizedModelEvent(
-                    type=ModelEventType.TOOL_CALL,
-                    tool_call=ToolCall(
-                        id=block.get("id", "toolu_0"),
-                        name=block.get("name", ""),
-                        arguments=block.get("input") or {},
-                    ),
+                yield normalized_tool_call(
+                    call_id=block.get("id"),
+                    name=block.get("name"),
+                    arguments=block.get("input") or {},
                     response_id=response_id,
                 )
         if data.get("usage"):
@@ -172,13 +169,10 @@ class AnthropicMessagesAdapter:
         for idx in sorted(blocks):
             block = blocks[idx]
             if block.get("type") == "tool_use":
-                yield NormalizedModelEvent(
-                    type=ModelEventType.TOOL_CALL,
-                    tool_call=ToolCall(
-                        id=block.get("id", f"toolu_{idx}"),
-                        name=block.get("name", ""),
-                        arguments=_loads(block.get("input_json", "")),
-                    ),
+                yield normalized_tool_call(
+                    call_id=block.get("id"),
+                    name=block.get("name"),
+                    arguments=block.get("input_json", ""),
                     response_id=response_id,
                 )
         yield NormalizedModelEvent(type=ModelEventType.USAGE, usage=usage)
@@ -248,16 +242,6 @@ def _parse_usage(usage: dict[str, Any]) -> TokenUsage:
         cached_input_tokens=usage.get("cache_read_input_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
     )
-
-
-def _loads(raw: str) -> dict[str, Any]:
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    except json.JSONDecodeError:
-        return {}
 
 
 def _classify_health(error_type: str | None, message: str | None) -> HealthResult:

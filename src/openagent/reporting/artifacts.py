@@ -21,6 +21,7 @@ model messages) is bounded before it is written.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ from ..core.models import Run, enum_value
 from ..core.projection import RunProjection
 from ..credentials.redaction import redact
 from ..security.atomic import atomic_write_text
+from ..security.filesystem import SafeWorkspaceWalker
 
 _IS_WINDOWS = sys.platform.startswith("win")
 
@@ -205,6 +207,23 @@ class ArtifactWriter:
         ]
         self._text(f"turn_{run.turns:03d}.md", "\n".join(lines))
 
+    def write_integrity(self, run: Run) -> dict[str, str]:
+        """Hash the completed artifact bundle (JSONL export is intentionally independent)."""
+
+        hashes: dict[str, str] = {}
+        walker = SafeWorkspaceWalker(self.run_dir)
+        for path in walker.iter_files():
+            relative = str(path.relative_to(self.run_dir))
+            if relative in {"events.jsonl", "integrity.json"} or relative.startswith("."):
+                continue
+            hashes[relative] = hashlib.sha256(walker.read_bytes(relative)).hexdigest()
+        run.artifact_integrity = hashes
+        self._json(
+            "integrity.json",
+            {"algorithm": "sha256", "run_id": run.id, "files": hashes},
+        )
+        return hashes
+
     def _json(self, name: str, data: dict) -> None:
         self._text(name, json.dumps(data, indent=2))
 
@@ -312,6 +331,7 @@ def _structured(projection: RunProjection | None) -> dict:
             "turn_details": [],
         }
     return {
+        "truncated": projection.truncated,
         "reasoning_summaries": [
             {
                 "item_id": i.item_id,

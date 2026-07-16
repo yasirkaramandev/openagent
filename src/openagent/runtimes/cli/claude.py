@@ -93,6 +93,8 @@ class ClaudeAdapter:
         ]
         if request.model:
             args += ["--model", request.model]
+        if request.reasoning_effort:
+            args += ["--effort", request.reasoning_effort]
         if profile.claude_allowed_tools:
             args += ["--allowedTools", ",".join(profile.claude_allowed_tools)]
         if profile.claude_permission_mode:

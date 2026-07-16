@@ -60,12 +60,19 @@ class CredentialStore:
         else:
             raise CredentialError(f"cannot store secrets for credential type {ref.type.value!r}")
 
-    def delete_secret(self, ref: CredentialRef) -> None:
+    def delete_secret(self, ref: CredentialRef, *, strict: bool = False) -> None:
         if ref.type is CredentialType.KEYCHAIN and keyring is not None:
             try:
                 keyring.delete_password(ref.service or self.service, ref.account or "")
-            except Exception:  # pragma: no cover - best effort
-                pass
+            except Exception as exc:
+                # Deletion is naturally idempotent: a missing entry already satisfies the request.
+                password_delete_error = getattr(
+                    getattr(keyring, "errors", None), "PasswordDeleteError", ()
+                )
+                if password_delete_error and isinstance(exc, password_delete_error):
+                    pass
+                elif strict:
+                    raise CredentialError("keychain secret could not be deleted") from exc
         self._session.pop(self._session_key(ref), None)
 
     # ------------------------------------------------------------------ reading

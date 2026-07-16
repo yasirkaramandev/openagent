@@ -21,7 +21,7 @@ from ..core.models import (
     RemoteModel,
     enum_value,
 )
-from ..credentials.redaction import redact, register_secret, secret_scope
+from ..credentials.redaction import redact, secret_scope
 from ..providers.base import HealthResult
 from ..providers.discovery import (
     PROBE_UNREACHABLE,
@@ -34,6 +34,7 @@ from ..providers.factory import build_adapter, get_preset, resolve_base_url
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
     from ..credentials.store import CredentialStore
+    from ..security.journal import JournalOperation, OperationJournal
     from ..storage.repositories import Repositories
 
 #: How long a capability probe stays trusted before it must be re-run (spec §16).
@@ -84,6 +85,8 @@ class ProviderTransaction:
         repos: Repositories,
         provider: ProviderConnection,
         api_key: str | None,
+        journal: OperationJournal,
+        legacy_credential: CredentialRef | None = None,
     ) -> None:
         self._credentials = credentials
         self._repos = repos
@@ -92,21 +95,40 @@ class ProviderTransaction:
         self._previous: str | None = None
         self._wrote = False
         self._committed = False
+        self._journal = journal
+        self._operation: JournalOperation | None = None
+        self._legacy_credential = legacy_credential
 
     def __enter__(self) -> ProviderTransaction:
         credential = self.provider.credential
+        self._operation = self._journal.begin(
+            "provider_add",
+            {
+                "provider_id": self.provider.id,
+                "credential": credential.model_dump(mode="json"),
+                "legacy_credential": (
+                    self._legacy_credential.model_dump(mode="json")
+                    if self._legacy_credential
+                    else None
+                ),
+            },
+        )
         if self._api_key and credential.type is CredentialType.KEYCHAIN:
             # Capture the *value* that was there before (needed to restore it byte-for-byte), then
             # overwrite it. Held only until commit()/rollback.
             self._previous = self._credentials.resolve(credential)
             self._wrote = True
+            self._operation.advance("secret_write_intent")
             self._credentials.set_secret(credential, self._api_key)
+            self._operation.advance("secret_written")
         try:
             self._repos.providers.upsert(self.provider)
         except Exception:
             self._restore()
             self._forget()
+            self._operation.complete()
             raise
+        self._operation.advance("db_written")
         self._api_key = None  # the key now lives in the keychain; keep no copy in memory
         return self
 
@@ -115,6 +137,10 @@ class ProviderTransaction:
 
         self._committed = True
         self._forget()
+        if self._legacy_credential is not None:
+            self._credentials.delete_secret(self._legacy_credential, strict=True)
+        if self._operation is not None:
+            self._operation.complete()
 
     def __exit__(
         self,
@@ -125,10 +151,22 @@ class ProviderTransaction:
         # Returns None → never suppresses the in-flight exception; an uncommitted transaction is
         # rolled back exactly (keychain restored, half-written provider row removed).
         if not self._committed:
-            self._restore()
-            self._forget()
+            restore_error: BaseException | None = None
+            try:
+                self._restore()
+            except BaseException as restore_exc:
+                # Keep the journal when keychain compensation could not finish. The DB row must
+                # still be removed so startup recovery sees an incomplete add and retries deleting
+                # the revision-scoped secret instead of mistaking the provider for committed.
+                restore_error = restore_exc
+            finally:
+                self._forget()
             with contextlib.suppress(Exception):
                 self._repos.providers.delete(self.provider.id)
+            if self._operation is not None and restore_error is None:
+                self._operation.complete()
+            if restore_error is not None:
+                raise restore_error
 
     def _restore(self) -> None:
         """Put the old secret back verbatim, or remove one that never existed (item 17)."""
@@ -136,7 +174,7 @@ class ProviderTransaction:
         if not self._wrote or self.provider.credential.type is not CredentialType.KEYCHAIN:
             return
         if self._previous is None:
-            self._credentials.delete_secret(self.provider.credential)
+            self._credentials.delete_secret(self.provider.credential, strict=True)
         else:
             self._credentials.set_secret(self.provider.credential, self._previous)
 
@@ -283,6 +321,7 @@ class ProviderService:
             raise ProviderValidationError(f"provider {name!r} already exists", field="name")
         preset = get_preset(provider_type)
         resolved_protocol = protocol or (preset.protocol if preset else Protocol.OPENAI_CHAT)
+        credential_revision = uuid4().hex
         credential = resolve_credential(
             name=name,
             provider_type=provider_type,
@@ -290,6 +329,10 @@ class ProviderService:
             key_env=key_env,
             credential_source=credential_source,
         )
+        if credential.type is CredentialType.KEYCHAIN:
+            credential = credential.model_copy(
+                update={"account": f"provider/{name}/{credential_revision}"}
+            )
         provider = ProviderConnection(
             id=f"provider_{name}",
             name=name,
@@ -304,10 +347,26 @@ class ProviderService:
             # A fresh revision per connection: the id is derived from the name, so re-adding a
             # removed provider reuses the id — without this, a persisted probe taken against the
             # *previous* key would still match the new connection's cache key (spec §22).
-            credential_revision=uuid4().hex,
+            credential_revision=credential_revision,
         )
         stored_key = api_key if (store_key and credential.type is CredentialType.KEYCHAIN) else None
-        return ProviderTransaction(self.credentials, self.repos, provider, stored_key)
+        legacy_credential = (
+            CredentialRef(
+                type=CredentialType.KEYCHAIN,
+                service=credential.service,
+                account=f"provider/{name}",
+            )
+            if credential.type is CredentialType.KEYCHAIN
+            else None
+        )
+        return ProviderTransaction(
+            self.credentials,
+            self.repos,
+            provider,
+            stored_key,
+            self.app.journal,
+            legacy_credential,
+        )
 
     def list(self) -> Sequence[ProviderConnection]:
         return self.repos.providers.list()
@@ -334,22 +393,35 @@ class ProviderService:
         dependents = self.agents_using(name)
         if dependents:
             raise ProviderInUseError(name, dependents)
-        if provider.credential.type is CredentialType.KEYCHAIN:
-            self.credentials.delete_secret(provider.credential)
+        operation = self.app.journal.begin(
+            "provider_remove",
+            {
+                "provider_id": provider.id,
+                "credential": provider.credential.model_dump(mode="json"),
+            },
+        )
         # Purge this connection's probes before the row goes: the id is derived from the name, so a
         # re-add under the same name reuses it. The credential revision would reject the inherited
         # rows anyway; deleting them keeps the store from accumulating verdicts for a connection
         # that no longer exists (spec §22).
-        self.repos.model_probes.delete_for_provider(provider.id)
-        self.repos.providers.delete(provider.id)
+        self.repos.providers.delete_with_probes(provider.id)
+        operation.advance("db_deleted")
+        if provider.credential.type is CredentialType.KEYCHAIN:
+            self.credentials.delete_secret(provider.credential, strict=True)
+        operation.complete()
         return True
 
     def adapter_for(self, provider: ProviderConnection):
         api_key = self.credentials.resolve(provider.credential)
-        # Register the concrete key so it is scrubbed from every artifact/log even when its format
-        # has no recognizable prefix (spec §30).
-        register_secret(api_key)
         return build_adapter(provider, api_key)
+
+    @contextlib.contextmanager
+    def adapter_scope(self, provider: ProviderConnection, *, scope_id: str | None = None):
+        """Build an adapter while its exact credential remains run/call-scoped for redaction."""
+
+        api_key = self.credentials.resolve(provider.credential)
+        with secret_scope(api_key, scope_id=scope_id):
+            yield build_adapter(provider, api_key)
 
     async def test_config(
         self,
@@ -454,23 +526,23 @@ class ProviderService:
             resolve_base_url(provider)
         except ValueError as exc:
             return HealthResult(ok=False, detail=str(exc))
-        adapter = self.adapter_for(provider)
-        try:
-            return await adapter.test_connection()
-        finally:
-            await _maybe_close(adapter)
+        with self.adapter_scope(provider) as adapter:
+            try:
+                return await adapter.test_connection()
+            finally:
+                await _maybe_close(adapter)
 
     async def remote_models(self, name: str) -> Sequence[RemoteModel]:
         provider = self.get(name)
         if not provider:
             return []
-        adapter = self.adapter_for(provider)
-        try:
-            return await adapter.list_models()
-        except Exception:  # noqa: BLE001 - discovery is best-effort
-            return []
-        finally:
-            await _maybe_close(adapter)
+        with self.adapter_scope(provider) as adapter:
+            try:
+                return await adapter.list_models()
+            except Exception:  # noqa: BLE001 - discovery is best-effort
+                return []
+            finally:
+                await _maybe_close(adapter)
 
     # ------------------------------------------------------------------ capability probe (§15, §16)
 
@@ -496,11 +568,11 @@ class ProviderService:
             cached = self._cached_probe(provider, model_id)
             if cached is not None:
                 return cached
-        adapter = self.adapter_for(provider)
-        try:
-            result = await probe_agent_model(adapter, model_id)
-        finally:
-            await _maybe_close(adapter)
+        with self.adapter_scope(provider) as adapter:
+            try:
+                result = await probe_agent_model(adapter, model_id)
+            finally:
+                await _maybe_close(adapter)
         self._store_probe(provider, model_id, result)
         return result
 
