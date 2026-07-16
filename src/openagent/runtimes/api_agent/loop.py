@@ -136,6 +136,34 @@ async def run_api_agent(
             await _aclose(stream)
 
         text = "".join(text_parts)
+        # An empty turn is a failure, not a silent success (§12). The provider stream closed having
+        # produced no text AND no tool calls — a hiccup, a content filter, a truncated stream, or a
+        # response whose every chunk failed to parse. Reporting `completed` with an empty summary
+        # tells the user the task succeeded when the model said nothing at all. Emit no
+        # `message.completed` for it either: the event log must not corroborate a success that did
+        # not happen.
+        #
+        # NB: this must come AFTER the provider-error check below — an error stream also carries no
+        # text, and reporting it as "empty" would mask the real cause (e.g. authentication_failed).
+        if error_type is None and not tool_calls and not text.strip():
+            _emit(
+                EventType.MESSAGE_COMPLETED,
+                item_id=f"msg_{step}",
+                status=ItemStatus.FAILED.value,
+                text="",
+                tool_calls=[],
+                step=step,
+            )
+            return ApiRunOutcome(
+                completed=False,
+                usage=total,
+                steps=step,
+                error_type="empty_model_response",
+                error_message=(
+                    "the model returned no text and no tool calls; the response was empty"
+                ),
+            )
+
         _emit(
             EventType.MESSAGE_COMPLETED,
             item_id=f"msg_{step}",
