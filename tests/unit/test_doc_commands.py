@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from openagent.cli.app import app
@@ -102,14 +103,39 @@ def test_documented_command_is_accepted(source: str, path: tuple[str, ...]) -> N
     )
 
 
+def _declared_flags(path: tuple[str, ...]) -> set[str]:
+    """Every long option the command actually declares, from Click's own parameter list.
+
+    Deliberately NOT scraped from ``--help`` output: Rich renders help into an ANSI-styled, bordered
+    panel and wraps/truncates it to the terminal width, so a name like ``--allow-unverified-model``
+    simply is not present as a substring at 80 columns. Introspecting the command is exact and
+    independent of terminal width, colour, and Rich's formatting.
+    """
+
+    command = get_command(app)
+    for token in path:
+        subcommands = getattr(command, "commands", None)
+        if not subcommands or token not in subcommands:
+            return set()
+        command = subcommands[token]
+    # Click adds --help to every command implicitly, so it is not in ``params``.
+    flags: set[str] = {"--help"}
+    for param in getattr(command, "params", []):
+        for opt in (*param.opts, *getattr(param, "secondary_opts", ())):
+            if opt.startswith("--"):
+                flags.add(opt)
+    return flags
+
+
 @pytest.mark.parametrize(
     ("source", "path", "flag"),
     _FLAG_CASES,
     ids=[f"{' '.join(p)} {f}" for _, p, f in _FLAG_CASES],
 )
 def test_documented_flag_exists(source: str, path: tuple[str, ...], flag: str) -> None:
-    help_text = runner.invoke(app, [*path, "--help"]).output
-    # Typer may wrap long help; strip newlines so a wrapped flag name still matches.
-    assert flag in help_text.replace("\n", " "), (
-        f"{source} documents `openagent {' '.join(path)} {flag}`, but the CLI has no such flag"
+    declared = _declared_flags(path)
+    assert declared, f"could not introspect `openagent {' '.join(path)}`"
+    assert flag in declared, (
+        f"{source} documents `openagent {' '.join(path)} {flag}`, but the CLI declares only "
+        f"{sorted(declared)}"
     )
