@@ -59,6 +59,7 @@ from ...runtimes.cli.registry import (
 from ...services.agent_service import AgentError
 from ...services.provider_service import ProviderValidationError, resolve_credential
 from ..markup import safe_markup
+from ..secret_input import SecretInputMixin
 from ..select_utils import selected_string
 from ..wizard_state import AddAgentWizardState, BackendType
 
@@ -110,7 +111,7 @@ _PROTOCOLS = [
 _FINAL_STEPS = ("review",)
 
 
-class AddAgentScreen(Screen):
+class AddAgentScreen(SecretInputMixin, Screen):
     BINDINGS = [
         Binding("escape", "back_or_cancel", "Back"),
         Binding("ctrl+s", "create", "Create Agent"),
@@ -297,6 +298,12 @@ class AddAgentScreen(Screen):
                     value=False,
                     id="allow-unverified",
                 )
+                with Vertical(id="override-row"):
+                    yield Label("Required override reason")
+                    yield Input(
+                        placeholder="why is running this unverified model acceptable?",
+                        id="override-reason",
+                    )
                 yield Label("", id="err-model", classes="field-error")
 
             # ---- Agent Details step (common fields) -----------------------
@@ -325,7 +332,7 @@ class AddAgentScreen(Screen):
 
             yield Static("", id="error-summary")
 
-        with Horizontal(id="action-bar"):
+        with Horizontal(id="action-bar", classes="action-bar"):
             yield Button("Back", id="back")
             yield Button("Continue", variant="primary", id="continue")
             yield Button("Create Agent", variant="success", id="create")
@@ -482,6 +489,7 @@ class AddAgentScreen(Screen):
             if self._commit_step():
                 self._advance()
         except _EXPECTED_ERRORS as exc:
+            self._clear_secret_widget()
             self._summary([str(exc)])
 
     def _advance(self) -> None:
@@ -691,6 +699,11 @@ class AddAgentScreen(Screen):
         self.query_one("#open-model-page").display = bool(preset and preset.catalog_url)
         # The unverified override is only offered where the gate applies, and never pre-selected.
         self.query_one("#allow-unverified").display = bool(preset and preset.catalog_is_mixed)
+        self.query_one("#override-row").display = bool(
+            preset
+            and preset.catalog_is_mixed
+            and self.query_one("#allow-unverified", Checkbox).value
+        )
         warning = self.query_one("#catalog-warning", Static)
         if preset and preset.catalog_is_mixed:
             warning.display = True
@@ -910,7 +923,13 @@ class AddAgentScreen(Screen):
         if not preset or not preset.catalog_is_mixed or not model:
             return True
         if self.query_one("#allow-unverified", Checkbox).value:
+            reason = self._input("override-reason")
+            if not reason:
+                self._field_error("err-model", "an explicit override reason is required")
+                return False
+            self.state.model_override_reason = reason
             return True  # explicit advanced override — surfaced loudly on Review
+        self.state.model_override_reason = None
         probe = self._probe
         if probe is None or probe.model != model:
             hint = (
@@ -968,6 +987,8 @@ class AddAgentScreen(Screen):
                     "[b][yellow]⚠ WARNING — this model was NOT verified agent-compatible.[/yellow][/b]\n"
                     "[yellow]It may answer questions but fail to operate OpenAgent tools.[/yellow]"
                 )
+            if s.model_override_reason:
+                lines.append(f"[b]Override reason:[/b] {safe_markup(s.model_override_reason, 500)}")
         self.query_one("#review-card", Static).update("\n".join(lines))
 
     def action_create(self) -> None:
@@ -978,6 +999,8 @@ class AddAgentScreen(Screen):
             self._create()
         except _EXPECTED_ERRORS as exc:
             self._summary([str(exc)])
+        finally:
+            self._clear_secret_widget()
 
     def _create(self) -> None:
         oa = self.app.oa  # type: ignore[attr-defined]
@@ -989,6 +1012,7 @@ class AddAgentScreen(Screen):
             "system_prompt": s.system_prompt,
             "permission_profile": s.permission_profile,
             "max_steps": s.max_steps,
+            "model_override_reason": s.model_override_reason,
         }
         if s.backend_type == "cli":
             agent = oa.agents.create(
@@ -1094,6 +1118,13 @@ class AddAgentScreen(Screen):
         elif event.select.id == "model-owner":
             self._apply_catalog_filters()
 
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "allow-unverified":
+            self.query_one("#override-row").display = event.value
+            if not event.value:
+                self.query_one("#override-reason", Input).value = ""
+                self.state.model_override_reason = None
+
     def on_input_changed(self, event: Input.Changed) -> None:
         # Local, instant filtering — no network call per keystroke (§14.2).
         if event.input.id == "model-search":
@@ -1137,10 +1168,9 @@ class AddAgentScreen(Screen):
     def _clear_secret_widget(self) -> None:
         """Wipe the API-key field and the in-memory secret together."""
 
-        try:
-            self.query_one("#api_key", Input).value = ""
-        except Exception:  # pragma: no cover - widget always present
-            pass
+        self.clear_secret_material()
+
+    def _clear_secret_state(self) -> None:
         self.state.clear_secret()
 
     def _preset(self) -> ProviderPreset | None:

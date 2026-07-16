@@ -40,6 +40,7 @@ class AddAgentWizardState(BaseModel):
     api_key: SecretStr | None = None
     key_env: str | None = None
     model: str | None = None
+    model_override_reason: str | None = None
 
     # Common agent identity
     agent_name: str = ""
@@ -110,3 +111,4 @@ class AddAgentWizardState(BaseModel):
         self.api_key = None
         self.key_env = None
         self.model = None
+        self.model_override_reason = None

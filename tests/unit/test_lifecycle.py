@@ -29,6 +29,10 @@ def test_terminal_resume_and_cancel_contract() -> None:
 def test_cancelled_and_orphaned_cannot_be_revived() -> None:
     assert not can_transition(RunStatus.CANCELLED, RunStatus.RUNNING)
     assert not can_transition(RunStatus.ORPHANED, RunStatus.RUNNING)
+
+
+def test_persisted_queued_run_can_be_orphaned_after_restart() -> None:
+    assert can_transition(RunStatus.QUEUED, RunStatus.ORPHANED)
     with pytest.raises(InvalidTransition):
         validate_transition(RunStatus.CANCELLED, RunStatus.RUNNING)
 

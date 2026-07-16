@@ -16,13 +16,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
+from collections import deque
 from collections.abc import Callable
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.events import DescendantFocus, Resize
 from textual.screen import Screen
-from textual.widgets import Footer, Header, ListItem, ListView, Static
+from textual.widget import Widget
+from textual.widgets import Button, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
 from ..app import OpenAgentApp
 from ..core.events import NormalizedEvent
@@ -45,8 +49,11 @@ _MENU = [
     ("doctor", "Doctor", "System diagnostics"),
 ]
 
-#: Bound on the events one live run keeps in memory (the full log is always on disk).
+#: In-memory tails are caches only; SQLite is the authoritative replay source.
 MAX_LIVE_EVENTS = 5_000
+MAX_GLOBAL_LIVE_EVENTS = 20_000
+MAX_LIVE_RUNS = 100
+TERMINAL_RETENTION_SECONDS = 5 * 60
 
 EventHook = Callable[[NormalizedEvent], None]
 
@@ -54,35 +61,54 @@ EventHook = Callable[[NormalizedEvent], None]
 class LiveRun:
     """A run this app is executing: its projected state, its event tail, and its subscribers."""
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, on_change: Callable[[], None] | None = None) -> None:
         self.run_id = run_id
         self.projection = RunProjection(run_id)
-        self.events: list[NormalizedEvent] = []
+        self.events: deque[NormalizedEvent] = deque(maxlen=MAX_LIVE_EVENTS)
         self.finished = False
+        self.finished_at: float | None = None
+        self.last_access = time.monotonic()
         self.error: str | None = None
         self._subscribers: list[EventHook] = []
+        self._on_change = on_change
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
+
+    def touch(self) -> None:
+        self.last_access = time.monotonic()
 
     def subscribe(self, hook: EventHook) -> None:
         if hook not in self._subscribers:
             self._subscribers.append(hook)
+        self.touch()
 
     def unsubscribe(self, hook: EventHook) -> None:
         with contextlib.suppress(ValueError):
             self._subscribers.remove(hook)
+        self.touch()
+        if self._on_change is not None:
+            self._on_change()
 
     def publish(self, event: NormalizedEvent) -> None:
         """Fold an event into the projection and notify whoever is watching. Runs on the UI thread."""
 
         self.projection.apply(event)
         self.events.append(event)
-        if len(self.events) > MAX_LIVE_EVENTS:
-            del self.events[: len(self.events) - MAX_LIVE_EVENTS]
+        self.touch()
         for hook in list(self._subscribers):
             hook(event)
+        if self._on_change is not None:
+            self._on_change()
 
     def finish(self, error: str | None = None) -> None:
         self.finished = True
+        self.finished_at = time.monotonic()
         self.error = error
+        self.touch()
+        if self._on_change is not None:
+            self._on_change()
 
 
 class DashboardScreen(Screen):
@@ -103,6 +129,9 @@ class DashboardScreen(Screen):
                     ],
                     id="menu",
                 )
+        with Horizontal(classes="action-bar"):
+            yield Button("Refresh", id="dash-refresh")
+            yield Button("Quit", id="dash-quit")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -110,6 +139,12 @@ class DashboardScreen(Screen):
 
     def action_refresh(self) -> None:
         self.refresh_stats()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "dash-refresh":
+            self.action_refresh()
+        elif event.button.id == "dash-quit":
+            self.app.exit()
 
     def refresh_stats(self) -> None:
         oa: OpenAgentApp = self.app.oa  # type: ignore[attr-defined]
@@ -151,6 +186,28 @@ class OpenAgentTUI(App):
     #menu { height: auto; }
     DataTable { height: 1fr; }
     .screen-title { padding: 0 1; text-style: bold; color: $accent; }
+    .action-bar { height: 3; min-height: 3; padding: 0 1; background: $panel; }
+    .action-bar Button { margin: 0 1 0 0; }
+
+    OpenAgentTUI.narrow #dash-body,
+    OpenAgentTUI.narrow AgentsScreen #agents-body,
+    OpenAgentTUI.narrow RunSetupScreen #body,
+    OpenAgentTUI.narrow RunConsoleScreen #overview-body { layout: vertical; }
+    OpenAgentTUI.narrow #stats,
+    OpenAgentTUI.narrow AgentsScreen #table,
+    OpenAgentTUI.narrow AgentsScreen #details,
+    OpenAgentTUI.narrow RunSetupScreen .col,
+    OpenAgentTUI.narrow RunConsoleScreen #timeline,
+    OpenAgentTUI.narrow RunConsoleScreen #details { width: 1fr; }
+    OpenAgentTUI.narrow #stats { height: auto; max-height: 12; }
+    OpenAgentTUI.narrow AgentsScreen #details { height: 1fr; }
+    OpenAgentTUI.narrow .action-bar Button,
+    OpenAgentTUI.narrow #action-bar.action-bar Button,
+    OpenAgentTUI.narrow #actions.action-bar Button {
+        width: 1fr; min-width: 0; margin: 0;
+    }
+    OpenAgentTUI.tiny .screen-title { height: auto; min-height: 1; }
+    OpenAgentTUI.tiny .action-bar { height: auto; min-height: 3; }
     """
     BINDINGS = [Binding("q", "quit", "Quit"), Binding("escape", "home", "Home")]
 
@@ -163,8 +220,51 @@ class OpenAgentTUI(App):
         self._open_modals: dict[str, object] = {}
 
     def on_mount(self) -> None:
+        self._apply_breakpoints(self.size.width)
         self.oa.runs.recover_orphans()
         self.push_screen(DashboardScreen())
+        self.set_interval(30, self._prune_live_runs)
+
+    def on_resize(self, event: Resize) -> None:
+        self._apply_breakpoints(event.size.width)
+
+    def _apply_breakpoints(self, width: int) -> None:
+        self.set_class(width < 80, "narrow")
+        self.set_class(width < 60, "tiny")
+
+    def on_descendant_focus(self, event: DescendantFocus) -> None:
+        """Keep keyboard focus visible in every scrollable form and modal."""
+
+        event.widget.scroll_visible(animate=False)
+
+    def on_key(self, event) -> None:
+        """Standard page/home/end navigation for non-editor widgets across all screens."""
+
+        if event.key not in {"pageup", "pagedown", "home", "end"}:
+            return
+        if isinstance(self.focused, (Input, TextArea)):
+            return
+        focused = self.focused
+        if focused is None:
+            return
+        target = next(
+            (
+                widget
+                for widget in focused.ancestors_with_self
+                if isinstance(widget, Widget) and widget.max_scroll_y > 0
+            ),
+            None,
+        )
+        if target is None:
+            return
+        action = {
+            "pageup": target.scroll_page_up,
+            "pagedown": target.scroll_page_down,
+            "home": target.scroll_home,
+            "end": target.scroll_end,
+        }[event.key]
+        action(animate=False)
+        event.stop()
 
     def action_home(self) -> None:
         if len(self.screen_stack) > 2:
@@ -187,12 +287,15 @@ class OpenAgentTUI(App):
     # ------------------------------------------------------------------ running (app-owned)
 
     def live_run(self, run_id: str) -> LiveRun | None:
-        return self.live_runs.get(run_id)
+        live = self.live_runs.get(run_id)
+        if live is not None:
+            live.touch()
+        return live
 
     def start_run(self, run: Run) -> LiveRun:
         """Execute ``run`` as an **app-level** worker so no screen owns (or can kill) it."""
 
-        live = LiveRun(run.id)
+        live = LiveRun(run.id, self._prune_live_runs)
         self.live_runs[run.id] = live
         self.run_worker(
             lambda: self._execute_run(run, live),
@@ -206,7 +309,7 @@ class OpenAgentTUI(App):
     def resume_run(self, run_id: str, prompt: str) -> LiveRun:
         """Send a follow-up turn into the same session (item 20)."""
 
-        live = LiveRun(run_id)
+        live = LiveRun(run_id, self._prune_live_runs)
         # Keep the earlier turns visible: replay first, then append this turn's events.
         live.projection = self.oa.runs.projection(run_id)
         self.live_runs[run_id] = live
@@ -218,6 +321,41 @@ class OpenAgentTUI(App):
             group="runs",
         )
         return live
+
+    def _prune_live_runs(self) -> None:
+        """Enforce five-minute terminal retention plus global run/event LRU budgets."""
+
+        now = time.monotonic()
+        expired = [
+            run_id
+            for run_id, live in self.live_runs.items()
+            if live.finished
+            and live.subscriber_count == 0
+            and live.finished_at is not None
+            and now - live.finished_at >= TERMINAL_RETENTION_SECONDS
+        ]
+        for run_id in expired:
+            self.live_runs.pop(run_id, None)
+
+        while len(self.live_runs) > MAX_LIVE_RUNS:
+            candidates = [live for live in self.live_runs.values() if live.subscriber_count == 0]
+            if not candidates:
+                break
+            victim = min(candidates, key=lambda live: (not live.finished, live.last_access))
+            self.live_runs.pop(victim.run_id, None)
+
+        total_events = sum(len(live.events) for live in self.live_runs.values())
+        while total_events > MAX_GLOBAL_LIVE_EVENTS:
+            candidates = [
+                live
+                for live in self.live_runs.values()
+                if live.events and live.subscriber_count == 0
+            ]
+            if not candidates:
+                break
+            victim = min(candidates, key=lambda live: (not live.finished, live.last_access))
+            victim.events.popleft()
+            total_events -= 1
 
     def _execute_run(self, run: Run, live: LiveRun) -> None:
         """Thread worker: drive the run and marshal every event back onto the UI thread."""

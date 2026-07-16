@@ -14,6 +14,7 @@ from textual.widgets import Button, Footer, Header, Input, Label, Select, Static
 
 from ...core.permissions import profile_names
 from ...services.agent_service import AgentError
+from ..markup import safe_markup
 from ..select_utils import selected_string
 
 
@@ -40,7 +41,7 @@ class EditAgentScreen(Screen):
         agent = self.app.oa.agents.get(self.agent_name)  # type: ignore[attr-defined]
         profiles = [(p, p) for p in profile_names()]
         yield Header()
-        yield Static(f"Edit Agent · {self.agent_name}", classes="screen-title")
+        yield Static(f"Edit Agent · {safe_markup(self.agent_name, 80)}", classes="screen-title")
         with VerticalScroll(id="form"):
             yield Label("Title")
             yield Input(value=agent.title if agent else "", id="title")
@@ -61,7 +62,7 @@ class EditAgentScreen(Screen):
                 ta.text = agent.system_prompt
             yield ta
             yield Static("", id="edit-error")
-        with Horizontal(id="action-bar"):
+        with Horizontal(id="action-bar", classes="action-bar"):
             yield Button("Save (Ctrl+S)", variant="success", id="save")
             yield Button("Cancel (Esc)", id="cancel")
         yield Footer()
@@ -86,7 +87,7 @@ class EditAgentScreen(Screen):
                 or "safe-edit",
             )
         except AgentError as exc:
-            self.query_one("#edit-error", Static).update(f"[red]{exc}[/red]")
+            self.query_one("#edit-error", Static).update(f"[red]{safe_markup(str(exc), 300)}[/red]")
             return
         self.notify(f"agent '{self.agent_name}' updated — OPENAGENT.md refreshed")
         self.dismiss(True)

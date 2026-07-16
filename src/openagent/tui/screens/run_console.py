@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.events import MouseScrollDown, MouseScrollUp
 from textual.screen import Screen
 from textual.widgets import (
     Button,
@@ -154,7 +155,7 @@ class RunSetupScreen(Screen):
             with VerticalScroll(classes="col"):
                 yield Static("[dim]Select an agent to see its runtime.[/dim]", id="agent-info")
                 yield Static("[dim]Readiness has not been checked yet.[/dim]", id="preflight")
-        with Horizontal(id="actions"):
+        with Horizontal(id="actions", classes="action-bar"):
             yield Button("Check Readiness", id="check")
             yield Button("Run Agent", variant="primary", id="run")
             yield Button("Cancel", id="cancel")
@@ -329,7 +330,7 @@ class RunConsoleScreen(Screen):
         Binding("f", "follow_up", "Follow-up"),
     ]
     DEFAULT_CSS = """
-    RunConsoleScreen #status { height: 3; padding: 0 1; border: round $primary; }
+    RunConsoleScreen #status { height: auto; max-height: 6; padding: 0 1; border: round $primary; }
     RunConsoleScreen #console-tabs { height: 1fr; }
     RunConsoleScreen #actions { height: 3; padding: 0 1; background: $panel; }
     RunConsoleScreen #actions Button { margin: 0 1 0 0; }
@@ -360,6 +361,7 @@ class RunConsoleScreen(Screen):
         self.projection = RunProjection(run_id)
         self._dirty = True
         self._live = None
+        self.follow_output = True
 
     # ------------------------------------------------------------------ compose
 
@@ -382,7 +384,7 @@ class RunConsoleScreen(Screen):
                             yield Static("", id=f"pane-{tab_id}")
         with Horizontal(id="followup-row"):
             yield Input(placeholder="follow-up prompt…", id="followup")
-        with Horizontal(id="actions"):
+        with Horizontal(id="actions", classes="action-bar"):
             yield Button("Cancel Run", variant="error", id="cancel")
             yield Button("Follow-up", id="follow")
             yield Button("Back", id="back")
@@ -442,6 +444,43 @@ class RunConsoleScreen(Screen):
         self.query_one("#pane-usage", Static).update(self._usage(p))
         self._render_artifacts()
         self._render_actions()
+        if self.follow_output:
+            self.call_after_refresh(self._scroll_output_to_end)
+
+    def _scroll_output_to_end(self) -> None:
+        for container in self.query(VerticalScroll):
+            if container.region.height > 0:
+                container.scroll_end(animate=False)
+
+    def _active_scroll_container(self) -> VerticalScroll | None:
+        focused = self.focused
+        if focused is not None:
+            for widget in focused.ancestors_with_self:
+                if isinstance(widget, VerticalScroll) and widget.region.height > 0:
+                    return widget
+        return next(
+            (widget for widget in self.query(VerticalScroll) if widget.region.height > 0), None
+        )
+
+    def _sync_follow_output(self) -> None:
+        target = self._active_scroll_container()
+        self.follow_output = bool(
+            target is None or target.max_scroll_y == 0 or target.scroll_y >= target.max_scroll_y
+        )
+
+    def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
+        self.follow_output = False
+
+    def on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
+        self.call_after_refresh(self._sync_follow_output)
+
+    def on_key(self, event) -> None:
+        if event.key in {"pageup", "home"}:
+            self.follow_output = False
+        elif event.key == "end":
+            self.follow_output = True
+        elif event.key == "pagedown":
+            self.call_after_refresh(self._sync_follow_output)
 
     def _render_status(self) -> None:
         oa = self.app.oa  # type: ignore[attr-defined]

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 from textual.widgets.button import ButtonVariant
@@ -29,7 +29,8 @@ class ConfirmModal(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     DEFAULT_CSS = """
     ConfirmModal { align: center middle; }
-    ConfirmModal #box { width: 60; height: auto; border: round $warning; background: $panel; padding: 1 2; }
+    ConfirmModal #box { width: 90%; max-width: 60; height: 90%; border: round $warning; background: $panel; padding: 1 2; }
+    ConfirmModal #modal-content { height: 1fr; min-height: 0; }
     ConfirmModal #buttons { height: 3; align-horizontal: right; }
     ConfirmModal Button { margin: 0 0 0 2; }
     """
@@ -48,7 +49,8 @@ class ConfirmModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
-            yield Static(self.question, id="question")
+            with VerticalScroll(id="modal-content"):
+                yield Static(self.question, id="question")
             with Horizontal(id="buttons"):
                 yield Button("Cancel", id="cancel")
                 yield Button(self.confirm_label, variant=self.confirm_variant, id="ok")
@@ -74,7 +76,8 @@ class ApprovalModal(ModalScreen[bool]):
     ]
     DEFAULT_CSS = """
     ApprovalModal { align: center middle; }
-    ApprovalModal #box { width: 78; height: auto; border: thick $warning; background: $panel; padding: 1 2; }
+    ApprovalModal #box { width: 94%; max-width: 78; height: 90%; border: thick $warning; background: $panel; padding: 1 2; }
+    ApprovalModal #modal-content { height: 1fr; min-height: 0; }
     ApprovalModal .k { color: $text-muted; }
     ApprovalModal #cmd { color: $warning; text-style: bold; padding: 1 0; }
     ApprovalModal #buttons { height: 3; align-horizontal: right; }
@@ -88,16 +91,19 @@ class ApprovalModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         r = self.request
         with Vertical(id="box"):
-            yield Label("⚠ Approval required", id="title")
-            yield Static(f"[b]Action:[/b] {safe_markup(r.action, 200)}")
-            yield Static(f"[b]Reason:[/b] {safe_markup(r.reason, 300) or '—'}")
-            yield Static(f"[b]Workspace:[/b] {safe_markup(r.workspace, 200) or '—'}", classes="k")
-            # The command is the thing being judged — it must be shown verbatim and inert.
-            yield Static(safe_markup(r.command or r.detail, 1000), id="cmd")
+            with VerticalScroll(id="modal-content"):
+                yield Label("⚠ Approval required", id="title")
+                yield Static(f"[b]Action:[/b] {safe_markup(r.action, 200)}")
+                yield Static(f"[b]Reason:[/b] {safe_markup(r.reason, 300) or '—'}")
+                yield Static(
+                    f"[b]Workspace:[/b] {safe_markup(r.workspace, 200) or '—'}", classes="k"
+                )
+                # The command is the thing being judged — it must be shown verbatim and inert.
+                yield Static(safe_markup(r.command or r.detail, 1000), id="cmd")
+                yield Static("[dim]Ctrl+C cancels the whole run[/dim]", classes="k")
             with Horizontal(id="buttons"):
                 yield Button("Deny (n)", id="deny")
                 yield Button("Approve once (y)", variant="warning", id="approve")
-            yield Static("[dim]Ctrl+C cancels the whole run[/dim]", classes="k")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "approve")
@@ -127,7 +133,8 @@ class QuestionModal(ModalScreen[str | None]):
     ]
     DEFAULT_CSS = """
     QuestionModal { align: center middle; }
-    QuestionModal #box { width: 78; height: auto; border: thick $accent; background: $panel; padding: 1 2; }
+    QuestionModal #box { width: 94%; max-width: 78; height: 90%; border: thick $accent; background: $panel; padding: 1 2; }
+    QuestionModal #modal-content { height: 1fr; min-height: 0; }
     QuestionModal #q { text-style: bold; padding: 0 0 1 0; }
     QuestionModal #buttons { height: 3; align-horizontal: right; }
     QuestionModal Button { margin: 0 0 0 2; }
@@ -141,14 +148,15 @@ class QuestionModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
-            yield Label("The agent is asking:", id="title")
-            # The question comes from the model: escape it (item 14).
-            yield Static(safe_markup(self.question, 1000), id="q")
-            yield Input(placeholder="type your answer", id="answer")
+            with VerticalScroll(id="modal-content"):
+                yield Label("The agent is asking:", id="title")
+                # The question comes from the model: escape it (item 14).
+                yield Static(safe_markup(self.question, 1000), id="q")
+                yield Input(placeholder="type your answer", id="answer")
+                yield Static("[dim]Ctrl+C cancels the whole run[/dim]", classes="k")
             with Horizontal(id="buttons"):
                 yield Button("Skip (Esc)", id="cancel")
                 yield Button("Answer", variant="primary", id="ok")
-            yield Static("[dim]Ctrl+C cancels the whole run[/dim]", classes="k")
 
     def on_mount(self) -> None:
         self.query_one("#answer", Input).focus()
@@ -188,7 +196,8 @@ class InPlaceConfirmModal(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     DEFAULT_CSS = """
     InPlaceConfirmModal { align: center middle; }
-    InPlaceConfirmModal #box { width: 72; height: auto; border: thick $error; background: $panel; padding: 1 2; }
+    InPlaceConfirmModal #box { width: 94%; max-width: 72; height: 90%; border: thick $error; background: $panel; padding: 1 2; }
+    InPlaceConfirmModal #modal-content { height: 1fr; min-height: 0; }
     InPlaceConfirmModal #title { color: $error; text-style: bold; }
     InPlaceConfirmModal #buttons { height: 3; align-horizontal: right; }
     InPlaceConfirmModal Button { margin: 0 0 0 2; }
@@ -203,18 +212,21 @@ class InPlaceConfirmModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
-            yield Label("⚠ Run in place, with no isolation?", id="title")
-            yield Static(
-                "This agent will edit the current project directly.\n\n"
-                "No isolated worktree or directory copy will be used. Changes are applied to your "
-                "files as the agent makes them, and there is no separate diff to review first.",
-            )
-            yield Static(f"[b]Agent:[/b] {safe_markup(self.agent, 80)}", classes="k")
-            yield Static(
-                f"[b]Profile:[/b] {safe_markup(self.profile, 40)} (can edit files)", classes="k"
-            )
-            yield Static(f"[b]Directory:[/b] {safe_markup(self.workspace, 200)}", classes="k")
-            yield Static("\nContinue in place?")
+            with VerticalScroll(id="modal-content"):
+                yield Label("⚠ Run in place, with no isolation?", id="title")
+                yield Static(
+                    "This agent will edit the current project directly.\n\n"
+                    "No isolated worktree or directory copy will be used. Changes are applied to "
+                    "your files as the agent makes them, and there is no separate diff to review "
+                    "first.",
+                )
+                yield Static(f"[b]Agent:[/b] {safe_markup(self.agent, 80)}", classes="k")
+                yield Static(
+                    f"[b]Profile:[/b] {safe_markup(self.profile, 40)} (can edit files)",
+                    classes="k",
+                )
+                yield Static(f"[b]Directory:[/b] {safe_markup(self.workspace, 200)}", classes="k")
+                yield Static("\nContinue in place?")
             with Horizontal(id="buttons"):
                 yield Button("Cancel", id="cancel")
                 yield Button("Run In Place", variant="error", id="confirm")

@@ -8,7 +8,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
 from ...core.models import AgentProfile, enum_value
 from ...services.provider_service import ProviderInUseError
@@ -40,6 +40,9 @@ class _TableScreen(Screen):
         yield Header()
         yield Static(self.title_text, classes="screen-title")
         yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+        with Horizontal(classes="action-bar"):
+            yield Button("Refresh", id="table-refresh")
+            yield Button("Back", id="table-back")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -47,6 +50,12 @@ class _TableScreen(Screen):
 
     def action_refresh(self) -> None:
         self.reload()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "table-refresh":
+            self.action_refresh()
+        elif event.button.id == "table-back":
+            self.app.pop_screen()
 
     def reload(self) -> None:
         table = self.query_one("#table", DataTable)
@@ -95,6 +104,12 @@ class AgentsScreen(Screen):
         with Horizontal(id="agents-body"):
             yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="details")
+        with Horizontal(classes="action-bar"):
+            yield Button("Details", id="agent-details")
+            yield Button("Run", id="agent-run")
+            yield Button("Edit", id="agent-edit")
+            yield Button("Add", id="agent-add")
+            yield Button("Back", id="agent-back")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -145,6 +160,18 @@ class AgentsScreen(Screen):
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._update_details()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "agent-details": self.action_details,
+            "agent-run": self.action_run,
+            "agent-edit": self.action_edit,
+            "agent-add": self.action_add,
+            "agent-back": self.app.pop_screen,
+        }
+        action = actions.get(event.button.id or "")
+        if action is not None:
+            action()
 
     def _update_details(self) -> None:
         name = self._selected_name()

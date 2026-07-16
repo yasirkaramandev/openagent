@@ -19,6 +19,8 @@ from textual.widgets import Button, Footer, Header, Input, Label, Select, Static
 from ...core.models import Protocol
 from ...providers.factory import PRESETS, preset_names
 from ...services.provider_service import ProviderValidationError
+from ..markup import safe_markup
+from ..secret_input import SecretInputMixin
 from ..select_utils import selected_string
 
 _CRED_SOURCES = [
@@ -34,9 +36,9 @@ _PROTOCOLS = [
 ]
 
 
-class AddProviderScreen(Screen):
+class AddProviderScreen(SecretInputMixin, Screen):
     BINDINGS = [
-        Binding("escape", "app.pop_screen", "Cancel"),
+        Binding("escape", "cancel", "Cancel"),
         Binding("ctrl+s", "save", "Save"),
         Binding("f10", "save", "Save"),
     ]
@@ -75,7 +77,7 @@ class AddProviderScreen(Screen):
                 yield Label("API key (hidden; stored in the OS keychain)")
                 yield Input(placeholder="paste key", password=True, id="api_key")
             yield Static("", id="prov-status")
-        with Horizontal(id="action-bar"):
+        with Horizontal(id="action-bar", classes="action-bar"):
             yield Button("Test Connection", id="test")
             yield Button("Save Provider (Ctrl+S)", variant="success", id="save")
             yield Button("Cancel (Esc)", id="cancel")
@@ -87,7 +89,11 @@ class AddProviderScreen(Screen):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "cred":
+            self.clear_secret_material()
             self._sync_cred_fields()
+
+    def on_unmount(self) -> None:
+        self.clear_secret_material()
 
     def _sync_cred_fields(self) -> None:
         cred = selected_string(self.query_one("#cred", Select))
@@ -127,10 +133,15 @@ class AddProviderScreen(Screen):
         elif event.button.id == "save":
             self.action_save()
         elif event.button.id == "cancel":
-            self.app.pop_screen()
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.clear_secret_material()
+        self.app.pop_screen()
 
     def action_test(self) -> None:
         p = self._params()
+        self.clear_secret_material()
         self._status("[dim]testing…[/dim]")
         self.run_worker(self._do_test(p), exclusive=True)
 
@@ -146,12 +157,13 @@ class AddProviderScreen(Screen):
             key_env=p["key_env"],
         )
         if result.ok:
-            self._status(f"[green]✓ connection ok[/green] — {result.detail}")
+            self._status(f"[green]✓ connection ok[/green] — {safe_markup(result.detail, 300)}")
         else:
-            self._status(f"[red]✗ {result.detail}[/red]")
+            self._status(f"[red]✗ {safe_markup(result.detail, 300)}[/red]")
 
     def action_save(self) -> None:
         p = self._params()
+        self.clear_secret_material()
         oa = self.app.oa  # type: ignore[attr-defined]
         if not p["name"]:
             self._status("[red]connection name is required[/red]")
@@ -172,7 +184,7 @@ class AddProviderScreen(Screen):
                 credential_source=p["cred"],
             )
         except ProviderValidationError as exc:
-            self._status(f"[red]✗ {exc}[/red]")
+            self._status(f"[red]✗ {safe_markup(str(exc), 300)}[/red]")
             return
         self.notify(f"provider '{p['name']}' saved")
         self.dismiss(True)

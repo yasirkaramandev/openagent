@@ -157,3 +157,56 @@ async def test_saved_key_never_displayed(tmp_path: Path):
         # The key input is a password field, so its rendered content is masked.
         screen.query_one("#api_key", Input).value = "sk-supersecret-123456"
         assert screen.query_one("#api_key", Input).password is True
+
+
+async def test_provider_secret_is_wiped_on_source_change_cancel_and_failure(tmp_path: Path):
+    oa = _app(tmp_path)
+    oa.providers.add(name="duplicate", provider_type="ollama", credential_source="none")
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        pilot.app.push_screen(AddProviderScreen())
+        await pilot.pause()
+        screen = pilot.app.screen
+        key = screen.query_one("#api_key", Input)
+
+        key.value = "prefixless-secret-source-change"
+        screen.query_one("#cred", Select).value = "env"
+        await pilot.pause()
+        assert key.value == ""
+
+        screen.query_one("#cred", Select).value = "keychain"
+        await pilot.pause()
+        key.value = "prefixless-secret-failed-save"
+        screen.query_one("#name", Input).value = "duplicate"
+        screen.action_save()
+        assert key.value == ""
+
+        key.value = "prefixless-secret-cancel"
+        screen.action_cancel()
+        await pilot.pause()
+        assert key.value == ""
+
+
+async def test_provider_test_uses_ephemeral_copy_then_wipes_widget(tmp_path: Path, monkeypatch):
+    from openagent.providers.base import HealthResult
+
+    oa = _app(tmp_path)
+    seen: dict[str, str | None] = {}
+
+    async def fake_test_config(**kwargs) -> HealthResult:
+        seen["key"] = kwargs.get("api_key")
+        return HealthResult(ok=False, detail="expected failure")
+
+    monkeypatch.setattr(oa.providers, "test_config", fake_test_config)
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        pilot.app.push_screen(AddProviderScreen())
+        await pilot.pause()
+        screen = pilot.app.screen
+        screen.query_one("#api_key", Input).value = "prefixless-ephemeral-test-key"
+        screen.action_test()
+        assert screen.query_one("#api_key", Input).value == ""
+        await pilot.pause()
+        await pilot.pause()
+
+    assert seen["key"] == "prefixless-ephemeral-test-key"

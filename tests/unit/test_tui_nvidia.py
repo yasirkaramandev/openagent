@@ -328,6 +328,7 @@ async def test_partial_model_is_blocked_but_can_be_overridden_explicitly(
         await pilot.pause()
         await pilot.pause()
         assert override.value is True
+        screen.query_one("#override-reason", Input).value = "manual compatibility review"
         await _continue(pilot)
         assert screen.step == "details"
 
@@ -340,6 +341,7 @@ async def test_review_warns_loudly_for_an_unverified_model(tmp_path: Path, monke
         await pilot.click("#allow-unverified")
         await pilot.pause()
         await pilot.pause()
+        screen.query_one("#override-reason", Input).value = "manual compatibility review"
         await _continue(pilot)
         assert screen.step == "details"
         screen.query_one("#name", Input).value = "nvidia-coder"

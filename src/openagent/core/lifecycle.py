@@ -21,7 +21,12 @@ TERMINAL = frozenset(
 )
 
 _TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
-    RunStatus.QUEUED: frozenset({RunStatus.STARTING, RunStatus.FAILED, RunStatus.CANCELLED}),
+    # A queued row is persisted before its worker starts. If the process dies in that window, a
+    # restarted instance has no queue/worker ownership to recover and must terminalize it as an
+    # orphan instead of leaving an unexecutable run queued forever.
+    RunStatus.QUEUED: frozenset(
+        {RunStatus.STARTING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.ORPHANED}
+    ),
     RunStatus.STARTING: frozenset(
         {
             RunStatus.RUNNING,
