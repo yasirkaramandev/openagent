@@ -285,9 +285,10 @@ def test_agent_add_succeeds_after_a_verified_probe(monkeypatch, catalog):
 
     async def _probe(self, provider_name, model_id, *, refresh=False):  # noqa: ANN001
         result = _verified(model_id)
-        # Mirror the real service: a probe populates the cache the create gate reads.
+        # Mirror the real service: a probe persists the verdict the create gate reads, including
+        # from the fresh OpenAgentApp built by the next CLI invocation.
         provider = self.get(provider_name)
-        self._probe_cache[self._probe_key(provider, model_id)] = result
+        self._store_probe(provider, model_id, result)
         return result
 
     monkeypatch.setattr(ProviderService, "probe_model", _probe)
@@ -295,8 +296,8 @@ def test_agent_add_succeeds_after_a_verified_probe(monkeypatch, catalog):
         app, ["provider", "probe", "nvidia-build", "--model", "nvidia/nemotron-test"]
     )
     assert probed.exit_code == 0, probed.stdout
-    # NB: a fresh CLI invocation builds a new app, so the in-memory cache does not carry over —
-    # the documented non-interactive flow is the explicit override. This asserts the gate itself.
+    # A fresh CLI invocation builds a new app. The verified result must therefore come from SQLite,
+    # not an in-memory cache or an explicit override.
     result = runner.invoke(
         app,
         [
@@ -307,7 +308,6 @@ def test_agent_add_succeeds_after_a_verified_probe(monkeypatch, catalog):
             "nvidia-build",
             "--model",
             "nvidia/nemotron-test",
-            "--allow-unverified-model",
         ],
     )
     assert result.exit_code == 0, result.stdout

@@ -155,6 +155,12 @@ class ProviderConnection(BaseModel):
     enabled: bool = True
     extra_headers: dict[str, str] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
+    #: Opaque token identifying *which* credential this connection carries, rotated whenever the
+    #: credential is written (spec §22). A persisted capability probe is keyed to it, so a rotated
+    #: key cannot inherit the previous key's "verified" verdict. It is deliberately **not** derived
+    #: from the secret: §22 forbids persisting the key or any hash of it. Defaults to empty for rows
+    #: written before revisions existed; migration m005 backfills a stable token.
+    credential_revision: str = ""
 
 
 class ModelProfile(BaseModel):

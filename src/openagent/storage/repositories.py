@@ -357,6 +357,72 @@ class EventIndexRepository:
         return int(row[0]) if row else 0
 
 
+class ModelProbeRepository:
+    """Persisted capability probes (spec §22).
+
+    A probe costs a real provider call, and it is the gate on ``agent add`` for a mixed catalog. The
+    CLI runs every command in a *new process*, so a probe held only in memory is gone before the
+    command that needs it starts — the user is told to probe, probes, and is told to probe again.
+
+    Nothing here is derived from the secret: §22 forbids persisting the key, a hash of it, the
+    Authorization header, or the raw provider response. The row records *what was tested against*
+    (connection, model, endpoint, protocol, credential revision, probe version) and the verdict.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def get(self, cache_key: str) -> dict | None:
+        with self.db.engine.connect() as conn:
+            row = conn.execute(
+                select(t.model_probes.c.data).where(t.model_probes.c.cache_key == cache_key)
+            ).first()
+        return dict(row[0]) if row else None
+
+    def put(
+        self,
+        *,
+        cache_key: str,
+        provider_id: str,
+        model_id: str,
+        base_url_fingerprint: str,
+        protocol: str,
+        credential_revision: str,
+        probe_version: str,
+        tested_at: str,
+        data: dict,
+    ) -> None:
+        with self.db.engine.begin() as conn:
+            conn.execute(sa_delete(t.model_probes).where(t.model_probes.c.cache_key == cache_key))
+            conn.execute(
+                insert(t.model_probes).values(
+                    cache_key=cache_key,
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    base_url_fingerprint=base_url_fingerprint,
+                    protocol=protocol,
+                    credential_revision=credential_revision,
+                    probe_version=probe_version,
+                    tested_at=tested_at,
+                    data=data,
+                )
+            )
+
+    def delete_for_provider(self, provider_id: str) -> int:
+        """Drop every probe belonging to a connection — called when the connection is removed.
+
+        A provider's id is derived from its name, so a re-add under the same name reuses the id.
+        Purging here means a new connection starts with no inherited verdicts even before the
+        credential-revision check gets a chance to reject them (spec §22).
+        """
+
+        with self.db.engine.begin() as conn:
+            result = conn.execute(
+                sa_delete(t.model_probes).where(t.model_probes.c.provider_id == provider_id)
+            )
+        return int(result.rowcount or 0)
+
+
 class Repositories:
     """Convenience bundle of all repositories over one database."""
 
@@ -369,3 +435,4 @@ class Repositories:
         self.runs = RunRepository(database)
         self.sessions = SessionRepository(database)
         self.event_index = EventIndexRepository(database)
+        self.model_probes = ModelProbeRepository(database)

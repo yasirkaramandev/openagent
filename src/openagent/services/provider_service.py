@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from ..core.models import (
     CredentialRef,
@@ -204,11 +205,6 @@ class ProviderService:
         self.app = app
         self.repos = app.repos
         self.credentials = app.credentials
-        #: In-memory capability-probe cache (spec §16), keyed by connection id + model + base URL +
-        #: a *credential identity* — never the secret itself, and never written to disk. The identity
-        #: includes a short digest of the resolved key so that rotating the key invalidates a prior
-        #: "verified" result instead of vouching for a key that was never tested.
-        self._probe_cache: dict[str, AgentModelProbe] = {}
 
     def add(
         self,
@@ -305,6 +301,10 @@ class ProviderService:
             region=region,
             workspace_id=workspace_id,
             extra_headers=extra_headers or {},
+            # A fresh revision per connection: the id is derived from the name, so re-adding a
+            # removed provider reuses the id — without this, a persisted probe taken against the
+            # *previous* key would still match the new connection's cache key (spec §22).
+            credential_revision=uuid4().hex,
         )
         stored_key = api_key if (store_key and credential.type is CredentialType.KEYCHAIN) else None
         return ProviderTransaction(self.credentials, self.repos, provider, stored_key)
@@ -336,6 +336,11 @@ class ProviderService:
             raise ProviderInUseError(name, dependents)
         if provider.credential.type is CredentialType.KEYCHAIN:
             self.credentials.delete_secret(provider.credential)
+        # Purge this connection's probes before the row goes: the id is derived from the name, so a
+        # re-add under the same name reuses it. The credential revision would reject the inherited
+        # rows anyway; deleting them keeps the store from accumulating verdicts for a connection
+        # that no longer exists (spec §22).
+        self.repos.model_probes.delete_for_provider(provider.id)
         self.repos.providers.delete(provider.id)
         return True
 
@@ -487,9 +492,8 @@ class ProviderService:
         provider = self.get(provider_name)
         if not provider:
             raise ProviderValidationError(f"provider {provider_name!r} not found", field="name")
-        key = self._probe_key(provider, model_id)
         if not refresh:
-            cached = self._cached_probe(key)
+            cached = self._cached_probe(provider, model_id)
             if cached is not None:
                 return cached
         adapter = self.adapter_for(provider)
@@ -497,7 +501,7 @@ class ProviderService:
             result = await probe_agent_model(adapter, model_id)
         finally:
             await _maybe_close(adapter)
-        self._probe_cache[key] = result
+        self._store_probe(provider, model_id, result)
         return result
 
     async def probe_model_config(
@@ -555,7 +559,7 @@ class ProviderService:
             return replace(probe, detail=redact(probe.detail))
 
     def cached_probe(self, provider_name: str, model_id: str) -> AgentModelProbe | None:
-        """The cached probe for this model, or ``None`` — used to gate agent creation (§17.5).
+        """The stored probe for this model, or ``None`` — used to gate agent creation (§17.5, §22).
 
         Never triggers a probe: a caller that needs one must ask for it explicitly, so an expensive
         provider call is never made silently behind the user's back.
@@ -564,10 +568,21 @@ class ProviderService:
         provider = self.get(provider_name)
         if not provider:
             return None
-        return self._cached_probe(self._probe_key(provider, model_id))
+        return self._cached_probe(provider, model_id)
 
-    def _cached_probe(self, key: str) -> AgentModelProbe | None:
-        cached = self._probe_cache.get(key)
+    def _cached_probe(self, provider: ProviderConnection, model_id: str) -> AgentModelProbe | None:
+        """Read a persisted probe back, refusing anything that no longer describes reality (§22).
+
+        The cache key already pins the connection, model, endpoint, protocol and credential
+        revision, so a lookup miss *is* the invalidation for all of those: a changed provider
+        simply computes a different key and finds nothing. Probe version and expiry are checked
+        here as well, because a row can outlive both while its key still matches.
+        """
+
+        row = self.repos.model_probes.get(self._probe_key(provider, model_id))
+        if row is None:
+            return None
+        cached = _probe_from_row(row)
         if cached is None or cached.tested_at is None:
             return None
         if cached.probe_version != PROBE_VERSION:
@@ -579,27 +594,118 @@ class ProviderService:
             return None
         return cached
 
-    def _probe_key(self, provider: ProviderConnection, model_id: str) -> str:
-        try:
-            base_url = resolve_base_url(provider)
-        except ValueError:
-            base_url = ""
-        return (
-            f"{provider.id}|{model_id}|{base_url}|{self._credential_identity(provider.credential)}"
-        )
+    def _store_probe(
+        self, provider: ProviderConnection, model_id: str, probe: AgentModelProbe
+    ) -> None:
+        """Persist a probe so the *next* process can honour it (spec §22).
 
-    def _credential_identity(self, credential: CredentialRef) -> str:
-        """A stable identity for the credential — the *reference*, plus an in-memory-only digest.
-
-        The digest exists so that rotating the key behind the same reference invalidates a cached
-        "verified" result (§16). It is derived at call time and lives only in this process's cache
-        dict; no secret or secret hash is ever written to disk.
+        ``detail`` is redacted first: it carries whatever the provider said, and a provider that
+        quotes the key back in an error body would otherwise write that key to the database.
         """
 
+        stored = replace(probe, detail=redact(probe.detail), tested_at=probe.tested_at or _utcnow())
+        tested_at = stored.tested_at
+        assert tested_at is not None  # set on the line above
+        self.repos.model_probes.put(
+            cache_key=self._probe_key(provider, model_id),
+            provider_id=provider.id,
+            model_id=model_id,
+            base_url_fingerprint=_fingerprint(self._base_url(provider)),
+            protocol=enum_value(provider.protocol),
+            credential_revision=self._credential_revision(provider),
+            probe_version=stored.probe_version,
+            tested_at=tested_at.isoformat(),
+            data=stored.to_dict(),
+        )
+
+    def _probe_key(self, provider: ProviderConnection, model_id: str) -> str:
+        """Everything the verdict depends on, hashed into one key (spec §22).
+
+        Anything that changes what a probe would find must change this key, or a stale row answers
+        for a connection it never saw. Note what is *absent*: no key, no digest of the key, nothing
+        derived from the secret at all — §22 forbids persisting any of it, and this string is
+        written to disk.
+        """
+
+        parts = "|".join(
+            (
+                provider.id,
+                model_id,
+                self._base_url(provider),
+                enum_value(provider.protocol),
+                self._credential_revision(provider),
+                PROBE_VERSION,
+            )
+        )
+        return _fingerprint(parts)
+
+    def _base_url(self, provider: ProviderConnection) -> str:
+        try:
+            return resolve_base_url(provider)
+        except ValueError:
+            return ""
+
+    def _credential_revision(self, provider: ProviderConnection) -> str:
+        """Which credential this connection carries — a reference plus an opaque revision token.
+
+        **Known limitation (spec §22, documented in SECURITY.md):** a key rotated *outside*
+        OpenAgent — edited straight into the OS keychain, or an env var whose value changed —
+        does not move the revision, so a probe taken with the previous key stays trusted until it
+        expires (``PROBE_CACHE_TTL``). Detecting that would mean persisting something derived from
+        the secret, which §22 forbids. Rotation *through* OpenAgent mints a new revision and
+        invalidates immediately; the TTL bounds the rest.
+        """
+
+        credential = provider.credential
         ref = f"{enum_value(credential.type)}:{credential.account or credential.env_var or ''}"
-        secret = self.credentials.resolve(credential)
-        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16] if secret else "nokey"
-        return f"{ref}:{digest}"
+        return f"{ref}:{provider.credential_revision or 'legacy'}"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _fingerprint(value: str) -> str:
+    """A short, stable digest of non-secret connection facts (endpoint, protocol, revision).
+
+    Used for the probe cache key and the stored ``base_url_fingerprint``. Never applied to a
+    secret — see ``_credential_revision`` for why the credential contributes a revision token
+    rather than anything derived from the key itself.
+    """
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _probe_from_row(row: dict) -> AgentModelProbe | None:
+    """Rebuild a probe from its stored JSON, tolerating a row this build cannot read.
+
+    A malformed or future-shaped row is treated as *no probe*, never as a verified one: the gate
+    this feeds must fail closed (spec §22).
+    """
+
+    try:
+        caps = row.get("capabilities")
+        if isinstance(caps, dict):
+            capabilities = ModelCapabilities(**caps)
+        else:
+            # `AgentModelProbe.to_dict` flattens the capabilities alongside the verdict.
+            capabilities = ModelCapabilities(
+                text=row.get("text"),
+                streaming=row.get("streaming"),
+                tool_calling=row.get("tool_calling"),
+            )
+        tested_at = row.get("tested_at")
+        return AgentModelProbe(
+            model=str(row["model"]),
+            capabilities=capabilities,
+            agent_compatible=bool(row.get("agent_compatible")),
+            category=str(row.get("category", "")),
+            detail=str(row.get("detail", "")),
+            tested_at=datetime.fromisoformat(tested_at) if tested_at else None,
+            probe_version=str(row.get("probe_version", "")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def _maybe_close(adapter: object) -> None:

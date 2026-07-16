@@ -109,6 +109,9 @@ model_probes = Table(
     Column("provider_id", String, nullable=False, index=True),
     Column("model_id", String, nullable=False),
     Column("base_url_fingerprint", String, nullable=False),
+    #: The wire protocol the probe was run against — a connection switched to another protocol
+    #: speaks a different shape, so an old verdict says nothing about the new one (spec §22).
+    Column("protocol", String, nullable=False, server_default=""),
     Column("credential_revision", String, nullable=False),
     Column("probe_version", String, nullable=False),
     Column("tested_at", String, nullable=False),

@@ -163,11 +163,58 @@ def _m004_event_index_uniqueness(conn: Connection) -> None:
     )
 
 
+def _m005_probe_protocol_and_credential_revision(conn: Connection) -> None:
+    """Key a persisted probe to the protocol and to a credential *revision* (spec §22).
+
+    Two gaps in m003, both of which would let a stored "verified" outlive what it verified:
+
+    * **protocol** was not part of the probe's identity. A connection switched from
+      ``openai-chat`` to ``anthropic-messages`` speaks a different wire shape, so a probe run
+      against the old one proves nothing about the new one.
+    * a provider's **id is derived from its name** (``provider_{name}``), so removing a provider
+      and re-adding it under the same name with a *different key or endpoint* reuses the id. A
+      probe keyed on the id alone would be inherited by the new connection — a verdict from a
+      credential that was never tested against it.
+
+    ``credential_revision`` is an opaque token, minted per connection and rotated whenever the
+    credential is written. It is **not** derived from the key: §22 forbids storing the key, a hash
+    of it, or the Authorization header, so nothing here is a function of the secret.
+
+    Existing rows are backfilled with a token derived from the row's own id, which is stable across
+    reads (a random default per load would change the cache key on every process start and no probe
+    would ever validate).
+    """
+
+    _add_column(conn, "model_probes", "protocol", "VARCHAR NOT NULL DEFAULT ''")
+    # m003's rows predate both columns above; they cannot be keyed correctly, and a probe is cheap
+    # to re-run. Dropping them is the fail-closed choice — re-probing costs one call, honouring a
+    # mis-keyed verdict costs the guarantee.
+    if _table_exists(conn, "model_probes"):
+        conn.execute(text("DELETE FROM model_probes"))
+    if not _table_exists(conn, "provider_connections"):
+        return
+    rows = conn.execute(text("SELECT id, data FROM provider_connections")).fetchall()
+    import json
+
+    for provider_id, data in rows:
+        payload = json.loads(data) if isinstance(data, str) else data
+        if payload.get("credential_revision"):
+            continue
+        payload["credential_revision"] = f"legacy-{provider_id}"
+        conn.execute(
+            text("UPDATE provider_connections SET data=:d WHERE id=:i"),
+            {"d": json.dumps(payload), "i": provider_id},
+        )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "base schema", _m001_base_schema),
     Migration(2, "run project scope", _m002_run_project_scope),
     Migration(3, "model probe cache", _m003_model_probe_cache),
     Migration(4, "event index uniqueness", _m004_event_index_uniqueness),
+    Migration(
+        5, "probe protocol + credential revision", _m005_probe_protocol_and_credential_revision
+    ),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1].version
