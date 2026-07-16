@@ -25,6 +25,17 @@ class ProviderPreset:
     anthropic_base_url: str | None = None
     needs_key: bool = True
     note: str = ""
+    #: Optional richer metadata (spec §10) used by hosted-catalog providers such as NVIDIA Build to
+    #: drive a provider-aware credential/model UI without hardcoding anything model-specific.
+    default_env_var: str | None = None
+    credential_label: str | None = None
+    credential_hint: str | None = None
+    catalog_url: str | None = None
+    docs_url: str | None = None
+    model_id_hint: str | None = None
+    #: True when ``/models`` mixes model *types* (chat, embedding, rerank, vision…) so a listed model
+    #: is NOT automatically an agent-compatible chat model — it must be capability-probed (§14.3).
+    catalog_is_mixed: bool = False
 
 
 #: Built-in presets. Base URLs come straight from each provider's docs (spec §12–§24).
@@ -48,6 +59,21 @@ PRESETS: dict[str, ProviderPreset] = {
                               anthropic_base_url="https://api.minimaxi.com/anthropic"),
     "openrouter": ProviderPreset("openrouter", "OpenRouter", Protocol.OPENAI_CHAT,
                                  openai_base_url="https://openrouter.ai/api/v1"),
+    # NVIDIA Build — hosted NIM APIs, OpenAI Chat Completions protocol (spec §9, §10). Base URL and
+    # protocol come straight from https://docs.api.nvidia.com/nim/reference/llm-apis. This is the
+    # HOSTED catalog at build.nvidia.com; self-hosted NIM users configure a `custom` endpoint instead.
+    "nvidia-build": ProviderPreset(
+        "nvidia-build", "NVIDIA Build (Hosted NIM APIs)", Protocol.OPENAI_CHAT,
+        openai_base_url="https://integrate.api.nvidia.com/v1",
+        needs_key=True,
+        default_env_var="NVIDIA_API_KEY",
+        credential_label="NVIDIA API Key",
+        credential_hint="Generate it on build.nvidia.com; keys commonly begin with nvapi-",
+        catalog_url="https://build.nvidia.com/",
+        docs_url="https://docs.api.nvidia.com/nim/reference/llm-apis",
+        model_id_hint="publisher/model",
+        catalog_is_mixed=True,
+    ),
     "mistral": ProviderPreset("mistral", "Mistral", Protocol.OPENAI_CHAT,
                               openai_base_url="https://api.mistral.ai/v1"),
     "together": ProviderPreset("together", "Together", Protocol.OPENAI_CHAT,

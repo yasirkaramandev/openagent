@@ -82,3 +82,51 @@ def test_short_values_not_registered():
 def test_empty_string_untouched():
     assert redact("") == ""
     assert redact("hello world") == "hello world"
+
+
+# --------------------------------------------------------------------------- NVIDIA keys (§19)
+
+NVIDIA_KEY = "nvapi-THIS_IS_A_FAKE_TEST_KEY_123456"
+
+
+def test_redacts_bare_nvidia_key():
+    out = redact(f"using key {NVIDIA_KEY} to call the api")
+    assert NVIDIA_KEY not in out
+    assert REDACTED in out
+
+
+def test_redacts_nvidia_key_in_authorization_header():
+    out = redact(f"Authorization: Bearer {NVIDIA_KEY}")
+    assert NVIDIA_KEY not in out
+    assert out.startswith("Authorization:")
+
+
+def test_redacts_nvidia_key_in_env_assignment():
+    out = redact(f"NVIDIA_API_KEY={NVIDIA_KEY}")
+    assert NVIDIA_KEY not in out
+    assert out.startswith("NVIDIA_API_KEY=")
+
+
+def test_redacts_nvidia_key_inside_nested_structures():
+    payload = {
+        "headers": {"Authorization": f"Bearer {NVIDIA_KEY}"},
+        "env": [f"NVIDIA_API_KEY={NVIDIA_KEY}"],
+        "note": f"the key {NVIDIA_KEY} was used",
+    }
+    out = redact_mapping(payload)
+    assert NVIDIA_KEY not in json_dumps(out)
+
+
+def test_nvidia_key_redacted_even_without_the_pattern_via_register():
+    """A future NVIDIA key format with no recognizable prefix is still scrubbed exactly (§19)."""
+
+    prefixless = "abcd1234efgh5678ijkl9012mnop"
+    register_secret(prefixless)
+    out = redact(f"Authorization: Bearer {prefixless}")
+    assert prefixless not in out
+
+
+def json_dumps(value) -> str:
+    import json
+
+    return json.dumps(value)

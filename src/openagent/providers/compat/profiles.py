@@ -54,6 +54,13 @@ PROFILES: dict[str, CompatibilityProfile] = {
     "glm": CompatibilityProfile("glm"),
     "minimax": CompatibilityProfile("minimax"),
     "openrouter": CompatibilityProfile("openrouter"),
+    # NVIDIA Build (spec §11). Send ONLY the common OpenAI-compatible fields until a capability probe
+    # (or an official fixture) proves more. In particular ``stream_options`` is NOT documented in
+    # NVIDIA's official examples, so streaming usage is off by default — the adapter must not send a
+    # field the endpoint may reject. tool_choice=required and parallel tools stay unassumed (probe).
+    "nvidia-build": CompatibilityProfile(
+        "nvidia-build", stream_usage=False, supports_tool_choice_required=False,
+    ),
     "ollama": CompatibilityProfile("ollama"),
     "mistral": CompatibilityProfile("mistral"),
     "together": CompatibilityProfile("together"),

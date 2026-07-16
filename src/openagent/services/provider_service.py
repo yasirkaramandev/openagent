@@ -2,18 +2,40 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from types import TracebackType
 from typing import TYPE_CHECKING
 
-from ..core.models import CredentialRef, CredentialType, Protocol, ProviderConnection, RemoteModel
+from ..core.models import (
+    CredentialRef,
+    CredentialType,
+    ModelCapabilities,
+    Protocol,
+    ProviderConnection,
+    RemoteModel,
+    enum_value,
+)
 from ..credentials.redaction import register_secret
 from ..providers.base import HealthResult
+from ..providers.discovery import (
+    PROBE_UNREACHABLE,
+    PROBE_VERSION,
+    AgentModelProbe,
+    probe_agent_model,
+)
 from ..providers.factory import build_adapter, get_preset, resolve_base_url
 
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
+    from ..credentials.store import CredentialStore
+    from ..storage.repositories import Repositories
+
+#: How long a capability probe stays trusted before it must be re-run (spec §16).
+PROBE_CACHE_TTL = timedelta(hours=24)
 
 
 class ProviderValidationError(ValueError):
@@ -38,29 +60,85 @@ class ProviderInUseError(ValueError):
         )
 
 
-@dataclass
-class SecretRollback:
-    """How to put the OS keychain back exactly as it was, if a transaction fails (item 17).
+class ProviderTransaction:
+    """A provider-creation transaction whose secret-rollback state lives ONLY on the stack (§6).
 
-    The previous code only tracked *whether* it had written a secret where none existed. If a secret
-    already existed under the same account, it was overwritten and — on failure — simply left there:
-    the user's old key was destroyed and replaced by a key belonging to a provider that was never
-    saved. Restoring correctly needs the previous **value**, not a boolean.
+    The old design stashed a :class:`!SecretRollback` — including the previous keychain value in
+    plaintext — in a service-level ``dict`` that was cleared only if ``rollback()`` was called. So a
+    *successful* ``provider add`` left the user's old key sitting in ``ProviderService`` for the whole
+    process lifetime. This transaction holds that value only for the duration of the ``with`` block:
+
+    * ``__enter__`` writes the new secret (capturing the previous value to restore) and the provider
+      row; a DB failure there restores the keychain and re-raises, and ``__exit__`` is not invoked.
+    * ``commit()`` — called the moment the provider (and, in the connect-and-create-agent flow, the
+      agent) is durably written — wipes the captured previous value immediately.
+    * ``__exit__`` on an *uncommitted* transaction restores the keychain exactly as it was and deletes
+      the half-written provider row.
+
+    Nothing plaintext survives past the ``with`` block, committed or not.
     """
 
-    ref: CredentialRef | None = None
-    previous: str | None = None
-    wrote: bool = False
+    def __init__(
+        self, credentials: CredentialStore, repos: Repositories,
+        provider: ProviderConnection, api_key: str | None,
+    ) -> None:
+        self._credentials = credentials
+        self._repos = repos
+        self.provider = provider
+        self._api_key = api_key
+        self._previous: str | None = None
+        self._wrote = False
+        self._committed = False
 
-    def restore(self, credentials) -> None:
-        """Undo the write: put the old secret back verbatim, or remove one that never existed."""
+    def __enter__(self) -> ProviderTransaction:
+        credential = self.provider.credential
+        if self._api_key and credential.type is CredentialType.KEYCHAIN:
+            # Capture the *value* that was there before (needed to restore it byte-for-byte), then
+            # overwrite it. Held only until commit()/rollback.
+            self._previous = self._credentials.resolve(credential)
+            self._wrote = True
+            self._credentials.set_secret(credential, self._api_key)
+        try:
+            self._repos.providers.upsert(self.provider)
+        except Exception:
+            self._restore()
+            self._forget()
+            raise
+        self._api_key = None  # the key now lives in the keychain; keep no copy in memory
+        return self
 
-        if not self.wrote or self.ref is None:
+    def commit(self) -> None:
+        """Mark the transaction durable and immediately forget the previous secret (§6.1)."""
+
+        self._committed = True
+        self._forget()
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        # Returns None → never suppresses the in-flight exception; an uncommitted transaction is
+        # rolled back exactly (keychain restored, half-written provider row removed).
+        if not self._committed:
+            self._restore()
+            self._forget()
+            with contextlib.suppress(Exception):
+                self._repos.providers.delete(self.provider.id)
+
+    def _restore(self) -> None:
+        """Put the old secret back verbatim, or remove one that never existed (item 17)."""
+
+        if not self._wrote or self.provider.credential.type is not CredentialType.KEYCHAIN:
             return
-        if self.previous is None:
-            credentials.delete_secret(self.ref)
+        if self._previous is None:
+            self._credentials.delete_secret(self.provider.credential)
         else:
-            credentials.set_secret(self.ref, self.previous)
+            self._credentials.set_secret(self.provider.credential, self._previous)
+
+    def _forget(self) -> None:
+        self._previous = None
+        self._api_key = None
+        self._wrote = False
 
 
 def resolve_credential(
@@ -120,9 +198,11 @@ class ProviderService:
         self.app = app
         self.repos = app.repos
         self.credentials = app.credentials
-        #: What :meth:`add` wrote to the keychain for each provider, so a later :meth:`rollback` in
-        #: the same transaction can restore the previous value exactly (item 17).
-        self._rollbacks: dict[str, SecretRollback] = {}
+        #: In-memory capability-probe cache (spec §16), keyed by connection id + model + base URL +
+        #: a *credential identity* — never the secret itself, and never written to disk. The identity
+        #: includes a short digest of the resolved key so that rotating the key invalidates a prior
+        #: "verified" result instead of vouching for a key that was never tested.
+        self._probe_cache: dict[str, AgentModelProbe] = {}
 
     def add(
         self,
@@ -159,18 +239,44 @@ class ProviderService:
         user's choice explicit; when omitted it is inferred from the inputs.
         """
 
-        if self.get(name) is not None:
-            raise ProviderValidationError(
-                f"provider {name!r} already exists", field="name"
-            )
+        with self.create_transaction(
+            name=name, provider_type=provider_type, protocol=protocol, base_url=base_url,
+            anthropic_base_url=anthropic_base_url, api_key=api_key, key_env=key_env,
+            credential_source=credential_source, region=region, workspace_id=workspace_id,
+            extra_headers=extra_headers, store_key=store_key,
+        ) as tx:
+            tx.commit()  # the provider row is durable — forget the previous secret immediately (§6)
+            return tx.provider
 
+    def create_transaction(
+        self,
+        *,
+        name: str,
+        provider_type: str,
+        protocol: Protocol | None = None,
+        base_url: str | None = None,
+        anthropic_base_url: str | None = None,
+        api_key: str | None = None,
+        key_env: str | None = None,
+        credential_source: str | None = None,
+        region: str | None = None,
+        workspace_id: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        store_key: bool = True,
+    ) -> ProviderTransaction:
+        """Prepare a provider-creation transaction (validates + builds the row), for callers that need
+        to commit only after a *partner* write succeeds — the atomic connect-provider-and-create-agent
+        flow (item 3). ``__enter__`` writes the secret + row; the caller commits after its own write,
+        and any exception before ``commit()`` rolls the keychain and row back exactly (§6.1)."""
+
+        if self.get(name) is not None:
+            raise ProviderValidationError(f"provider {name!r} already exists", field="name")
         preset = get_preset(provider_type)
         resolved_protocol = protocol or (preset.protocol if preset else Protocol.OPENAI_CHAT)
         credential = resolve_credential(
             name=name, provider_type=provider_type, api_key=api_key, key_env=key_env,
             credential_source=credential_source,
         )
-
         provider = ProviderConnection(
             id=f"provider_{name}",
             name=name,
@@ -183,47 +289,14 @@ class ProviderService:
             workspace_id=workspace_id,
             extra_headers=extra_headers or {},
         )
-        rollback = SecretRollback()
-        if api_key and store_key and credential.type is CredentialType.KEYCHAIN:
-            # Capture the *value* that was there before, not just whether one was: restoring needs it.
-            rollback = SecretRollback(
-                ref=credential, previous=self.credentials.resolve(credential), wrote=True,
-            )
-            self.credentials.set_secret(credential, api_key)
-        try:
-            self.repos.providers.upsert(provider)
-        except Exception:
-            rollback.restore(self.credentials)
-            raise
-        self._rollbacks[provider.name] = rollback
-        return provider
+        stored_key = api_key if (store_key and credential.type is CredentialType.KEYCHAIN) else None
+        return ProviderTransaction(self.credentials, self.repos, provider, stored_key)
 
     def list(self) -> Sequence[ProviderConnection]:
         return self.repos.providers.list()
 
     def get(self, name: str) -> ProviderConnection | None:
         return self.repos.providers.get_by_name(name)
-
-    def rollback(self, provider: ProviderConnection) -> None:
-        """Undo a just-created provider (row + keychain), restoring the keychain exactly (item 17).
-
-        Used by the atomic create-provider-and-agent transaction (item 3); unlike :meth:`remove` it
-        does **not** run the in-use guard, because the partner agent creation failed and the provider
-        must be removed regardless.
-
-        It follows the same rule as :meth:`add`: a secret this transaction wrote over is put back,
-        and a secret that existed **before** the transaction is never deleted. Deleting it would
-        destroy a key the user still has another use for, over a failure they did not cause.
-        """
-
-        rollback = self._rollbacks.pop(provider.name, None)
-        if rollback is not None:
-            rollback.restore(self.credentials)
-        elif provider.credential.type is CredentialType.KEYCHAIN:
-            # No recorded write (e.g. the provider was created elsewhere): nothing of ours to undo,
-            # so leave the keychain alone rather than deleting a secret we did not write.
-            pass
-        self.repos.providers.delete(provider.id)
 
     def agents_using(self, name: str) -> Sequence[str]:
         """Names of agents whose runtime binds to the provider connection ``name``."""
@@ -359,6 +432,120 @@ class ProviderService:
             return []
         finally:
             await _maybe_close(adapter)
+
+    # ------------------------------------------------------------------ capability probe (§15, §16)
+
+    async def probe_model(
+        self, provider_name: str, model_id: str, *, refresh: bool = False,
+    ) -> AgentModelProbe:
+        """Really exercise ``model_id`` on a saved provider and report what was observed (§15.1).
+
+        This — not ``/models`` reachability — is the only thing that may be called validation: a
+        catalog can be public, so listing a model proves neither that the key works nor that the model
+        speaks OpenAgent's chat/tool shape. Results are cached per (connection, model, base URL,
+        credential identity) with a TTL (§16); ``refresh=True`` forces a fresh probe.
+        """
+
+        provider = self.get(provider_name)
+        if not provider:
+            raise ProviderValidationError(f"provider {provider_name!r} not found", field="name")
+        key = self._probe_key(provider, model_id)
+        if not refresh:
+            cached = self._cached_probe(key)
+            if cached is not None:
+                return cached
+        adapter = self.adapter_for(provider)
+        try:
+            result = await probe_agent_model(adapter, model_id)
+        finally:
+            await _maybe_close(adapter)
+        self._probe_cache[key] = result
+        return result
+
+    async def probe_model_config(
+        self,
+        *,
+        model_id: str,
+        provider_type: str,
+        protocol: Protocol | None = None,
+        base_url: str | None = None,
+        anthropic_base_url: str | None = None,
+        region: str | None = None,
+        workspace_id: str | None = None,
+        api_key: str | None = None,
+        key_env: str | None = None,
+    ) -> AgentModelProbe:
+        """Probe a model on a *would-be* provider before it is saved (Add-Agent new-connection flow).
+
+        Mirrors :meth:`test_config`: a transient adapter, nothing persisted, the key never stored or
+        echoed. Not cached — there is no connection identity to key a cache on yet.
+        """
+
+        preset = get_preset(provider_type)
+        resolved_protocol = protocol or (preset.protocol if preset else Protocol.OPENAI_CHAT)
+        provider = ProviderConnection(
+            id="provider__transient", name="__transient", provider_type=provider_type,
+            protocol=resolved_protocol, base_url=base_url, anthropic_base_url=anthropic_base_url,
+            region=region, workspace_id=workspace_id,
+            credential=CredentialRef(type=CredentialType.NONE),
+        )
+        key = api_key or (os.environ.get(key_env) if key_env else None)
+        register_secret(key)
+        try:
+            resolve_base_url(provider)
+        except ValueError as exc:
+            return AgentModelProbe(model_id, ModelCapabilities(text=False), False,
+                                   PROBE_UNREACHABLE, str(exc))
+        adapter = build_adapter(provider, key)
+        try:
+            return await probe_agent_model(adapter, model_id)
+        finally:
+            await _maybe_close(adapter)
+
+    def cached_probe(self, provider_name: str, model_id: str) -> AgentModelProbe | None:
+        """The cached probe for this model, or ``None`` — used to gate agent creation (§17.5).
+
+        Never triggers a probe: a caller that needs one must ask for it explicitly, so an expensive
+        provider call is never made silently behind the user's back.
+        """
+
+        provider = self.get(provider_name)
+        if not provider:
+            return None
+        return self._cached_probe(self._probe_key(provider, model_id))
+
+    def _cached_probe(self, key: str) -> AgentModelProbe | None:
+        cached = self._probe_cache.get(key)
+        if cached is None or cached.tested_at is None:
+            return None
+        if cached.probe_version != PROBE_VERSION:
+            return None  # the probe definition changed — an old result proves nothing about the new one
+        tested = cached.tested_at
+        if tested.tzinfo is None:
+            tested = tested.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - tested >= PROBE_CACHE_TTL:
+            return None
+        return cached
+
+    def _probe_key(self, provider: ProviderConnection, model_id: str) -> str:
+        try:
+            base_url = resolve_base_url(provider)
+        except ValueError:
+            base_url = ""
+        return f"{provider.id}|{model_id}|{base_url}|{self._credential_identity(provider.credential)}"
+
+    def _credential_identity(self, credential: CredentialRef) -> str:
+        """A stable identity for the credential — the *reference*, plus an in-memory-only digest.
+
+        The digest exists so that rotating the key behind the same reference invalidates a cached
+        "verified" result (§16). It is derived at call time and lives only in this process's cache
+        dict; no secret or secret hash is ever written to disk.
+        """
+
+        ref = f"{enum_value(credential.type)}:{credential.account or credential.env_var or ''}"
+        secret = self.credentials.resolve(credential)
+        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16] if secret else "nokey"
+        return f"{ref}:{digest}"
 
 
 async def _maybe_close(adapter: object) -> None:

@@ -19,6 +19,14 @@ from ..core.errors import ErrorType, classify_http_status, is_retryable
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
+#: A 202 means the provider queued the request and expects the caller to poll for a result. The chat
+#: runtime is synchronous and has no polling, so a 202 is an explicit, honest failure — never an empty
+#: "success" with no content (spec §15.5; some NVIDIA model types behave this way).
+_ASYNC_MESSAGE = (
+    "Asynchronous NVIDIA invocation is not supported by the OpenAgent chat runtime yet "
+    "(the endpoint returned HTTP 202 with a request id instead of a completion)."
+)
+
 
 class TransportError(Exception):
     def __init__(self, error_type: ErrorType, message: str, status: int | None = None) -> None:
@@ -71,6 +79,8 @@ class Transport:
                 attempt += 1
                 continue
 
+            if response.status_code == 202:
+                raise TransportError(ErrorType.ASYNC_UNSUPPORTED, _ASYNC_MESSAGE, status=202)
             if response.status_code >= 400:
                 retry_after = _retry_after(response)
                 if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
@@ -98,6 +108,9 @@ class Transport:
         while True:
             try:
                 async with self.client().stream("POST", path, json=payload) as response:
+                    if response.status_code == 202:
+                        await response.aread()
+                        raise TransportError(ErrorType.ASYNC_UNSUPPORTED, _ASYNC_MESSAGE, status=202)
                     if response.status_code >= 400:
                         body = (await response.aread()).decode("utf-8", errors="replace")
                         retry_after = _retry_after(response)

@@ -23,6 +23,9 @@ REDACTED = "[REDACTED]"
 _PATTERNS: list[re.Pattern[str]] = [
     # Provider key prefixes: sk-..., sk-ant-..., gsk_..., etc. (>=16 trailing chars)
     re.compile(r"\b(sk|rk|gsk|xai|glm|ya29)[-_][A-Za-z0-9_\-]{16,}"),
+    # NVIDIA Build keys (spec §19). Format may evolve; the prefix is a hint, so match it defensively
+    # in addition to the exact registered value.
+    re.compile(r"\bnvapi-[A-Za-z0-9_\-]{8,}"),
     # Bearer tokens
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"),
     # Authorization headers

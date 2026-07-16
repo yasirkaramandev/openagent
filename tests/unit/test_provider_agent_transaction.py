@@ -193,3 +193,77 @@ def test_agent_transaction_rollback_restores_the_previous_secret(
 
     assert oa.credentials.resolve(ref) == "old-secret"   # the user's old key is intact
     assert oa.providers.get("acme") is None              # …and the half-made provider is gone
+
+
+# --------------------------------------------------------------------------- transaction-local rollback (§6)
+
+
+def test_successful_add_retains_no_rollback_secret_cache(tmp_path: Path) -> None:
+    """A successful ``provider add`` must not leave the previous key in a service-level cache (§6).
+
+    The old design kept a ``SecretRollback`` (previous key in plaintext) in ``ProviderService`` until
+    a rollback that, on success, never came — so the value lived for the whole process. There is now
+    no such cache at all: rollback state lives only on the transaction stack.
+    """
+
+    oa = _app(tmp_path)
+    oa.providers.add(name="acme", provider_type="custom", base_url="https://api.test/v1",
+                     api_key="new-secret")
+    assert not hasattr(oa.providers, "_rollbacks")
+    assert oa.providers.get("acme") is not None
+
+
+def test_successful_provider_agent_transaction_clears_previous_secret(tmp_path: Path) -> None:
+    oa = _app(tmp_path)
+    ref = _ref("acme")
+    oa.credentials.set_secret(ref, "old-secret")  # a prior key exists under this account
+
+    oa.agents.create_with_new_provider(
+        provider_name="acme", provider_type="custom", base_url="https://api.test/v1",
+        api_key="new-secret", model="m", name="acme-coder",
+    )
+    # Success: the new key is stored and the previous value is retained nowhere in the service.
+    assert oa.credentials.resolve(ref) == "new-secret"
+    assert not hasattr(oa.providers, "_rollbacks")
+
+
+def test_new_key_with_no_previous_value_is_deleted_on_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no key existed before, a rolled-back transaction removes the one it wrote (no orphan)."""
+
+    oa = _app(tmp_path)
+    ref = _ref("acme")
+    assert oa.credentials.resolve(ref) is None
+    monkeypatch.setattr(oa.repos.agents, "upsert",
+                        lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")))
+    with pytest.raises(RuntimeError):
+        oa.agents.create_with_new_provider(
+            provider_name="acme", provider_type="custom", base_url="https://api.test/v1",
+            api_key="brand-new", model="m", name="acme-coder",
+        )
+    assert oa.credentials.resolve(ref) is None
+    assert oa.providers.get("acme") is None
+
+
+def test_stale_rollback_cannot_affect_a_later_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rolled-back later transaction must not touch an earlier, unrelated provider's key (§6)."""
+
+    oa = _app(tmp_path)
+    # 1) A successful earlier add with its own key.
+    oa.providers.add(name="alpha", provider_type="custom", base_url="https://api.test/v1",
+                     api_key="alpha-key")
+    # 2) A later, unrelated provider whose agent creation fails and rolls the provider back.
+    monkeypatch.setattr(oa.repos.agents, "upsert",
+                        lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")))
+    with pytest.raises(RuntimeError):
+        oa.agents.create_with_new_provider(
+            provider_name="beta", provider_type="custom", base_url="https://api.test/v1",
+            api_key="beta-key", model="m", name="beta-coder",
+        )
+    # alpha's key is untouched by beta's rollback; alpha still exists, beta does not.
+    assert oa.credentials.resolve(_ref("alpha")) == "alpha-key"
+    assert oa.providers.get("alpha") is not None
+    assert oa.providers.get("beta") is None
