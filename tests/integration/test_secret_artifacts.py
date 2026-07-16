@@ -143,3 +143,98 @@ async def test_cli_stderr_secret_is_redacted(
     run_dir = app.paths.run_dir(run.id)
     for name in ("events.jsonl", "logs.txt", "result.json"):
         assert "ghp_stderrLEAK1234567890abcdefGHIJ" not in (run_dir / name).read_text()
+
+
+# --------------------------------------------------------------------------- NVIDIA (§12, §19)
+
+NVIDIA_KEY = "nvapi-THIS_IS_A_FAKE_TEST_KEY_123456"
+INTERNAL_REASONING = "PRIVATE INTERNAL REASONING"
+
+_ARTIFACTS = (
+    "request.json",
+    "status.json",
+    "result.json",
+    "events.jsonl",
+    "logs.txt",
+    "output.md",
+    "handoff.md",
+    "changes.diff",
+    "timeline.md",
+)
+
+
+async def test_nvidia_raw_reasoning_never_reaches_any_artifact(
+    app: OpenAgentApp, httpx_mock: HTTPXMock
+):
+    """`reasoning_content` is raw chain-of-thought: only the final answer may be stored (§12, §20.4).
+
+    End to end through a real run — not just the adapter — so this covers events.jsonl, timeline.md,
+    result.json and output.md, the places an operator or another agent would actually read.
+    """
+
+    app.providers.add(
+        name="nvidia-build", provider_type="nvidia-build", api_key=NVIDIA_KEY, store_key=True
+    )
+    app.agents.create(
+        name="nv",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="nvidia-build",
+        model="nvidia/nemotron-test",
+        permission_profile="safe-edit",
+    )
+    httpx_mock.add_response(
+        content=_sse(
+            {"choices": [{"delta": {"reasoning_content": INTERNAL_REASONING, "content": None}}]},
+            {"choices": [{"delta": {"content": "Safe final answer"}}]},
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+
+    run = app.runs.create(agent_name="nv", prompt="think hard then answer")
+    result = await app.runs.execute(run)
+    assert result.status.value == "completed"
+
+    run_dir = app.paths.run_dir(run.id)
+    for name in _ARTIFACTS:
+        path = run_dir / name
+        if not path.exists():
+            continue
+        text = path.read_text()
+        assert INTERNAL_REASONING not in text, f"raw reasoning leaked into {name}"
+        assert NVIDIA_KEY not in text, f"the NVIDIA key leaked into {name}"
+
+    # The final answer — and only the final answer — survives.
+    assert "Safe final answer" in json.loads((run_dir / "result.json").read_text())["summary"]
+
+
+async def test_nvidia_key_never_reaches_any_artifact_on_auth_failure(
+    app: OpenAgentApp, httpx_mock: HTTPXMock
+):
+    """A rejected key must not be echoed back through the error path either (§19, §20.2)."""
+
+    app.providers.add(
+        name="nvidia-build", provider_type="nvidia-build", api_key=NVIDIA_KEY, store_key=True
+    )
+    app.agents.create(
+        name="nv",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="nvidia-build",
+        model="nvidia/nemotron-test",
+        permission_profile="safe-edit",
+    )
+    # An unhelpful provider that echoes the key back in its error body.
+    httpx_mock.add_response(
+        status_code=401,
+        json={"error": {"message": f"invalid key: Bearer {NVIDIA_KEY}"}},
+    )
+
+    run = app.runs.create(agent_name="nv", prompt=f"use {NVIDIA_KEY}")
+    result = await app.runs.execute(run)
+    assert result.status.value == "failed"
+
+    run_dir = app.paths.run_dir(run.id)
+    for name in _ARTIFACTS:
+        path = run_dir / name
+        if not path.exists():
+            continue
+        assert NVIDIA_KEY not in path.read_text(), f"the NVIDIA key leaked into {name}"

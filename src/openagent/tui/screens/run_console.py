@@ -690,6 +690,12 @@ class RunConsoleScreen(Screen):
         event.input.value = ""
         self.query_one("#followup-row").display = False
         self.app.resume_run(self.run_id, prompt)  # type: ignore[attr-defined]
+        # Disable follow-up the instant the worker starts (§4.1), rather than waiting for the next
+        # refresh tick to notice the run went active. The per-run lock in RunService is the real
+        # guarantee — a second follow-up is rejected outright — but the UI must not offer an action
+        # it knows will be refused. ``_render_actions`` re-evaluates once the turn reaches a terminal
+        # state and follow-up becomes available again.
+        self.query_one("#follow", Button).disabled = True
         self._live = self.app.live_run(self.run_id)  # type: ignore[attr-defined]
         if self._live is not None:
             self.projection = self._live.projection
