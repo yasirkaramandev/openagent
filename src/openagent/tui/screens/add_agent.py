@@ -16,6 +16,9 @@ are shown inline (never a full-screen traceback), while genuine bugs still propa
 
 from __future__ import annotations
 
+import os
+import webbrowser
+
 from pydantic import SecretStr
 from textual import events
 from textual.app import ComposeResult
@@ -25,6 +28,7 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import (
     Button,
+    Checkbox,
     Footer,
     Header,
     Input,
@@ -36,10 +40,16 @@ from textual.widgets import (
     TextArea,
 )
 
-from ...core.models import Protocol, RuntimeType
+from ...core.models import Protocol, RemoteModel, RuntimeType
 from ...core.permissions import profile_names
 from ...credentials.store import CredentialError
-from ...providers.factory import PRESETS, get_preset, preset_names
+from ...providers.discovery import (
+    AgentModelProbe,
+    filter_models,
+    looks_non_chat,
+    publishers,
+)
+from ...providers.factory import PRESETS, ProviderPreset, get_preset, preset_names
 from ...runtimes.cli.registry import (
     CliModelDiscovery,
     CliRegistryEntry,
@@ -111,7 +121,10 @@ class AddAgentScreen(Screen):
     AddAgentScreen #content { height: 1fr; padding: 0 2; }
     AddAgentScreen Label { margin: 1 0 0 0; text-style: bold; }
     AddAgentScreen .hint { color: $text-muted; text-style: none; margin: 0 0 1 0; height: auto; }
+    AddAgentScreen .warning { color: $warning; text-style: none; margin: 0 0 1 0; height: auto; }
     AddAgentScreen .field-error { color: $error; text-style: none; margin: 0; height: auto; }
+    AddAgentScreen #hosted-actions { height: auto; margin: 0 0 1 0; }
+    AddAgentScreen #catalog-filters { height: auto; }
     AddAgentScreen .card { border: round $primary; padding: 0 1; margin: 0 0 1 0; height: auto; }
     AddAgentScreen #error-summary { color: $error; padding: 0 2; height: auto; }
     AddAgentScreen #conn-status { height: auto; margin: 1 0 0 0; }
@@ -140,6 +153,10 @@ class AddAgentScreen(Screen):
         self._model_context: tuple[str, ...] | None = None
         self._model_method = ""          # e.g. "agy models" / "provider models"
         self._model_status = "default"   # discovered | manual | default (shown on Review)
+        #: The full discovered catalog, kept so search/publisher filtering is purely local (§14.2).
+        self._catalog: list[RemoteModel] = []
+        #: The last real capability probe — the ONLY thing that may call a model agent-compatible.
+        self._probe: AgentModelProbe | None = None
 
     # ------------------------------------------------------------------ compose
 
@@ -199,6 +216,12 @@ class AddAgentScreen(Screen):
                     yield Label("", id="err-provider", classes="field-error")
 
                 with Vertical(id="conn-new"):
+                    # Provider-aware header: for a hosted catalog (NVIDIA Build) the endpoint and
+                    # protocol are fixed facts from the official docs, not user input (§13.1).
+                    yield Static("", id="hosted-info", classes="card")
+                    with Horizontal(id="hosted-actions"):
+                        yield Button("Open NVIDIA Build", id="open-catalog")
+                    yield Static("", id="hosted-hint", classes="hint")
                     yield Label("Connection name")
                     yield Input(placeholder="e.g. deepseek-main", id="conn_name")
                     yield Label("", id="err-conn", classes="field-error")
@@ -229,16 +252,31 @@ class AddAgentScreen(Screen):
             with Vertical(id="step-model"):
                 yield Static("Choose the model", classes="hint")
                 yield Static("", id="model-info", classes="card")
+                # A mixed catalog (NVIDIA Build) lists chat, embedding, rerank and vision models
+                # alike — a listing is never a capability claim (§14.3).
+                yield Static("", id="catalog-warning", classes="warning")
                 with WizardRadioSet(id="model-mode"):
                     yield RadioButton("Choose a discovered model", value=True, id="model-mode-discovered")
                     yield RadioButton("Enter a model ID manually (not verified)", id="model-mode-manual")
                     yield RadioButton("Use the CLI's default model (CLI agents only)", id="model-mode-default")
+                # Local search + publisher filter: a big catalog is unusable as a flat Select, and
+                # typing must never trigger a network call (§14.2).
+                with Vertical(id="catalog-filters"):
+                    yield Label("Search models")
+                    yield Input(placeholder="filter by model id (local)", id="model-search")
+                    yield Label("Publisher")
+                    yield Select([], id="model-owner", allow_blank=True, prompt="all publishers")
                 yield Select([], id="model_select", allow_blank=True,
                              prompt="discovered models (Refresh to load)")
-                yield Input(placeholder="model id/label, e.g. deepseek-chat", id="model")
+                yield Input(placeholder="model id/label, e.g. publisher/model", id="model")
                 yield Static("", id="model-status", classes="hint")
+                yield Static("", id="model-verify", classes="hint")
                 with Horizontal(id="model-actions"):
-                    yield Button("Refresh Models", id="model-refresh")
+                    yield Button("Refresh Catalog", id="model-refresh")
+                    yield Button("Validate Model & Key", id="model-validate")
+                    yield Button("Open model page", id="open-model-page")
+                yield Checkbox("Create as unverified/limited model (advanced)", value=False,
+                               id="allow-unverified")
                 yield Label("", id="err-model", classes="field-error")
 
             # ---- Agent Details step (common fields) -----------------------
@@ -374,6 +412,14 @@ class AddAgentScreen(Screen):
             self._test_connection()
         elif bid == "model-refresh":
             self._refresh_models()
+        elif bid == "model-validate":
+            self._validate_model()
+        elif bid == "open-catalog":
+            preset = self._preset()
+            self._open_url((preset.catalog_url if preset else None) or "https://build.nvidia.com/")
+        elif bid == "open-model-page":
+            preset = self._preset()
+            self._open_url((preset.catalog_url if preset else None) or "https://build.nvidia.com/")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in a field advances (Continue) on non-final steps (part 16).
@@ -504,16 +550,25 @@ class AddAgentScreen(Screen):
         (:func:`resolve_credential`), so there is one source of truth and no drift.
         """
 
+        env_var = self._input("key_env") or None
         try:
             resolve_credential(
                 name=conn_name, provider_type=self.state.provider_type or "custom",
-                api_key=key or None, key_env=self._input("key_env") or None,
+                api_key=key or None, key_env=env_var,
                 credential_source=cred,
             )
         except ProviderValidationError as exc:
             field = {"api_key": "err-conn", "key_env": "err-conn"}.get(exc.field, "err-conn")
             self._field_error(field, str(exc))
             self._status(f"[red]✗ {safe_markup(str(exc), 200)}[/red]")
+            return False
+        # An env-var credential that does not exist is a guaranteed failure at run time — say so
+        # here, where the user can fix it, and never echo the value (§13.3).
+        if cred == "env" and env_var and env_var not in os.environ:
+            message = (f"environment variable {env_var} is not set in this environment — export it "
+                       "first, or use the OS keychain instead")
+            self._field_error("err-conn", message)
+            self._status(f"[red]✗ {safe_markup(message, 200)}[/red]")
             return False
         return True
 
@@ -581,6 +636,99 @@ class AddAgentScreen(Screen):
         mode = self._radio_value("#model-mode", _MODEL_MODES) or "discovered"
         self.query_one("#model_select", Select).display = mode == "discovered"
         self.query_one("#model", Input).display = mode == "manual"
+        # The catalog filters only make sense while browsing a discovered list.
+        self.query_one("#catalog-filters").display = (
+            mode == "discovered" and self.state.backend_type == "api"
+        )
+        is_api = self.state.backend_type == "api"
+        preset = self._preset()
+        self.query_one("#model-validate").display = is_api
+        self.query_one("#open-model-page").display = bool(preset and preset.catalog_url)
+        # The unverified override is only offered where the gate applies, and never pre-selected.
+        self.query_one("#allow-unverified").display = bool(preset and preset.catalog_is_mixed)
+        warning = self.query_one("#catalog-warning", Static)
+        if preset and preset.catalog_is_mixed:
+            warning.display = True
+            warning.update(
+                "NVIDIA's catalog contains chat, embedding, reranking, vision and other model "
+                "types.\nA catalog entry is not automatically compatible with OpenAgent agents.\n"
+                "Validate the selected model before creating the agent."
+            )
+        else:
+            warning.display = False
+
+    def _apply_catalog_filters(self) -> None:
+        """Filter the already-fetched catalog locally — never a network call per keystroke (§14.2)."""
+
+        search = self.query_one("#model-search", Input).value.strip() or None
+        owner = selected_string(self.query_one("#model-owner", Select)) or None
+        models = filter_models(self._catalog, search=search, owner=owner)
+        select = self.query_one("#model_select", Select)
+        select.set_options([(_catalog_label(m), m.id) for m in models])
+        if not models:
+            self._set_model_status("[yellow]no catalog model matches these filters[/yellow]")
+        else:
+            self._set_model_status(f"[green]{len(models)} of {len(self._catalog)} model(s)[/green]"
+                                   " — pick one, then Validate Model & Key")
+
+    def _open_url(self, url: str) -> None:
+        """Open a URL with Python's cross-platform webbrowser — never a shell command (§13.4)."""
+
+        opened = False
+        try:
+            opened = webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - a headless/SSH box has no browser; that is not an error
+            opened = False
+        if opened:
+            self.notify(f"opened {url}")
+        else:
+            # Fall back to showing a copyable address rather than pretending it worked.
+            self._set_model_status(f"could not open a browser — copy this address: {safe_markup(url)}")
+            self.notify(f"could not open a browser — copy this address: {url}", severity="warning")
+
+    def _validate_model(self) -> None:
+        """Run a REAL capability probe against the selected model (§14.2, §15)."""
+
+        if not self._capture_model(validate=True, gate=False):
+            return
+        model = self.state.model
+        if not model:
+            self._field_error("err-model", "choose or type a model first")
+            return
+        self.query_one("#model-verify", Static).update(
+            f"[dim]validating {safe_markup(model)} — text, streaming and tool calling…[/dim]"
+        )
+        self.run_worker(self._do_validate(model), exclusive=True)
+
+    async def _do_validate(self, model: str) -> None:
+        oa = self.app.oa  # type: ignore[attr-defined]
+        s = self.state
+        try:
+            if s.provider_mode == "existing" and s.provider_name:
+                probe = await oa.providers.probe_model(s.provider_name, model, refresh=True)
+            else:
+                probe = await oa.providers.probe_model_config(
+                    model_id=model, provider_type=s.provider_type or "custom", protocol=s.protocol,
+                    base_url=s.base_url, region=s.region, workspace_id=s.workspace_id,
+                    api_key=s.api_key.get_secret_value() if s.api_key else None,
+                    key_env=s.key_env,
+                )
+        except Exception as exc:  # noqa: BLE001 - surface any failure honestly, never as success
+            self._probe = None
+            self.query_one("#model-verify", Static).update(
+                f"[red]✗ could not validate: {safe_markup(str(exc), 200)}[/red]"
+            )
+            return
+        self._probe = probe
+        self.query_one("#model-verify", Static).update(_probe_line(probe))
+
+    def _verification_note(self) -> str:
+        probe = self._probe
+        if probe is None:
+            return "not validated"
+        return "verified agent compatible" if probe.agent_compatible else (
+            f"NOT verified ({probe.category})"
+        )
 
     def _refresh_models(self) -> None:
         self._set_model_status("[dim]discovering models…[/dim]")
@@ -636,17 +784,26 @@ class AddAgentScreen(Screen):
         self._apply_api_models(models)
 
     def _apply_api_models(self, models) -> None:
-        ids = [m.id for m in models]
         select = self.query_one("#model_select", Select)
-        if not ids:
+        self._catalog = list(models)
+        if not self._catalog:
             select.set_options([])
             self._set_model_status("[yellow]no models reported — enter a model id manually below[/yellow]")
             return
         self._model_method = "provider models"
-        select.set_options([(mid, mid) for mid in ids])
-        self._set_model_status(f"[green]loaded {len(ids)} model(s)[/green] — pick one below")
+        # Populate the publisher filter from what the catalog actually reported (§14.2).
+        owners = publishers(self._catalog)
+        self.query_one("#model-owner", Select).set_options([(o, o) for o in owners])
+        self._apply_catalog_filters()
 
-    def _capture_model(self, *, validate: bool) -> bool:
+    def _capture_model(self, *, validate: bool, gate: bool = True) -> bool:
+        """Write the model choice into state.
+
+        ``gate`` runs the mixed-catalog probe requirement (§14.3). It is skipped when the *Validate*
+        button itself is capturing the selection — that would be circular: you cannot require a probe
+        in order to run the probe.
+        """
+
         mode = self._radio_value("#model-mode", _MODEL_MODES) or "discovered"
         if mode == "default":
             if self.state.backend_type != "cli":
@@ -663,8 +820,9 @@ class AddAgentScreen(Screen):
                 self._field_error("err-model", "type a model id, or choose another option")
                 return False
             self.state.model = model
+            # A hand-typed id is never "discovered" and never implies verification (§14.4).
             self._model_status = "manual"
-            return True
+            return not (validate and gate) or self._model_is_allowed(model)
         # discovered
         chosen = selected_string(self.query_one("#model_select", Select))
         if validate and not chosen:
@@ -672,6 +830,33 @@ class AddAgentScreen(Screen):
             return False
         self.state.model = chosen
         self._model_status = "discovered"
+        return not (validate and gate) or self._model_is_allowed(chosen)
+
+    def _model_is_allowed(self, model: str | None) -> bool:
+        """Gate a mixed-catalog model on a real probe (§14.3, §15.2-§15.4).
+
+        Scoped to catalogs that mix model types (NVIDIA Build): there a model id proves nothing, so
+        continuing without a probe would build an agent that may simply not work. The user can always
+        tick the explicit, never-preselected override.
+        """
+
+        preset = self._preset()
+        if not preset or not preset.catalog_is_mixed or not model:
+            return True
+        if self.query_one("#allow-unverified", Checkbox).value:
+            return True  # explicit advanced override — surfaced loudly on Review
+        probe = self._probe
+        if probe is None or probe.model != model:
+            hint = (" This model id looks like it may not be a chat model."
+                    if looks_non_chat(model) else "")
+            self._field_error(
+                "err-model",
+                f"{model} has not been validated — press 'Validate Model & Key' first.{hint}",
+            )
+            return False
+        if not probe.agent_compatible:
+            self._field_error("err-model", probe.message())
+            return False
         return True
 
     # ------------------------------------------------------------------ review + create
@@ -696,6 +881,18 @@ class AddAgentScreen(Screen):
         ]
         if s.tags:
             lines.append(f"[b]Tags:[/b] {safe_markup(', '.join(s.tags))}")
+        if s.backend_type == "api":
+            # State the verification outcome plainly, and warn loudly when it is not verified —
+            # an override must never look like a normal success (§15.3).
+            lines.append(f"[b]Validation:[/b] {safe_markup(self._verification_note())}")
+            probe = self._probe
+            if probe is not None and probe.agent_compatible:
+                lines.append("[green]✓ Verified Agent Compatible[/green]")
+            elif self._preset() and self._preset().catalog_is_mixed:  # type: ignore[union-attr]
+                lines.append(
+                    "[b][yellow]⚠ WARNING — this model was NOT verified agent-compatible.[/yellow][/b]\n"
+                    "[yellow]It may answer questions but fail to operate OpenAgent tools.[/yellow]"
+                )
         self.query_one("#review-card", Static).update("\n".join(lines))
 
     def action_create(self) -> None:
@@ -792,6 +989,18 @@ class AddAgentScreen(Screen):
             if chosen:
                 # Mirror the pick into the manual field so switching modes keeps the value visible.
                 self.query_one("#model", Input).value = chosen
+                # A new selection invalidates the previous model's probe (§16): a "verified" badge
+                # must never carry over to a model that was not the one tested.
+                if self._probe is not None and self._probe.model != chosen:
+                    self._probe = None
+                    self.query_one("#model-verify", Static).update("")
+        elif event.select.id == "model-owner":
+            self._apply_catalog_filters()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Local, instant filtering — no network call per keystroke (§14.2).
+        if event.input.id == "model-search":
+            self._apply_catalog_filters()
 
     def _sync_cli_detail(self) -> None:
         entry = self._entry_for(self._radio_value("#cli", self._cli_values))
@@ -829,6 +1038,9 @@ class AddAgentScreen(Screen):
             pass
         self.state.clear_secret()
 
+    def _preset(self) -> ProviderPreset | None:
+        return get_preset(self.state.provider_type or "")
+
     def _sync_connection_fields(self) -> None:
         mode = self._radio_value("#conn-mode", ["new", "existing"]) or "new"
         is_new = mode == "new"
@@ -837,8 +1049,58 @@ class AddAgentScreen(Screen):
         cred = self._radio_value("#cred", self._cred_values) or "keychain"
         self.query_one("#key-row").display = is_new and cred == "keychain"
         self.query_one("#env-row").display = is_new and cred == "env"
+        if is_new:
+            self._sync_hosted_fields()
         if not is_new:
             self._populate_existing_connections()
+
+    def _sync_hosted_fields(self) -> None:
+        """Make the Connection step provider-aware (§13.1).
+
+        For a hosted catalog with published metadata (NVIDIA Build) the endpoint and protocol are
+        fixed facts, the key source defaults to the OS keychain, the env-var name is pre-filled, and
+        'No API key' is not offered at all — it is never a legitimate choice for a provider that
+        requires one.
+        """
+
+        preset = self._preset()
+        hosted = bool(preset and preset.catalog_url)
+        self.query_one("#hosted-info").display = hosted
+        self.query_one("#hosted-actions").display = hosted
+        self.query_one("#hosted-hint").display = hosted
+        # A provider that needs a key must not offer "no key" (§13.1).
+        none_button = self.query_one("#cred-none", RadioButton)
+        none_button.display = not (preset and preset.needs_key)
+        if not preset or not hosted:
+            # Only a hosted-catalog provider gets pre-filled defaults; for everything else the fields
+            # stay exactly as the user left them (switching provider clears them — part 19).
+            return
+        if hosted:
+            endpoint = preset.openai_base_url or ""
+            self.query_one("#hosted-info", Static).update(
+                f"[b]{safe_markup(preset.label)}[/b]\n"
+                f"Hosted NVIDIA NIM endpoints from build.nvidia.com.\n"
+                f"Use one NVIDIA API key to access available catalog models.\n"
+                f"[b]Official endpoint:[/b] {safe_markup(endpoint)}\n"
+                f"[b]Protocol:[/b] {safe_markup(preset.protocol.value)}"
+            )
+            self.query_one("#hosted-hint", Static).update(
+                "[b]How to get an API key[/b]\n"
+                "1. Sign in to NVIDIA Build.\n"
+                "2. Open a model page.\n"
+                "3. Click Generate API Key / Get API Key.\n"
+                f"4. Paste the key here, or save it as {safe_markup(preset.default_env_var or '')}.\n"
+                "5. Never put the key directly in a command.\n"
+                + (f"[dim]{safe_markup(preset.credential_hint or '')}[/dim]"
+                   if preset.credential_hint else "")
+            )
+        # Sensible provider-aware defaults the user can still override.
+        name_input = self.query_one("#conn_name", Input)
+        if not name_input.value.strip():
+            name_input.value = preset.provider_type
+        env_input = self.query_one("#key_env", Input)
+        if preset.default_env_var and not env_input.value.strip():
+            env_input.value = preset.default_env_var
 
     def _compatible_connections(self) -> list[str]:
         """Saved connections that belong to the **selected provider family** (part 19).
@@ -983,9 +1245,45 @@ def _provider_detail_text(name: str | None) -> str:
         return name
     where = "local service" if not p.needs_key else "cloud"
     key = "no API key" if not p.needs_key else "API key required"
+    lines = [f"[b]{p.label}[/b]"]
+    if p.catalog_url:
+        # A hosted catalog card states plainly what it is and what one key buys (§13).
+        lines.append("Hosted NVIDIA NIM endpoints from build.nvidia.com.")
+        lines.append("Use one NVIDIA API key to access available catalog models.")
+    lines.append(f"Protocol: {p.protocol.value}")
+    if p.openai_base_url:
+        lines.append(f"Endpoint: {p.openai_base_url}")
+    lines.append(f"{where} · {key}")
+    if p.catalog_is_mixed:
+        lines.append("Catalog mixes model types — a listing is not a capability claim; probe first.")
+    else:
+        lines.append("Model discovery: supported (best-effort) · Compatibility: adapter "
+                     "implemented, live-unverified")
+    return "\n".join(lines)
+
+
+def _catalog_label(model: RemoteModel) -> str:
+    """A catalog row: id, publisher, and an honest *hint* when it may not be a chat model (§14.3)."""
+
+    parts = [model.id]
+    if model.owned_by:
+        parts.append(f"· {model.owned_by}")
+    if looks_non_chat(model.id):
+        parts.append("· may not be a chat model")
+    return "  ".join(parts)
+
+
+def _probe_line(probe: AgentModelProbe) -> str:
+    """Render a probe verdict — only capabilities that were actually observed (§15.2)."""
+
+    mark = {True: "[green]yes[/green]", False: "[red]no[/red]",
+            None: "[yellow]unverified[/yellow]"}
+    caps = probe.capabilities
+    colour = "green" if probe.agent_compatible else "yellow"
     return (
-        f"[b]{p.label}[/b]\nProtocol: {p.protocol.value}\n{where} · {key}\n"
-        "Model discovery: supported (best-effort) · Compatibility: adapter implemented, live-unverified"
+        f"text {mark[bool(caps.text)]} · streaming {mark[caps.streaming]} · "
+        f"tool calling {mark[caps.tool_calling]}\n"
+        f"[{colour}]{safe_markup(probe.message())}[/{colour}]"
     )
 
 
