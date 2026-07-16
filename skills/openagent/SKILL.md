@@ -146,7 +146,17 @@ A run is only done when its `status` is terminal. Treat these distinctly — **n
 - `completed` — success.
 - `failed` — it did not finish; read `failure_type` and the failure section.
 - `cancelled` — stopped by a user/cancel.
-- `orphaned` — the process was lost (e.g. across a restart) and could not be reattached.
+- `orphaned` — OpenAgent lost ownership/observation of the run. **The underlying process may be
+  gone, reused, unverifiable, or still alive but unattached.** Inspect `failure_type` before acting.
+
+`orphaned` does **not** mean "the process is gone". Read `failure_type`:
+
+| `failure_type` | What it means | Is a process still running? |
+| --- | --- | --- |
+| `orphaned_pid_gone` | no such PID any more | no |
+| `orphaned_pid_reused` | that PID now belongs to an **unrelated** process | not ours — never touch it |
+| `orphaned_pid_unknown` | the PID is live but identity cannot be verified | unknown — fail closed |
+| `orphaned_unattached_process` | the backend process is **still alive**, just unowned | yes — it may still be running |
 
 If `status` is not terminal, the run is still going — do not assume success.
 
@@ -157,7 +167,20 @@ openagent cancel --id <run-id>
 ```
 
 Cancellation is real: it tears down the provider stream / kills the CLI process tree and records a
-single `run.cancelled`. Confirm with `openagent output --id <run-id> --format json`.
+single `run.cancelled` as the last event. Confirm with `openagent output --id <run-id> --format json`.
+
+It also works on an **orphaned** run:
+
+- `orphaned_unattached_process` may still be alive — `openagent cancel --id <run-id>` performs a
+  **PID + create-time identity verification** and only then terminates the process tree.
+- Any other orphan reason (gone / reused / unknown) is refused: the command exits non-zero and kills
+  nothing, because the recorded PID cannot be safely tied to this run.
+- **Never kill a PID manually without identity verification.** PIDs are reused; `kill <pid>` from a
+  run record can terminate an unrelated process. Always go through `openagent cancel`.
+
+`openagent cancel` never prints a false success. Trust its exit code and message:
+`terminated` / `signalled` (something was actually stopped), `already_terminal` (nothing to do),
+`not_found`, `identity_mismatch` or `not_cancellable` (nothing was stopped — non-zero exit).
 
 ## Following up / resuming
 
@@ -182,8 +205,55 @@ inspected.
 ## Handling failures
 
 - `failed` → read `failure_type` in `result.json`; surface the safe message, do not retry blindly.
-- `orphaned` → the process is gone; do not claim it completed. Start a fresh run if needed.
+- `orphaned` → OpenAgent lost track of the run; do not claim it completed. Read `failure_type`: with
+  `orphaned_unattached_process` the process may still be running — stop it with
+  `openagent cancel --id <run-id>` (never with a manual `kill`). Start a fresh run if needed.
+- `artifacts_partial: true` in `status.json`/`result.json` → the bundle was rebuilt by failure
+  recovery and is incomplete; read `artifact_failure.stage`. Never report such a run as completed.
 - Missing optional CLIs in `doctor` are warnings, not install failures.
+
+## NVIDIA Build (hosted NIM APIs)
+
+NVIDIA Build is a **hosted catalog** at `https://integrate.api.nvidia.com/v1` speaking OpenAI Chat
+Completions. One NVIDIA API key reaches the catalog's models. The catalog mixes model *types*, so a
+model id proves nothing until it is probed.
+
+```bash
+openagent provider list --json
+openagent provider models nvidia-build --json
+openagent provider probe nvidia-build --model <publisher/model> --json
+openagent add --name <name> --provider nvidia-build --model <publisher/model>
+```
+
+Add the connection with a hidden prompt (never argv), or reference an env var:
+
+```bash
+openagent provider add nvidia-build --type nvidia-build            # prompts for the key
+openagent provider add nvidia-build --type nvidia-build --key-env NVIDIA_API_KEY
+```
+
+Read the probe JSON, not prose:
+
+```json
+{"provider": "nvidia-build", "model": "…", "text": true, "streaming": true,
+ "tool_calling": true, "agent_compatible": true, "category": "verified", "tested_at": "…"}
+```
+
+Only `agent_compatible: true` (category `verified`) means the model can run an OpenAgent agent.
+
+Hard requirements:
+
+- **Never put `NVIDIA_API_KEY` (or any key) in argv.** Use the hidden prompt or `--key-env`.
+- **Never assume every NVIDIA catalog model is a chat model.** `provider models` reports
+  `capabilities: null` for every entry — that is the truth, not a gap to fill in.
+- **Probe before creating a normal agent.** `openagent add` refuses an unprobed mixed-catalog model
+  unless `--allow-unverified-model` is passed, which produces a warning you must relay.
+- Treat embedding / rerank / vision models as **unverified** until capability testing. Name-based
+  guesses are hints only, never verdicts.
+- `openagent provider test nvidia-build` only proves the **catalog is reachable** — it does not mean
+  the key is valid. Do not report it as "authenticated". Use `provider probe` to validate.
+- **Never expose `reasoning_content`.** OpenAgent never stores it; do not try to surface it.
+- Trust the machine-readable probe result and run status over any prose.
 
 ## Security rules (hard requirements)
 
@@ -203,7 +273,13 @@ inspected.
 - Resume/follow-up is CLI-only in v0.1.x and needs a reported session id.
 - Model listing exists only for CLIs/providers that actually expose it.
 - A restarted OpenAgent cannot reattach to a run started by a previous process — such runs are marked
-  `orphaned` (fail-closed), not silently "completed".
+  `orphaned` (fail-closed), not silently "completed". Their process may still be alive; stop it with
+  `openagent cancel --id <run-id>`, which verifies PID + create-time identity first.
+- NVIDIA Build's asynchronous (HTTP 202 + request id) model types are **not** supported by the chat
+  runtime; they fail explicitly rather than returning an empty answer.
+- The NVIDIA capability-probe cache is per-process and expires after 24h, so a fresh CLI invocation
+  does not see a probe from a previous one — pass `--allow-unverified-model` for non-interactive
+  creation, and say so in your report.
 
 ## Complete example
 
