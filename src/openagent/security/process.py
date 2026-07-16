@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 
@@ -25,6 +26,13 @@ import psutil
 from ..core.cancellation import RunCancellation, RunCancelled
 
 IS_WINDOWS = sys.platform.startswith("win")
+
+#: How much of a child's stderr to retain, as a ring buffer keeping the **tail** (§13). The last few
+#: KB is what actually diagnoses a failure; everything before it is noise a crash loop produced.
+MAX_STDERR_BYTES = 64_000
+_STDERR_CHUNK = 8192
+#: How long to let the stderr reader finish after stdout closes, before cancelling it.
+_STDERR_DRAIN_GRACE = 5.0
 
 #: Environment variables that are safe/necessary to inherit for a child CLI to function.
 _SAFE_ENV_KEYS = (
@@ -70,12 +78,22 @@ class ManagedProcess:
         *,
         cwd: Path,
         env: Mapping[str, str] | None = None,
+        max_stderr_bytes: int = MAX_STDERR_BYTES,
     ) -> None:
         self.args = list(args)
         self.cwd = cwd
         self.env = dict(env) if env is not None else minimal_environment()
         self._proc: asyncio.subprocess.Process | None = None
-        self._stderr: list[str] = []
+        #: A bounded ring of the most recent stderr bytes (§13). stdout has always had a real byte
+        #: cap (``run_capture``'s bounded reader); stderr was an unbounded ``list[str]``, so a backend
+        #: that logs hundreds of MB — a crash loop, a progress spinner, a debug flag — was buffered
+        #: in full, in RAM, for the whole run, then joined into one string on access. The tail is
+        #: what diagnoses a failure, so that is what is kept.
+        self._stderr_chunks: deque[bytes] = deque()
+        self._stderr_bytes = 0
+        self._stderr_total = 0
+        self._stderr_truncated = False
+        self._max_stderr_bytes = max_stderr_bytes
         self._cancelled = False
         self._create_time: float | None = None
 
@@ -114,17 +132,72 @@ class ManagedProcess:
             async for raw in self._proc.stdout:
                 yield raw.decode("utf-8", errors="replace").rstrip("\n")
         finally:
-            await stderr_task
+            # stdout is exhausted (the child exited or was killed). Give the stderr reader a bounded
+            # moment to finish draining, then stop it: a cancelled run must not leave a reader task
+            # attached to a dead pipe (§13).
+            if not stderr_task.done():
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=_STDERR_DRAIN_GRACE)
+                except (TimeoutError, asyncio.TimeoutError):
+                    stderr_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stderr_task
+            else:
+                await stderr_task
 
     async def _drain_stderr(self) -> None:
+        """Read stderr in fixed-size chunks into the bounded ring.
+
+        Chunks, not lines: ``async for raw in stream`` is line-based, and asyncio's StreamReader
+        raises ``LimitOverrunError`` once a single line exceeds its 64 KiB buffer — so one enormous
+        line (no newline) both defeated the bound and could break the reader.
+        """
+
         if self._proc is None or self._proc.stderr is None:
             return
-        async for raw in self._proc.stderr:
-            self._stderr.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+        stream = self._proc.stderr
+        while True:
+            chunk = await stream.read(_STDERR_CHUNK)
+            if not chunk:
+                return
+            self._absorb_stderr(chunk)
+
+    def _absorb_stderr(self, chunk: bytes) -> None:
+        self._stderr_total += len(chunk)
+        if len(chunk) >= self._max_stderr_bytes:
+            # A single chunk bigger than the whole budget: keep only its tail.
+            self._stderr_chunks.clear()
+            self._stderr_bytes = 0
+            chunk = chunk[-self._max_stderr_bytes :]
+            self._stderr_truncated = True
+        self._stderr_chunks.append(chunk)
+        self._stderr_bytes += len(chunk)
+        while self._stderr_bytes > self._max_stderr_bytes and len(self._stderr_chunks) > 1:
+            dropped = self._stderr_chunks.popleft()
+            self._stderr_bytes -= len(dropped)
+            self._stderr_truncated = True
+
+    @property
+    def stderr_total_bytes(self) -> int:
+        """Everything the child wrote to stderr, including what the ring dropped."""
+
+        return self._stderr_total
+
+    @property
+    def stderr_truncated(self) -> bool:
+        return self._stderr_truncated
 
     @property
     def stderr(self) -> str:
-        return "\n".join(self._stderr)
+        text = b"".join(self._stderr_chunks).decode("utf-8", errors="replace")
+        if not self._stderr_truncated:
+            return text
+        # Say plainly that this is a tail, and how much was produced — silent truncation would make
+        # a diagnosis look complete when it is not.
+        return (
+            f"[stderr truncated — kept the last {self._stderr_bytes} bytes of "
+            f"{self._stderr_total} produced]\n{text}"
+        )
 
     async def wait(self) -> int:
         assert self._proc is not None
