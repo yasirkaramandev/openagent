@@ -124,7 +124,7 @@ def test_rebuild_artifacts_accumulates_provider_cost(app: OpenAgentApp):
 
     run = Run(id="run_cost", agent="x", status=RunStatus.RUNNING)
     app.repos.runs.upsert(run)
-    log = EventLog(app.paths.run_dir(run.id))
+    log = EventLog(app.paths.run_dir(run.id), index=app.repos.event_index, run_id=run.id)
     for cost, inp in ((0.01, 10), (0.02, 3)):
         log.append(
             NormalizedEvent(
@@ -151,7 +151,7 @@ def test_rebuild_artifacts_cost_none_when_no_cost_reported(app: OpenAgentApp):
 
     run = Run(id="run_nocost", agent="x", status=RunStatus.RUNNING)
     app.repos.runs.upsert(run)
-    log = EventLog(app.paths.run_dir(run.id))
+    log = EventLog(app.paths.run_dir(run.id), index=app.repos.event_index, run_id=run.id)
     log.append(
         NormalizedEvent(
             run_id=run.id,

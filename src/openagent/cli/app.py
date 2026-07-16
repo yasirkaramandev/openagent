@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from pathlib import Path
 from typing import NoReturn
 
 import typer
@@ -30,6 +32,7 @@ from ..providers.discovery import (
 )
 from ..providers.factory import PRESETS, get_preset, preset_names
 from ..services.agent_service import AgentError
+from ..services.project_service import ProjectError
 from ..services.provider_service import ProviderInUseError, ProviderValidationError
 from ..services.run_service import CancelOutcome, RunError
 from ..tui.markup import safe_line, safe_markup
@@ -41,8 +44,12 @@ app = typer.Typer(
 )
 provider_app = typer.Typer(help="Manage API provider connections.")
 agent_app = typer.Typer(help="Manage agents.")
+events_app = typer.Typer(help="Inspect and repair event exports.")
+project_app = typer.Typer(help="Manage stable project identities.")
 app.add_typer(provider_app, name="provider")
 app.add_typer(agent_app, name="agent")
+app.add_typer(events_app, name="events")
+app.add_typer(project_app, name="project")
 
 console = Console()
 err = Console(stderr=True)
@@ -61,6 +68,12 @@ def _fail(message: str) -> NoReturn:
     # a crafted name can't forge or corrupt the terminal output (item 12).
     err.print(f"[red]error:[/red] {safe_markup(message)}")
     raise typer.Exit(1)
+
+
+def emit_json(data: object) -> None:
+    """Write one complete machine-readable value directly to stdout."""
+
+    sys.stdout.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 # --------------------------------------------------------------------------- top-level
@@ -210,11 +223,19 @@ def list_agents(json_out: bool = typer.Option(False, "--json")) -> None:
 
 
 @app.command("runs")
-def runs(limit: int = typer.Option(20, "--limit")) -> None:
+def runs(
+    limit: int = typer.Option(20, "--limit"),
+    json_out: bool = typer.Option(False, "--json"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
+) -> None:
     """List recent runs."""
     oa = _app()
+    recent = oa.runs.list(limit, all_projects=all_projects)
+    if json_out:
+        emit_json([run.model_dump(mode="json") for run in recent])
+        return
     table = Table("ID", "Agent", "Status", "Started", "Files")
-    for run in oa.runs.list(limit):
+    for run in recent:
         status = enum_value(run.status)
         table.add_row(
             safe_line(run.id),
@@ -285,11 +306,12 @@ def output(
     format: str = typer.Option(
         "md", "--format", help="md|json|diff|logs|events|handoff|status|tests"
     ),
+    all_projects: bool = typer.Option(False, "--all-projects"),
 ) -> None:
     """Print a run artifact (spec §32)."""
     oa = _app()
     try:
-        artifact = oa.runs.output(id, format)
+        artifact = oa.runs.output(id, format, all_projects=all_projects)
     except RunError as exc:
         _fail(str(exc))
     # Emit the artifact **verbatim**. ``console.print`` soft-wraps at the console width (80 when
@@ -302,11 +324,12 @@ def output(
 def message(
     id: str = typer.Option(..., "--id"),
     prompt: str = typer.Option(..., "--prompt", "-p"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
 ) -> None:
     """Continue a run's session with a new prompt (spec §32)."""
     oa = _app()
     try:
-        result = _run(oa.runs.resume(id, prompt, on_event=_print_event))
+        result = _run(oa.runs.resume(id, prompt, on_event=_print_event, all_projects=all_projects))
     except RunError as exc:
         _fail(str(exc))
     status = enum_value(result.status)
@@ -315,21 +338,26 @@ def message(
 
 @app.command()
 def resume(
-    id: str = typer.Option(..., "--id"), prompt: str = typer.Option("continue", "--prompt", "-p")
+    id: str = typer.Option(..., "--id"),
+    prompt: str = typer.Option("continue", "--prompt", "-p"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
 ) -> None:
     """Resume a run (spec §32)."""
-    message(id=id, prompt=prompt)
+    message(id=id, prompt=prompt, all_projects=all_projects)
 
 
 @app.command()
-def cancel(id: str = typer.Option(..., "--id")) -> None:
+def cancel(
+    id: str = typer.Option(..., "--id"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
+) -> None:
     """Cancel a running run (spec §32, §3.3).
 
     Reports exactly what happened and never claims a false success: a run that was already finished,
     or an orphaned run whose recorded process is gone/reused, is reported as such (non-zero exit for
     the cases where nothing was stopped).
     """
-    outcome = _run(_app().runs.cancel(id))
+    outcome = _run(_app().runs.cancel(id, all_projects=all_projects))
     safe_id = safe_markup(id)
     if outcome is CancelOutcome.TERMINATED:
         console.print(f"[yellow]cancelled[/yellow] {safe_id} — process tree terminated")
@@ -341,6 +369,8 @@ def cancel(id: str = typer.Option(..., "--id")) -> None:
         console.print(f"[dim]{safe_id} has already finished; nothing to cancel[/dim]")
     elif outcome is CancelOutcome.NOT_FOUND:
         _fail(f"run {id!r} not found")
+    elif outcome is CancelOutcome.WRONG_PROJECT:
+        _fail(f"{id}: run belongs to another project; pass --all-projects explicitly")
     elif outcome is CancelOutcome.ALREADY_GONE:
         _fail(f"{id}: the recorded process has already exited; the run was left untouched.")
     elif outcome is CancelOutcome.IDENTITY_UNKNOWN:
@@ -371,7 +401,7 @@ def doctor(json_out: bool = typer.Option(False, "--json")) -> None:
     oa = _app()
     checks = _run(oa.doctor.run())
     if json_out:
-        console.print_json(data={"checks": [c.to_dict() for c in checks]})
+        emit_json({"checks": [c.to_dict() for c in checks]})
         return
     marks = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
     for check in checks:
@@ -379,6 +409,53 @@ def doctor(json_out: bool = typer.Option(False, "--json")) -> None:
             f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
             + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else "")
         )
+
+
+@events_app.command("repair")
+def events_repair(
+    id: str = typer.Option(..., "--id"),
+    json_out: bool = typer.Option(False, "--json"),
+    all_projects: bool = typer.Option(False, "--all-projects"),
+) -> None:
+    """Regenerate JSONL from the authoritative SQLite event bodies."""
+
+    try:
+        result = _app().runs.repair_event_export(id, all_projects=all_projects)
+    except RunError as exc:
+        _fail(str(exc))
+    if json_out:
+        emit_json(result)
+    else:
+        console.print(
+            f"[green]✓[/green] repaired {safe_markup(id)} event export "
+            f"({result['events']} events, {result['terminal_count']} terminal)"
+        )
+
+
+@project_app.command("list")
+def project_list(json_out: bool = typer.Option(False, "--json")) -> None:
+    projects = _app().projects.list()
+    if json_out:
+        emit_json([project.model_dump(mode="json") for project in projects])
+        return
+    table = Table("ID", "State", "Root")
+    for project in projects:
+        table.add_row(safe_line(project.id), safe_line(project.state), safe_line(project.root))
+    console.print(table)
+
+
+@project_app.command("relocate")
+def project_relocate(
+    id: str = typer.Option(..., "--id"), root: Path = typer.Option(..., "--root")
+) -> None:
+    try:
+        project = _app().projects.relocate(id, root)
+    except ProjectError as exc:
+        _fail(str(exc))
+    console.print(
+        f"[green]✓[/green] relocated project {safe_markup(project.id)} to "
+        f"{safe_markup(project.root)}"
+    )
 
 
 @app.command("mcp")
@@ -448,7 +525,7 @@ def provider_list(json_out: bool = typer.Option(False, "--json")) -> None:
     oa = _app()
     providers = oa.providers.list()
     if json_out:
-        console.print_json(data=[p.model_dump(mode="json") for p in providers])
+        emit_json([p.model_dump(mode="json") for p in providers])
         return
     table = Table("Name", "Type", "Protocol", "Base URL", "Key")
     for p in providers:
@@ -513,17 +590,13 @@ def provider_models(
     oa = _app()
     models = filter_models(_run(oa.providers.remote_models(name)), search=search, owner=owner)
     if json_out:
-        # Emit verbatim: console.print_json would soft-wrap and corrupt machine-readable output.
-        typer.echo(
-            json.dumps(
-                {
-                    "provider": name,
-                    "models": [
-                        {"id": m.id, "owned_by": m.owned_by, "capabilities": None} for m in models
-                    ],
-                },
-                indent=2,
-            )
+        emit_json(
+            {
+                "provider": name,
+                "models": [
+                    {"id": m.id, "owned_by": m.owned_by, "capabilities": None} for m in models
+                ],
+            }
         )
         return
     if not models:
@@ -573,7 +646,7 @@ def _print_probe(name: str, model: str, *, json_out: bool, refresh: bool) -> Non
     except ProviderValidationError as exc:
         _fail(str(exc))
     if json_out:
-        typer.echo(json.dumps({"provider": name, **probe.to_dict()}, indent=2))
+        emit_json({"provider": name, **probe.to_dict()})
     else:
         caps = probe.capabilities
         mark = {
@@ -694,7 +767,7 @@ def agent_show(name: str = typer.Argument(...)) -> None:
     agent = _app().agents.get(name)
     if not agent:
         _fail(f"agent {name!r} not found")
-    console.print_json(data=agent.model_dump(mode="json"))
+    emit_json(agent.model_dump(mode="json"))
 
 
 @agent_app.command("remove")
@@ -711,7 +784,7 @@ def agent_remove(name: str = typer.Argument(...)) -> None:
 def _print_agents(oa: OpenAgentApp, json_out: bool) -> None:
     agents = oa.agents.list()
     if json_out:
-        console.print_json(data=[a.model_dump(mode="json") for a in agents])
+        emit_json([a.model_dump(mode="json") for a in agents])
         return
     table = Table("Name", "Title", "Runtime", "Tags", "Profile")
     for a in agents:

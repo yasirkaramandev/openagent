@@ -1,47 +1,82 @@
-"""Project identity (spec §3).
-
-OpenAgent keeps **one SQLite database per user** (in the platform data dir) but writes **run
-artifacts next to each project** (``<project>/.openagent/runs/<run-id>/``). Nothing tied the two
-together, which made several behaviours wrong once a second project existed:
-
-* ``recover_orphans()`` walked every active run in the global DB, so opening OpenAgent in project B
-  marked project A's genuinely-running run as orphaned;
-* ``output()``/``projection()`` resolved artifacts from the *current* ``Paths`` — i.e. the directory
-  you happened to be in — so asking project B for project A's run looked in the wrong place;
-* run lists mixed every project together with no way to tell them apart.
-
-A run therefore records where it came from: a stable ``project_id``, the canonical ``project_root``,
-the ``project_state_dir`` and the concrete ``artifact_dir``. The id is derived from the *resolved*
-path so that symlinked or differently-spelled routes to the same directory agree, and it is stored so
-that later moving the project does not silently reassign old runs.
-"""
+"""Stable project UUID marker and relocation identity helpers."""
 
 from __future__ import annotations
 
 import hashlib
+import json
+import uuid
 from pathlib import Path
+
+from ..core.models import Project
+from ..security.atomic import atomic_write_text
+from ..security.filesystem import UnsafeWorkspacePath
+
+PROJECT_MARKER_VERSION = 1
 
 
 def canonical_root(project_root: Path) -> Path:
-    """The canonical form of a project root.
-
-    Resolved so that ``/tmp/x`` and ``/private/tmp/x`` (macOS), a symlinked checkout, or a relative
-    path all produce the same identity. Falls back to an absolute path when the directory cannot be
-    resolved (it may not exist yet).
-    """
-
     try:
         return project_root.resolve()
-    except (OSError, RuntimeError):  # pragma: no cover - unresolvable path
+    except (OSError, RuntimeError):
         return project_root.absolute()
 
 
-def project_id_for(project_root: Path) -> str:
-    """A stable, filesystem-safe id for a project directory.
-
-    A hash of the canonical path: short, stable across runs, and free of separators/case issues that
-    would make the raw path awkward as a key. It identifies *a directory*, not its contents.
-    """
-
+def legacy_project_id_for(project_root: Path) -> str:
     digest = hashlib.sha256(str(canonical_root(project_root)).encode("utf-8")).hexdigest()
     return f"proj_{digest[:16]}"
+
+
+def marker_path(project_root: Path) -> Path:
+    return canonical_root(project_root) / ".openagent" / "project.json"
+
+
+def read_project_marker(project_root: Path) -> Project | None:
+    path = marker_path(project_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        project_id = str(uuid.UUID(str(payload["id"])))
+        version = int(payload["version"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if version != PROJECT_MARKER_VERSION:
+        return None
+    return Project(id=project_id, root=str(canonical_root(project_root)), marker_version=version)
+
+
+def write_project_marker(project: Project) -> None:
+    root = canonical_root(Path(project.root))
+    state_dir = root / ".openagent"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        info = state_dir.lstat()
+        if state_dir.is_symlink() or not state_dir.is_dir():
+            raise UnsafeWorkspacePath(f"project state path is not a real directory: {state_dir}")
+        del info
+    except OSError as exc:
+        raise UnsafeWorkspacePath(f"cannot verify project state directory: {state_dir}") from exc
+    atomic_write_text(
+        state_dir / "project.json",
+        json.dumps(
+            {
+                "version": PROJECT_MARKER_VERSION,
+                "id": project.id,
+                "root": str(root),
+            },
+            indent=2,
+        ),
+        mode=0o600,
+    )
+
+
+def ensure_project_marker(project_root: Path) -> Project:
+    existing = read_project_marker(project_root)
+    if existing is not None:
+        return existing
+    project = Project(id=str(uuid.uuid4()), root=str(canonical_root(project_root)))
+    write_project_marker(project)
+    return project
+
+
+def project_id_for(project_root: Path) -> str:
+    marker = read_project_marker(project_root)
+    return marker.id if marker else legacy_project_id_for(project_root)

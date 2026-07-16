@@ -34,6 +34,7 @@ from openagent.security.process import (
     is_pid_alive,
     terminate_process_tree,
 )
+from openagent.services.run_service import RunError
 from openagent.storage.event_log import EventLog
 from openagent.storage.projects import project_id_for
 
@@ -187,8 +188,10 @@ def test_artifacts_resolve_through_the_recorded_dir_not_the_current_project(two_
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "result.json").write_text(json.dumps({"status": "completed", "from": "project_a"}))
 
-    # app_b's ambient Paths point at project B; the run says it lives in project A.
-    payload = json.loads(app_b.runs.output(run.id, "json"))
+    # Cross-project output is denied unless the caller explicitly opts into the global authority.
+    with pytest.raises(RunError, match="another project"):
+        app_b.runs.output(run.id, "json")
+    payload = json.loads(app_b.runs.output(run.id, "json", all_projects=True))
     assert payload["from"] == "project_a"
 
 
@@ -211,7 +214,9 @@ def test_projection_uses_the_recorded_artifact_dir(two_apps):
         )
     )
     # Read the projection from the *other* project's app: it must actually find A's events.
-    projection = app_b.runs.projection(run.id)
+    with pytest.raises(RunError, match="another project"):
+        app_b.runs.projection(run.id)
+    projection = app_b.runs.projection(run.id, all_projects=True)
     assert projection.run_id == run.id
     assert projection.phase == "running", (
         "the projection replayed nothing — it read the wrong project's artifact directory"
@@ -226,7 +231,9 @@ async def test_cancel_uses_the_owning_projects_artifact_dir(two_apps):
     try:
         run = _live_run_in(app_a, proc.pid)
 
-        outcome = await app_b.runs.cancel(run.id)
+        assert (await app_b.runs.cancel(run.id)).value == "wrong_project"
+        assert is_pid_alive(proc.pid)
+        outcome = await app_b.runs.cancel(run.id, all_projects=True)
         assert outcome.value == "terminated"
 
         deadline = time.monotonic() + 5.0

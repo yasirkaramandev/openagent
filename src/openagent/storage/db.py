@@ -15,16 +15,20 @@ from pathlib import Path
 from sqlalchemy import (
     JSON,
     Column,
+    Float,
+    ForeignKey,
     Integer,
     MetaData,
     String,
     Table,
+    UniqueConstraint,
     create_engine,
+    event,
     insert,
 )
 from sqlalchemy.engine import Engine
 
-from .migrations import LATEST_VERSION, run_migrations
+from .migrations import LATEST_VERSION, MigrationReport, run_migrations
 
 #: The schema this build understands. Owned by ``migrations.MIGRATIONS`` so the number and the DDL
 #: cannot drift apart — the old constant could be bumped without any migration existing.
@@ -46,6 +50,18 @@ provider_connections = Table(
     Column("name", String, unique=True, nullable=False),
     Column("provider_type", String, nullable=False),
     Column("enabled", Integer, nullable=False, default=1),
+    Column("data", JSON, nullable=False),
+)
+
+projects = Table(
+    "projects",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("root", String, nullable=False, unique=True),
+    Column("state", String, nullable=False, default="active"),
+    Column("marker_version", Integer, nullable=False, default=1),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
     Column("data", JSON, nullable=False),
 )
 
@@ -92,10 +108,18 @@ runs = Table(
     # Project identity (spec §3). The DB is global (one per user) while artifacts are project-local,
     # so a run must record which project it belongs to and where its artifacts actually live —
     # otherwise scoping and artifact resolution have to guess from the current directory.
-    Column("project_id", String, index=True),
+    Column("project_id", String, ForeignKey("projects.id"), index=True),
     Column("project_root", String),
     Column("project_state_dir", String),
     Column("artifact_dir", String),
+    Column("pid", Integer),
+    Column("process_create_time", Float),
+    Column("process_executable", String),
+    Column("command_identity", String),
+    Column("execution_backend", String, nullable=False, default="host-restricted"),
+    Column("container_runtime", String),
+    Column("container_image", String),
+    Column("agent_commit_sha", String),
     Column("data", JSON, nullable=False),
 )
 
@@ -136,6 +160,15 @@ events = Table(
     Column("type", String, nullable=False),
     Column("timestamp", String, nullable=False),
     Column("source", String, nullable=False),
+    Column("body", JSON, nullable=False),
+    UniqueConstraint("run_id", "seq", name="uq_events_run_seq"),
+)
+
+event_sequences = Table(
+    "event_sequences",
+    metadata,
+    Column("run_id", String, primary_key=True),
+    Column("next_seq", Integer, nullable=False),
 )
 
 usage_records = Table(
@@ -160,10 +193,12 @@ class Database:
         engine = create_engine(
             f"sqlite:///{db_path}",
             future=True,
+            connect_args={"timeout": 30},
             json_serializer=lambda obj: (
                 obj if isinstance(obj, str) else __import__("json").dumps(obj)
             ),
         )
+        _configure_sqlite(engine)
         db = cls(engine)
         db.migrate(db_path=db_path)
         return db
@@ -171,11 +206,12 @@ class Database:
     @classmethod
     def in_memory(cls) -> Database:
         engine = create_engine("sqlite://", future=True)
+        _configure_sqlite(engine)
         db = cls(engine)
         db.migrate()
         return db
 
-    def migrate(self, db_path: Path | None = None) -> int:
+    def migrate(self, db_path: Path | None = None) -> MigrationReport:
         """Bring the schema up to date through the real migration runner (spec §15).
 
         This used to be ``create_all()`` + ``UPDATE schema_meta SET version``, which would happily
@@ -197,3 +233,14 @@ class Database:
             return True
         except Exception:  # pragma: no cover - environment dependent
             return False
+
+
+def _configure_sqlite(engine: Engine) -> None:
+    @event.listens_for(engine, "connect")
+    def _set_pragmas(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()

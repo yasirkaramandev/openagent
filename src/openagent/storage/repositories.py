@@ -6,16 +6,21 @@ read, keeping indexed columns in sync for querying.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, insert, or_, select, update
-from sqlalchemy.exc import IntegrityError
 
+from ..core.events import EventType, NormalizedEvent
+from ..core.limits import RUNTIME_LIMITS
 from ..core.models import (
     AgentProfile,
     CliInstallation,
     ModelProfile,
+    Project,
     ProviderConnection,
     Run,
     RunStatus,
@@ -175,6 +180,112 @@ class CliRepository:
             conn.execute(sa_delete(t.cli_installations).where(t.cli_installations.c.id == cli_id))
 
 
+class ProjectRepository:
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def upsert(self, project: Project) -> None:
+        values = {
+            "root": project.root,
+            "state": project.state,
+            "marker_version": project.marker_version,
+            "created_at": project.created_at.isoformat(),
+            "updated_at": project.updated_at.isoformat(),
+            "data": project.model_dump(mode="json"),
+        }
+        with self.db.engine.begin() as conn:
+            result = conn.execute(
+                update(t.projects).where(t.projects.c.id == project.id).values(**values)
+            )
+            if result.rowcount == 0:
+                conn.execute(insert(t.projects).values(id=project.id, **values))
+
+    def get(self, project_id: str) -> Project | None:
+        with self.db.engine.connect() as conn:
+            row = conn.execute(
+                select(t.projects.c.data).where(t.projects.c.id == project_id)
+            ).first()
+        return Project.model_validate(row[0]) if row else None
+
+    def get_by_root(self, root: str) -> Project | None:
+        with self.db.engine.connect() as conn:
+            row = conn.execute(select(t.projects.c.data).where(t.projects.c.root == root)).first()
+        return Project.model_validate(row[0]) if row else None
+
+    def list(self) -> Sequence[Project]:
+        with self.db.engine.connect() as conn:
+            rows = conn.execute(select(t.projects.c.data).order_by(t.projects.c.root)).all()
+        return [Project.model_validate(row[0]) for row in rows]
+
+    def relocate(self, project_id: str, new_root: Path) -> Project:
+        project = self.get(project_id)
+        if project is None:
+            raise KeyError(project_id)
+        old_root = Path(project.root)
+        new_root = new_root.resolve()
+        updated = project.model_copy(
+            update={
+                "root": str(new_root),
+                "state": "active",
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        with self.db.engine.begin() as conn:
+            conflict = conn.execute(
+                select(t.projects.c.id).where(
+                    t.projects.c.root == str(new_root), t.projects.c.id != project_id
+                )
+            ).first()
+            if conflict:
+                raise ValueError(f"project root already belongs to {conflict[0]}")
+            conn.execute(
+                update(t.projects)
+                .where(t.projects.c.id == project_id)
+                .values(
+                    root=updated.root,
+                    state=updated.state,
+                    marker_version=updated.marker_version,
+                    updated_at=updated.updated_at.isoformat(),
+                    data=updated.model_dump(mode="json"),
+                )
+            )
+            rows = conn.execute(
+                select(t.runs.c.id, t.runs.c.data).where(t.runs.c.project_id == project_id)
+            ).all()
+            for run_id, payload in rows:
+                run = Run.model_validate(payload)
+
+                def moved(value: str | None) -> str | None:
+                    if not value:
+                        return value
+                    try:
+                        relative = Path(value).relative_to(old_root)
+                    except ValueError:
+                        return value
+                    return str(new_root / relative)
+
+                run.project_root = str(new_root)
+                run.project_state_dir = str(new_root / ".openagent")
+                run.artifact_dir = str(new_root / ".openagent" / "runs" / run_id)
+                run.workspace = moved(run.workspace) or run.workspace
+                run.worktree = moved(run.worktree)
+                run.source_path = moved(run.source_path)
+                run.baseline_dir = moved(run.baseline_dir)
+                conn.execute(
+                    update(t.runs)
+                    .where(t.runs.c.id == run_id)
+                    .values(
+                        workspace=run.workspace,
+                        worktree=run.worktree,
+                        project_root=run.project_root,
+                        project_state_dir=run.project_state_dir,
+                        artifact_dir=run.artifact_dir,
+                        data=run.model_dump(mode="json"),
+                    )
+                )
+        return updated
+
+
 class RunRepository:
     def __init__(self, database: Database) -> None:
         self.db = database
@@ -198,6 +309,22 @@ class RunRepository:
                     project_root=run.project_root,
                     project_state_dir=run.project_state_dir,
                     artifact_dir=run.artifact_dir,
+                    pid=run.process_identity.pid if run.process_identity else run.pid,
+                    process_create_time=(
+                        run.process_identity.create_time
+                        if run.process_identity
+                        else run.pid_started_at
+                    ),
+                    process_executable=(
+                        run.process_identity.executable if run.process_identity else None
+                    ),
+                    command_identity=(
+                        run.process_identity.command_identity if run.process_identity else None
+                    ),
+                    execution_backend=run.execution_backend,
+                    container_runtime=run.container_runtime,
+                    container_image=run.container_image,
+                    agent_commit_sha=run.agent_commit_sha,
                     data=run.model_dump(mode="json"),
                 )
             )
@@ -218,6 +345,20 @@ class RunRepository:
             "project_root": run.project_root,
             "project_state_dir": run.project_state_dir,
             "artifact_dir": run.artifact_dir,
+            "pid": run.process_identity.pid if run.process_identity else run.pid,
+            "process_create_time": (
+                run.process_identity.create_time if run.process_identity else run.pid_started_at
+            ),
+            "process_executable": (
+                run.process_identity.executable if run.process_identity else None
+            ),
+            "command_identity": (
+                run.process_identity.command_identity if run.process_identity else None
+            ),
+            "execution_backend": run.execution_backend,
+            "container_runtime": run.container_runtime,
+            "container_image": run.container_image,
+            "agent_commit_sha": run.agent_commit_sha,
             "data": run.model_dump(mode="json"),
         }
 
@@ -324,64 +465,66 @@ class SessionRepository:
 
 
 class EventIndexRepository:
-    """Indexes events by run (bodies live in events.jsonl)."""
+    """SQLite-authoritative event body store and per-run sequence allocator."""
 
     def __init__(self, database: Database) -> None:
         self.db = database
 
-    #: How many times to re-read the sequence after losing a race for it. Each retry means another
-    #: writer committed our number first; bounded so a pathological loop cannot spin forever.
-    _SEQ_RETRIES = 8
-
     def append(self, event_id: str, run_id: str, type_: str, timestamp: str, source: str) -> int:
-        """Allocate this run's next sequence number and insert the row, atomically (spec §11).
+        event = NormalizedEvent(
+            id=event_id,
+            run_id=run_id,
+            type=EventType(type_),
+            timestamp=timestamp,
+            source=source,
+            data={"legacy_append_api": True},
+        )
+        return self.append_event(event)
 
-        This replaces ``next_seq()`` (a ``SELECT max(seq)+1`` on its own read connection) followed by
-        a separate ``add()`` write. Read-then-write across two connections is not atomic: two
-        appenders to the same run — the CLI and the TUI, or two threads of one run — both read
-        ``max=N``, both compute ``N+1``, and both write it. Nothing between the two statements held
-        the value, and the JSONL line is written *before* this call, so the loser of the race got an
-        IntegrityError with its event already on disk: an orphan line and an index that disagrees
-        with the log it indexes.
-
-        Both statements now run in **one** ``engine.begin()`` transaction. SQLite serialises writers,
-        so the allocation a writer commits is the one the next writer reads. The UNIQUE index on
-        ``(run_id, seq)`` from migration m004 becomes the backstop rather than the discovery
-        mechanism: a writer that still loses retries with a freshly read maximum instead of failing.
-
-        Returns the sequence number actually allocated.
-        """
-
-        for attempt in range(self._SEQ_RETRIES):
-            try:
-                with self.db.engine.begin() as conn:
-                    row = conn.execute(
-                        select(func.max(t.events.c.seq)).where(t.events.c.run_id == run_id)
-                    ).first()
-                    seq = ((row[0] if row else 0) or 0) + 1
-                    conn.execute(
-                        insert(t.events).values(
-                            id=event_id,
-                            run_id=run_id,
-                            seq=seq,
-                            type=type_,
-                            timestamp=timestamp,
-                            source=source,
-                        )
-                    )
-                return seq
-            except IntegrityError:
-                # Either we lost the (run_id, seq) race, or this event id is genuinely a duplicate.
-                # Only the former is retryable: re-inserting a duplicate id would spin until the
-                # budget ran out and then report a misleading "contention" failure.
-                if self._event_exists(event_id) or attempt == self._SEQ_RETRIES - 1:
-                    raise
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    def _event_exists(self, event_id: str) -> bool:
+    def append_event(self, event: NormalizedEvent) -> int:
+        payload = event.model_dump(mode="json")
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(encoded) > RUNTIME_LIMITS.event_data_bytes:
+            raise ValueError(f"event body exceeds {RUNTIME_LIMITS.event_data_bytes} bytes")
+        type_ = event.type if isinstance(event.type, str) else event.type.value
+        timestamp = event.timestamp
         with self.db.engine.connect() as conn:
-            row = conn.execute(select(t.events.c.id).where(t.events.c.id == event_id)).first()
-        return row is not None
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                state = conn.execute(
+                    select(t.event_sequences.c.next_seq).where(
+                        t.event_sequences.c.run_id == event.run_id
+                    )
+                ).first()
+                seq = int(state[0]) if state else 1
+                if seq > RUNTIME_LIMITS.events_per_run:
+                    raise ValueError(f"run event count exceeds {RUNTIME_LIMITS.events_per_run}")
+                conn.execute(
+                    insert(t.events).values(
+                        id=event.id,
+                        run_id=event.run_id,
+                        seq=seq,
+                        type=type_,
+                        timestamp=timestamp,
+                        source=event.source,
+                        body=payload,
+                    )
+                )
+                if state:
+                    conn.execute(
+                        update(t.event_sequences)
+                        .where(t.event_sequences.c.run_id == event.run_id)
+                        .values(next_seq=seq + 1)
+                    )
+                else:
+                    conn.execute(
+                        insert(t.event_sequences).values(run_id=event.run_id, next_seq=seq + 1)
+                    )
+                conn.commit()
+                return seq
+            except BaseException:
+                conn.rollback()
+                raise
 
     def sequences_for(self, run_id: str) -> list[int]:
         """Every indexed sequence number for a run, in order. For recovery checks and tests."""
@@ -391,6 +534,26 @@ class EventIndexRepository:
                 select(t.events.c.seq).where(t.events.c.run_id == run_id).order_by(t.events.c.seq)
             ).all()
         return [r[0] for r in rows]
+
+    def read(self, run_id: str) -> list[NormalizedEvent]:
+        with self.db.engine.connect() as conn:
+            rows = conn.execute(
+                select(t.events.c.body).where(t.events.c.run_id == run_id).order_by(t.events.c.seq)
+            ).all()
+        return [NormalizedEvent.model_validate(row[0]) for row in rows]
+
+    def read_raw(self, run_id: str) -> list[dict]:
+        return [event.model_dump(mode="json") for event in self.read(run_id)]
+
+    def terminal_count(self, run_id: str) -> int:
+        terminals = ("run.completed", "run.failed", "run.cancelled")
+        with self.db.engine.connect() as conn:
+            row = conn.execute(
+                select(func.count())
+                .select_from(t.events)
+                .where(t.events.c.run_id == run_id, t.events.c.type.in_(terminals))
+            ).first()
+        return int(row[0]) if row else 0
 
     def count(self, run_id: str) -> int:
         with self.db.engine.connect() as conn:
@@ -475,6 +638,7 @@ class Repositories:
         self.models = ModelRepository(database)
         self.agents = AgentRepository(database)
         self.clis = CliRepository(database)
+        self.projects = ProjectRepository(database)
         self.runs = RunRepository(database)
         self.sessions = SessionRepository(database)
         self.event_index = EventIndexRepository(database)

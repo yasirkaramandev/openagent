@@ -21,6 +21,7 @@ from ..runtimes.cli.registry import (
     cli_registry_entries,
     known_cli_types,
 )
+from ..storage.event_log import EventLog
 from ..workspaces.worktree import is_git_repo
 
 if TYPE_CHECKING:
@@ -80,6 +81,7 @@ class DoctorService:
         checks.extend(await self._cli_checks())
         checks.extend(self._provider_checks())
         checks.extend(self._agent_checks())
+        checks.append(self._event_store_check())
         checks.append(self._openagent_md_check())
         return checks
 
@@ -232,6 +234,39 @@ class DoctorService:
             OK if synced else WARN,
             "up to date" if synced else "stale; re-run `openagent add`/`remove`",
         )
+
+    def _event_store_check(self) -> Check:
+        issues: list[str] = []
+        repairable = 0
+        for run in self.app.runs.list(limit=1_000):
+            sequences = self.app.repos.event_index.sequences_for(run.id)
+            expected = list(range(1, len(sequences) + 1))
+            if sequences != expected:
+                issues.append(f"{run.id}: sequence discontinuity")
+            if len(sequences) != len(set(sequences)):
+                issues.append(f"{run.id}: duplicate sequence")
+            terminals = self.app.repos.event_index.terminal_count(run.id)
+            terminal_status = run.status.value in {"completed", "failed", "cancelled"}
+            if terminals > 1 or (terminal_status and terminals != 1):
+                issues.append(f"{run.id}: terminal count {terminals}")
+            path = self.app.runs.run_dir_for(run) / "events.jsonl"
+            try:
+                exported = EventLog(path.parent).read_raw()
+                exported_ids = [event.get("id") for event in exported]
+            except (OSError, ValueError):
+                exported_ids = []
+            database_ids = [event["id"] for event in self.app.repos.event_index.read_raw(run.id)]
+            if exported_ids != database_ids:
+                repairable += 1
+        if issues:
+            return Check("Event store integrity", FAIL, "; ".join(issues[:10]))
+        if repairable:
+            return Check(
+                "Event store integrity",
+                WARN,
+                f"SQLite bodies valid; {repairable} JSONL export(s) differ and can be repaired",
+            )
+        return Check("Event store integrity", OK, "continuous SQLite bodies; JSONL exports match")
 
 
 def overall_ok(checks: list[Check]) -> bool:

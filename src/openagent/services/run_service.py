@@ -55,7 +55,7 @@ from ..security.process import (
     terminate_pid_tree,
 )
 from ..storage.event_log import EventLog
-from ..storage.projects import canonical_root, project_id_for
+from ..storage.projects import canonical_root
 from ..tools.base import AskUserResolver, ToolContext
 from ..tools.registry import ToolExecutor
 from ..workspaces.worktree import NONE, STRATEGIES, WorktreeManager
@@ -111,6 +111,7 @@ class CancelOutcome(str, Enum):
     TERMINATED = "terminated"  # a live process tree was identity-verified and killed
     ALREADY_TERMINAL = "already_terminal"  # the run had already reached a terminal state
     NOT_FOUND = "not_found"  # no such run
+    WRONG_PROJECT = "wrong_project"
     ALREADY_GONE = "already_gone"
     IDENTITY_UNKNOWN = "identity_unknown"
     IDENTITY_MISMATCH = "identity_mismatch"
@@ -229,7 +230,7 @@ class RunService:
             workspace=str(self.paths.project_root),
             permission_profile=profile,
             worktree_strategy=worktree,
-            project_id=project_id_for(self.paths.project_root),
+            project_id=self.project_id,
             project_root=str(root),
             project_state_dir=str(self.paths.project_state_dir),
             artifact_dir=str(self.paths.run_dir(run_id)),
@@ -246,7 +247,7 @@ class RunService:
     def project_id(self) -> str:
         """The project this service instance is bound to."""
 
-        return project_id_for(self.paths.project_root)
+        return self.app.project.id
 
     def run_dir_for(self, run: Run) -> Path:
         """Where ``run``'s artifacts live — from the run itself, never from the current project.
@@ -260,12 +261,30 @@ class RunService:
             return Path(run.artifact_dir)
         return self.paths.run_dir(run.id)
 
-    def _run_dir_by_id(self, run_id: str) -> Path:
-        run = self.get(run_id)
+    def _run_dir_by_id(self, run_id: str, *, all_projects: bool = False) -> Path:
+        run = self._require_run(run_id, all_projects=all_projects)
         return self.run_dir_for(run) if run else self.paths.run_dir(run_id)
 
-    def get(self, run_id: str) -> Run | None:
-        return self.repos.runs.get(run_id)
+    def get(self, run_id: str, *, all_projects: bool = False) -> Run | None:
+        run = self.repos.runs.get(run_id)
+        if (
+            run is not None
+            and not all_projects
+            and run.project_id is not None
+            and run.project_id != self.project_id
+        ):
+            return None
+        return run
+
+    def _require_run(self, run_id: str, *, all_projects: bool = False) -> Run:
+        run = self.repos.runs.get(run_id)
+        if run is None:
+            raise RunError(f"run {run_id!r} not found")
+        if not all_projects and run.project_id is not None and run.project_id != self.project_id:
+            raise RunError(
+                f"run {run_id!r} belongs to another project; pass explicit all_projects authority"
+            )
+        return run
 
     def list(self, limit: int = 50, *, all_projects: bool = False) -> Sequence[Run]:
         """This project's recent runs. Pass ``all_projects`` for the explicit global view (§3.5)."""
@@ -813,7 +832,14 @@ class RunService:
 
     # ------------------------------------------------------------------ resume / cancel
 
-    async def resume(self, run_id: str, prompt: str, on_event: EventHook | None = None) -> Run:
+    async def resume(
+        self,
+        run_id: str,
+        prompt: str,
+        on_event: EventHook | None = None,
+        *,
+        all_projects: bool = False,
+    ) -> Run:
         """Take a follow-up turn on a CLI run under the **same** lifecycle contract as the first run.
 
         Item 9.4/§4: a resume turn is not a second-class path. Exactly one resume runs per run at a
@@ -823,9 +849,7 @@ class RunService:
         run left ``running`` and never a success reported over a failed artifact write (§4.3/§4.4).
         """
 
-        run = self.get(run_id)
-        if not run:
-            raise RunError(f"run {run_id!r} not found")
+        run = self._require_run(run_id, all_projects=all_projects)
         agent = self.repos.agents.get(run.agent)
 
         # §4.1 Per-run lock, checked first because it is the most specific diagnosis of "a turn is in
@@ -1070,7 +1094,7 @@ class RunService:
 
     # ------------------------------------------------------------------ replay
 
-    def projection(self, run_id: str) -> RunProjection:
+    def projection(self, run_id: str, *, all_projects: bool = False) -> RunProjection:
         """Replay ``events.jsonl`` into the current projected state of a run (item 10).
 
         This is what lets the Run Console be *closed and reopened* — including for a run that is
@@ -1078,7 +1102,11 @@ class RunService:
         """
 
         projection = RunProjection(run_id)
-        for event in EventLog(self._run_dir_by_id(run_id)).read():
+        for event in EventLog(
+            self._run_dir_by_id(run_id, all_projects=all_projects),
+            index=self.repos.event_index,
+            run_id=run_id,
+        ).read():
             projection.apply(event)
         return projection
 
@@ -1145,7 +1173,7 @@ class RunService:
 
         art = RunArtifacts()
         state: dict[str, Any] = {"terminal": None}
-        event_log = EventLog(self.run_dir_for(run))
+        event_log = EventLog(self.run_dir_for(run), index=self.repos.event_index, run_id=run.id)
         usage_total: dict[str, Any] = {
             "input_tokens": 0,
             "cached_input_tokens": 0,
@@ -1202,7 +1230,13 @@ class RunService:
             baseline_dir=baseline_dir,
         )
 
-    async def cancel(self, run_id: str, reason: str = "cancelled by user") -> CancelOutcome:
+    async def cancel(
+        self,
+        run_id: str,
+        reason: str = "cancelled by user",
+        *,
+        all_projects: bool = False,
+    ) -> CancelOutcome:
         """Really stop a run — API and CLI alike (item 9). Idempotent, and honest about the result.
 
         Paths, in order:
@@ -1222,9 +1256,12 @@ class RunService:
         Returns a :class:`CancelOutcome` so the CLI never prints a false "cancelled" (§3.3).
         """
 
-        run = self.get(run_id)
-        if not run:
+        raw = self.repos.runs.get(run_id)
+        if raw is None:
             return CancelOutcome.NOT_FOUND
+        if not all_projects and raw.project_id is not None and raw.project_id != self.project_id:
+            return CancelOutcome.WRONG_PROJECT
+        run = raw
 
         if run.status is RunStatus.ORPHANED or _status_value(run) == RunStatus.ORPHANED.value:
             return self._cancel_orphan(run, reason)
@@ -1426,8 +1463,19 @@ class RunService:
         except OSError:  # pragma: no cover - the audit note is best-effort
             pass
 
-    def output(self, run_id: str, fmt: str = "md") -> str:
-        run_dir = self._run_dir_by_id(run_id)
+    def repair_event_export(self, run_id: str, *, all_projects: bool = False) -> dict[str, Any]:
+        run = self._require_run(run_id, all_projects=all_projects)
+        path = EventLog(self.run_dir_for(run), index=self.repos.event_index, run_id=run.id).export()
+        return {
+            "run_id": run.id,
+            "events": self.repos.event_index.count(run.id),
+            "terminal_count": self.repos.event_index.terminal_count(run.id),
+            "export": str(path),
+            "repaired": True,
+        }
+
+    def output(self, run_id: str, fmt: str = "md", *, all_projects: bool = False) -> str:
+        run_dir = self._run_dir_by_id(run_id, all_projects=all_projects)
         mapping = {
             "md": "output.md",
             "json": "result.json",

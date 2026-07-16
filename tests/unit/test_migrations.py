@@ -31,6 +31,8 @@ from openagent.storage.migrations import (
     LATEST_VERSION,
     MIGRATIONS,
     SchemaTooNewError,
+    UnknownRevisionError,
+    current_revision,
     current_version,
     run_migrations,
 )
@@ -97,6 +99,12 @@ def test_migrations_are_numbered_contiguously_from_one():
     versions = [m.version for m in MIGRATIONS]
     assert versions == list(range(1, len(MIGRATIONS) + 1)), "migrations must be 1..N with no gaps"
     assert LATEST_VERSION == versions[-1]
+    assert [m.revision for m in MIGRATIONS] == [f"{version:04d}" for version in versions]
+    assert [m.down_revision for m in MIGRATIONS] == [
+        None,
+        *[migration.revision for migration in MIGRATIONS[:-1]],
+    ]
+    assert all(m.forward_only_reason for m in MIGRATIONS)
 
 
 def test_upgrade_from_a_real_v1_database_applies_the_ddl(tmp_path: Path):
@@ -169,6 +177,19 @@ def test_a_backup_is_taken_before_upgrading(tmp_path: Path):
     assert "project_id" not in _columns(backups[0], "runs")
 
 
+def test_migration_report_exposes_backup_and_verification(tmp_path: Path):
+    db_path = tmp_path / "old.db"
+    _v1_database(db_path)
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    report = run_migrations(engine, db_path=db_path)
+    engine.dispose()
+    assert report.backup_path is not None and report.backup_path.exists()
+    assert report.integrity_check == "ok"
+    assert report.foreign_key_violations == ()
+    assert report.row_counts["runs"] == 1
+    assert report.applied == tuple(f"{version:04d}" for version in range(2, LATEST_VERSION + 1))
+
+
 def test_fresh_database_needs_no_backup(tmp_path: Path):
     """A brand-new DB has nothing to lose; do not litter the data dir with empty backups."""
 
@@ -193,6 +214,22 @@ def test_a_future_schema_is_refused_rather_than_opened(tmp_path: Path):
         Database.open(db_path)
     assert str(LATEST_VERSION + 5) in str(excinfo.value)
     assert "upgrade" in str(excinfo.value).lower()
+
+
+def test_an_unknown_revision_is_refused_fail_closed(tmp_path: Path):
+    db_path = tmp_path / "unknown.db"
+    Database.open(db_path)
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO schema_meta (key, value) VALUES ('revision', 'deadbeef') "
+                "ON CONFLICT(key) DO UPDATE SET value='deadbeef'"
+            )
+        )
+    engine.dispose()
+    with pytest.raises(UnknownRevisionError, match="unknown database revision"):
+        Database.open(db_path)
 
 
 def test_an_interrupted_migration_leaves_the_version_behind_and_retries_cleanly(
@@ -236,3 +273,8 @@ def test_in_memory_database_migrates_to_latest():
     db = Database.in_memory()
     with db.engine.begin() as conn:
         assert current_version(conn) == LATEST_VERSION
+        assert current_revision(conn) == f"{LATEST_VERSION:04d}"
+        assert {row[1] for row in conn.execute(text("PRAGMA table_info(events)"))} >= {"body"}
+        assert conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='event_sequences'")
+        ).first()

@@ -134,7 +134,9 @@ def test_output_json_is_emitted_verbatim_not_soft_wrapped(monkeypatch):
 
     long_run = "x" * 300  # far wider than any console; any wrapping would split this run
     payload = json.dumps({"status": "completed", "summary": long_run})
-    monkeypatch.setattr(RunService, "output", lambda self, run_id, fmt: payload)
+    monkeypatch.setattr(
+        RunService, "output", lambda self, run_id, fmt, *, all_projects=False: payload
+    )
 
     result = runner.invoke(app, ["output", "--id", "run_x", "--format", "json"])
     assert result.exit_code == 0

@@ -277,6 +277,17 @@ class ProcessIdentity(BaseModel):
     command_identity: str
 
 
+class Project(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    root: str
+    state: str = "active"
+    marker_version: int = 1
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class Run(BaseModel):
     """A single execution (spec §3.5)."""
 

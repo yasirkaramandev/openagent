@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import KEYCHAIN_SERVICE, Paths, ensure_dirs, get_paths
 from .credentials.store import CredentialStore
 from .storage.db import Database
+from .storage.projects import ensure_project_marker, write_project_marker
 from .storage.repositories import Repositories
 
 
@@ -18,8 +19,18 @@ class OpenAgentApp:
     def __init__(self, paths: Paths) -> None:
         self.paths = paths
         ensure_dirs(paths)
+        project = ensure_project_marker(paths.project_root)
         self.db = Database.open(paths.db_path)
         self.repos = Repositories(self.db)
+        # An upgraded DB may already know this root under its legacy path-derived id. Preserve that
+        # identity and rewrite the new marker once, rather than creating a duplicate project row.
+        registered = self.repos.projects.get_by_root(project.root)
+        if registered is not None and registered.id != project.id:
+            project = registered.model_copy(update={"marker_version": 1, "state": "active"})
+            write_project_marker(project)
+        else:
+            self.repos.projects.upsert(project)
+        self.project = project
         self.credentials = CredentialStore(KEYCHAIN_SERVICE)
         self._services: dict[str, object] = {}
 
@@ -64,6 +75,12 @@ class OpenAgentApp:
         from .services.doctor_service import DoctorService
 
         return self._cached("doctor", lambda: DoctorService(self))
+
+    @property
+    def projects(self):
+        from .services.project_service import ProjectService
+
+        return self._cached("projects", lambda: ProjectService(self))
 
     def _cached(self, key: str, factory):
         if key not in self._services:
