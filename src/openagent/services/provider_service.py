@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import os
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import TYPE_CHECKING
@@ -19,7 +20,7 @@ from ..core.models import (
     RemoteModel,
     enum_value,
 )
-from ..credentials.redaction import register_secret
+from ..credentials.redaction import redact, register_secret, secret_scope
 from ..providers.base import HealthResult
 from ..providers.discovery import (
     PROBE_UNREACHABLE,
@@ -377,18 +378,22 @@ class ProviderService:
             credential=CredentialRef(type=CredentialType.NONE),
         )
         key = api_key or (os.environ.get(key_env) if key_env else None)
-        register_secret(key)
-        try:
-            resolve_base_url(provider)
-        except ValueError as exc:
-            return HealthResult(ok=False, detail=str(exc))
-        adapter = build_adapter(provider, key)
-        try:
-            return await adapter.test_connection()
-        except Exception as exc:  # noqa: BLE001 - surface any failure as an unhealthy result
-            return HealthResult(ok=False, detail=str(exc))
-        finally:
-            await _maybe_close(adapter)
+        # Scoped, not registered forever (spec §8): this key belongs to a form the user is filling
+        # in, not to a run. Every value leaving here is redacted *inside* the scope — releasing the
+        # key first and redacting later (in the UI) would be too late for a prefixless key, which
+        # only the exact-value registry can catch.
+        with secret_scope(key):
+            try:
+                resolve_base_url(provider)
+            except ValueError as exc:
+                return HealthResult(ok=False, detail=redact(str(exc)))
+            adapter = build_adapter(provider, key)
+            try:
+                return await adapter.test_connection()
+            except Exception as exc:  # noqa: BLE001 - surface any failure as an unhealthy result
+                return HealthResult(ok=False, detail=redact(str(exc)))
+            finally:
+                await _maybe_close(adapter)
 
     async def remote_models_config(
         self,
@@ -422,18 +427,19 @@ class ProviderService:
             credential=CredentialRef(type=CredentialType.NONE),
         )
         key = api_key or (os.environ.get(key_env) if key_env else None)
-        register_secret(key)
-        try:
-            resolve_base_url(provider)
-        except ValueError:
-            return []
-        adapter = build_adapter(provider, key)
-        try:
-            return await adapter.list_models()
-        except Exception:  # noqa: BLE001 - discovery is best-effort
-            return []
-        finally:
-            await _maybe_close(adapter)
+        # Scoped to this call (spec §8) — see test_config for why the key must not outlive the form.
+        with secret_scope(key):
+            try:
+                resolve_base_url(provider)
+            except ValueError:
+                return []
+            adapter = build_adapter(provider, key)
+            try:
+                return await adapter.list_models()
+            except Exception:  # noqa: BLE001 - discovery is best-effort
+                return []
+            finally:
+                await _maybe_close(adapter)
 
     async def test(self, name: str) -> HealthResult:
         provider = self.get(name)
@@ -527,18 +533,26 @@ class ProviderService:
             credential=CredentialRef(type=CredentialType.NONE),
         )
         key = api_key or (os.environ.get(key_env) if key_env else None)
-        register_secret(key)
-        try:
-            resolve_base_url(provider)
-        except ValueError as exc:
-            return AgentModelProbe(
-                model_id, ModelCapabilities(text=False), False, PROBE_UNREACHABLE, str(exc)
-            )
-        adapter = build_adapter(provider, key)
-        try:
-            return await probe_agent_model(adapter, model_id)
-        finally:
-            await _maybe_close(adapter)
+        # Scoped to this call (spec §8) — see test_config for why the key must not outlive the form.
+        with secret_scope(key):
+            try:
+                resolve_base_url(provider)
+            except ValueError as exc:
+                return AgentModelProbe(
+                    model_id,
+                    ModelCapabilities(text=False),
+                    False,
+                    PROBE_UNREACHABLE,
+                    redact(str(exc)),
+                )
+            adapter = build_adapter(provider, key)
+            try:
+                probe = await probe_agent_model(adapter, model_id)
+            finally:
+                await _maybe_close(adapter)
+            # `detail` carries whatever the provider said, which may quote the key back. Redact while
+            # the scope still holds it — a prefixless key is unmatchable once released.
+            return replace(probe, detail=redact(probe.detail))
 
     def cached_probe(self, provider_name: str, model_id: str) -> AgentModelProbe | None:
         """The cached probe for this model, or ``None`` — used to gate agent creation (§17.5).
