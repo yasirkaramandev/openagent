@@ -31,8 +31,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]" build
 
+      # A required gate (spec §8): the formatter baseline is enforced, not aspirational. ruff is
+      # pinned exactly in [dev] so this can never fail merely because a new ruff shipped.
+      - name: Ruff format check
+        run: ruff format --check .
+
       - name: Ruff
-        run: ruff check src tests
+        run: ruff check .
 
       - name: Mypy
         run: mypy src
@@ -187,8 +192,15 @@ jobs:
           "$RUNNER_TEMP/uv2/bin/openagent" version
 
   installer-windows:
-    name: installer (windows-latest)
+    name: installer (windows-latest, ${{ matrix.shell }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      # setup.bat is documented for BOTH shells (`setup.bat` from CMD, `.\setup.bat` from
+      # PowerShell), so both invocations are verified — a PowerShell-only quoting or exit-code bug
+      # would otherwise ship unnoticed (spec §7.4).
+      matrix:
+        shell: [cmd, powershell]
     env:
       OPENAGENT_SETUP_NO_LAUNCH: "1"
     steps:
@@ -201,9 +213,35 @@ jobs:
           echo UV_TOOL_BIN_DIR=%RUNNER_TEMP%\uv\bin>> "%GITHUB_ENV%"
           echo UV_PYTHON_INSTALL_DIR=%RUNNER_TEMP%\uv\py>> "%GITHUB_ENV%"
 
-      - name: First install (setup.bat, no TUI launch)
+      - name: First install through CMD (setup.bat, no TUI launch)
+        if: matrix.shell == 'cmd'
         shell: cmd
         run: setup.bat
+
+      - name: First install through PowerShell (.\setup.bat, no TUI launch)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: |
+          .\setup.bat
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The installer itself already proves a *fresh* CMD and PowerShell can run `openagent` from
+      # the PERSISTED (registry) PATH, with no manual tool-bin injection (spec §7.3). This job
+      # re-asserts it independently of the installer's own check, from this step's environment.
+      - name: Fresh CMD + PowerShell find openagent via the persisted PATH
+        shell: powershell
+        run: |
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (-not ($user -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ieq $env:UV_TOOL_BIN_DIR.TrimEnd('\') })) {
+            Write-Error "the tool dir was not persisted to the user PATH"; exit 1
+          }
+          # Compose the PATH a brand-new login shell would get, and use ONLY that.
+          $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+          cmd /d /c "openagent version"
+          if ($LASTEXITCODE -ne 0) { Write-Error "fresh CMD could not run openagent"; exit 1 }
+          & openagent version
+          if ($LASTEXITCODE -ne 0) { Write-Error "fresh PowerShell could not run openagent"; exit 1 }
 
       - name: Verify openagent and parseable doctor JSON
         shell: cmd
