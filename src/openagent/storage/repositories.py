@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, or_, select
 
 from ..core.models import (
     AgentProfile,
@@ -192,6 +192,10 @@ class RunRepository:
                     completed_at=run.completed_at.isoformat() if run.completed_at else None,
                     exit_code=run.exit_code,
                     failure_type=run.failure_type,
+                    project_id=run.project_id,
+                    project_root=run.project_root,
+                    project_state_dir=run.project_state_dir,
+                    artifact_dir=run.artifact_dir,
                     data=run.model_dump(mode="json"),
                 )
             )
@@ -201,17 +205,49 @@ class RunRepository:
             row = conn.execute(select(t.runs.c.data).where(t.runs.c.id == run_id)).first()
         return Run.model_validate(row[0]) if row else None
 
-    def list(self, limit: int = 50) -> Sequence[Run]:
+    def list(
+        self, limit: int = 50, *, project_id: str | None = None, all_projects: bool = False
+    ) -> Sequence[Run]:
+        """Recent runs, scoped to one project unless ``all_projects`` is asked for (spec §3.2, §3.5).
+
+        The database is global, so an unscoped list mixes every project on the machine together.
+        Legacy rows (``project_id IS NULL``, written before v0.1.3) are included in a scoped list:
+        they predate scoping and hiding them would look like data loss.
+        """
+
+        query = select(t.runs.c.data).order_by(t.runs.c.started_at.desc())
+        if not all_projects and project_id is not None:
+            query = query.where(
+                or_(t.runs.c.project_id == project_id, t.runs.c.project_id.is_(None))
+            )
         with self.db.engine.connect() as conn:
-            rows = conn.execute(
-                select(t.runs.c.data).order_by(t.runs.c.started_at.desc()).limit(limit)
-            ).all()
+            rows = conn.execute(query.limit(limit)).all()
         return [Run.model_validate(r[0]) for r in rows]
 
-    def list_active(self) -> Sequence[Run]:
+    def list_active(
+        self, *, project_id: str | None = None, all_projects: bool = False
+    ) -> Sequence[Run]:
+        """Active runs, scoped by default (spec §3.3).
+
+        Orphan recovery reads this. Unscoped, opening OpenAgent in project B would see project A's
+        running run, find no adapter for it in *this* process, and orphan it — which is the bug.
+
+        Legacy rows (``project_id IS NULL``) are INCLUDED. They can only have been written before
+        v0.1.3 (``create()`` always stamps a project now, and the v2 migration backfills from
+        ``workspace``), so a row still marked active is almost certainly a genuine leftover whose
+        process is long gone. Excluding them would strand them as "running" forever. This is safe
+        because recovery only *marks state* — it never terminates a process — and every real run now
+        carries a project_id, so the cross-project guarantee still holds for everything that matters.
+        """
+
         active = ("queued", "starting", "running", "waiting_approval")
+        query = select(t.runs.c.data).where(t.runs.c.status.in_(active))
+        if not all_projects and project_id is not None:
+            query = query.where(
+                or_(t.runs.c.project_id == project_id, t.runs.c.project_id.is_(None))
+            )
         with self.db.engine.connect() as conn:
-            rows = conn.execute(select(t.runs.c.data).where(t.runs.c.status.in_(active))).all()
+            rows = conn.execute(query).all()
         return [Run.model_validate(r[0]) for r in rows]
 
 

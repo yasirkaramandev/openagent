@@ -261,6 +261,18 @@ class Run(BaseModel):
     #: Finer-grained lifecycle position than ``status`` (see :class:`~openagent.core.events.RunPhase`):
     #: preflight → preparing_workspace → starting_backend → running → finalizing → terminal (item 4).
     phase: str = "queued"
+    #: Which project this run belongs to (spec §3). The database is global (one per user) while
+    #: artifacts are project-local, so without this a run cannot be scoped, and orphan recovery in one
+    #: project would "recover" another project's genuinely-running run. Optional so that runs written
+    #: by v0.1.2 still load; the v2 migration backfills them from ``workspace``.
+    project_id: str | None = None
+    #: The canonical (resolved) project root, so symlinked/relative routes agree.
+    project_root: str | None = None
+    #: The project's OpenAgent state dir (``<project>/.openagent``).
+    project_state_dir: str | None = None
+    #: Where this run's artifacts actually live. Reads resolve through THIS, never through the
+    #: ambient working directory (spec §3.7).
+    artifact_dir: str | None = None
     workspace: str = ""
     worktree: str | None = None
     branch: str | None = None

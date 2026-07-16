@@ -50,7 +50,18 @@ def _v1_database(path: Path) -> None:
                 " exit_code INTEGER, failure_type VARCHAR, data JSON NOT NULL)"
             )
         )
-        conn.execute(text("CREATE TABLE schema_meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)"))
+        # A real v1 database (built by v0.1.2's create_all) has the event index table too, with no
+        # uniqueness constraint on (run_id, seq) — that is what migration 4 adds.
+        conn.execute(
+            text(
+                "CREATE TABLE events ("
+                " id VARCHAR PRIMARY KEY, run_id VARCHAR NOT NULL, seq INTEGER NOT NULL,"
+                " type VARCHAR NOT NULL, timestamp VARCHAR NOT NULL, source VARCHAR NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("CREATE TABLE schema_meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)")
+        )
         conn.execute(text("INSERT INTO schema_meta (key, value) VALUES ('version', '1')"))
         payload = json.dumps(
             {

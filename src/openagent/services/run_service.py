@@ -43,6 +43,7 @@ from ..runtimes.cli.registry import build_cli_adapter
 from ..security.approvals import ApprovalCallback, ApprovalGate
 from ..security.process import PID_ALIVE, pid_identity, run_process_status, terminate_pid_tree
 from ..storage.event_log import EventLog
+from ..storage.projects import canonical_root, project_id_for
 from ..tools.base import AskUserResolver, ToolContext
 from ..tools.registry import ToolExecutor
 from ..workspaces.worktree import NONE, STRATEGIES, WorktreeManager
@@ -170,22 +171,57 @@ class RunService:
                 "worktree 'none' runs a file-editing agent directly in your project with no "
                 "isolation; pass explicit confirmation to proceed"
             )
+        run_id = _new_run_id()
+        # Record which project this run belongs to, and where its artifacts will live (spec §3). The
+        # DB is global, so without this the run cannot be scoped and reads have to guess the artifact
+        # location from the current working directory.
+        root = canonical_root(self.paths.project_root)
         run = Run(
-            id=_new_run_id(),
+            id=run_id,
             agent=agent_name,
             prompt=prompt,
             workspace=str(self.paths.project_root),
             permission_profile=profile,
             worktree_strategy=worktree,
+            project_id=project_id_for(self.paths.project_root),
+            project_root=str(root),
+            project_state_dir=str(self.paths.project_state_dir),
+            artifact_dir=str(self.paths.run_dir(run_id)),
         )
         self.repos.runs.upsert(run)
         return run
 
+    # ------------------------------------------------------------------ project scope (§3)
+
+    @property
+    def project_id(self) -> str:
+        """The project this service instance is bound to."""
+
+        return project_id_for(self.paths.project_root)
+
+    def run_dir_for(self, run: Run) -> Path:
+        """Where ``run``'s artifacts live — from the run itself, never from the current project.
+
+        A run created by another project records its own ``artifact_dir``; resolving through the
+        ambient ``Paths`` would look under *this* project and find nothing (spec §3.7). Runs written
+        before v0.1.3 have no ``artifact_dir``, so they fall back to the old behaviour.
+        """
+
+        if run.artifact_dir:
+            return Path(run.artifact_dir)
+        return self.paths.run_dir(run.id)
+
+    def _run_dir_by_id(self, run_id: str) -> Path:
+        run = self.get(run_id)
+        return self.run_dir_for(run) if run else self.paths.run_dir(run_id)
+
     def get(self, run_id: str) -> Run | None:
         return self.repos.runs.get(run_id)
 
-    def list(self, limit: int = 50) -> Sequence[Run]:
-        return self.repos.runs.list(limit)
+    def list(self, limit: int = 50, *, all_projects: bool = False) -> Sequence[Run]:
+        """This project's recent runs. Pass ``all_projects`` for the explicit global view (§3.5)."""
+
+        return self.repos.runs.list(limit, project_id=self.project_id, all_projects=all_projects)
 
     # ------------------------------------------------------------------ execution
 
@@ -203,7 +239,7 @@ class RunService:
         cancel = self.cancellations.create(run.id)
         cancel.bind()
 
-        run_dir = self.paths.run_dir(run.id)
+        run_dir = self.run_dir_for(run)
         art = RunArtifacts()
         projection = RunProjection(run.id)
         state: dict[str, Any] = {"terminal": None}  # RunStatus | None
@@ -759,7 +795,7 @@ class RunService:
     ) -> Run:
         session_id = run.provider_session_id
         assert session_id is not None  # guaranteed by resume()'s guard, before the lock
-        run_dir = self.paths.run_dir(run.id)
+        run_dir = self.run_dir_for(run)
         # Per-turn artifacts (item 18): captured live so turn_NNN.md holds only THIS turn's summary,
         # usage, and tests — the cumulative view is rebuilt separately for result.json.
         turn_art = RunArtifacts()
@@ -921,7 +957,7 @@ class RunService:
             )
         projection.apply(terminal_event)
 
-        run_dir = self.paths.run_dir(run.id)
+        run_dir = self.run_dir_for(run)
         writer = ArtifactWriter(run_dir)
         # The terminal event will occupy the next slot; the turn range is inclusive through it.
         event_end = sum(1 for _ in event_log.read()) + 1
@@ -973,7 +1009,7 @@ class RunService:
         """
 
         projection = RunProjection(run_id)
-        for event in EventLog(self.paths.run_dir(run_id)).read():
+        for event in EventLog(self._run_dir_by_id(run_id)).read():
             projection.apply(event)
         return projection
 
@@ -1040,7 +1076,7 @@ class RunService:
 
         art = RunArtifacts()
         state: dict[str, Any] = {"terminal": None}
-        event_log = EventLog(self.paths.run_dir(run.id))
+        event_log = EventLog(self.run_dir_for(run))
         usage_total: dict[str, Any] = {
             "input_tokens": 0,
             "cached_input_tokens": 0,
@@ -1183,7 +1219,7 @@ class RunService:
         final semantic event and the projection settles on ``cancelled`` (item 1).
         """
 
-        run_dir = self.paths.run_dir(run.id)
+        run_dir = self.run_dir_for(run)
         if run_dir.exists():
             with contextlib.suppress(OSError):
                 EventLog(run_dir, index=self.repos.event_index).append(
@@ -1208,7 +1244,7 @@ class RunService:
         orphan recovery wrote saying it had been left running). Best-effort; ordered before
         ``run.cancelled`` so that event stays last (§3.2)."""
 
-        run_dir = self.paths.run_dir(run.id)
+        run_dir = self.run_dir_for(run)
         if not run_dir.exists():
             return
         with contextlib.suppress(OSError):
@@ -1252,7 +1288,10 @@ class RunService:
         """
 
         recovered: list[str] = []
-        for run in self.repos.runs.list_active():
+        # Scoped to THIS project (spec §3.6). The database is global, so an unscoped sweep would see
+        # another project's genuinely-running run, find no adapter for it in *this* process, and
+        # declare it orphaned — killing the user's real work from an unrelated directory.
+        for run in self.repos.runs.list_active(project_id=self.project_id):
             # Owned by *this* process (a live CLI adapter or an in-flight API/CLI cancellation
             # controller) → genuinely still running here; leave it alone.
             if run.id in self._cli_adapters or self.cancellations.get(run.id) is not None:
@@ -1276,7 +1315,7 @@ class RunService:
         **not** terminated. Best-effort: a failure to write this note must never crash recovery.
         """
 
-        run_dir = self.paths.run_dir(run.id)
+        run_dir = self.run_dir_for(run)
         if not run_dir.exists():
             return
         try:
@@ -1303,7 +1342,7 @@ class RunService:
             pass
 
     def output(self, run_id: str, fmt: str = "md") -> str:
-        run_dir = self.paths.run_dir(run_id)
+        run_dir = self._run_dir_by_id(run_id)
         mapping = {
             "md": "output.md",
             "json": "result.json",

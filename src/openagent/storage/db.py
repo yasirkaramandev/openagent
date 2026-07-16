@@ -21,12 +21,14 @@ from sqlalchemy import (
     Table,
     create_engine,
     insert,
-    select,
-    update,
 )
 from sqlalchemy.engine import Engine
 
-SCHEMA_VERSION = 1
+from .migrations import LATEST_VERSION, run_migrations
+
+#: The schema this build understands. Owned by ``migrations.MIGRATIONS`` so the number and the DDL
+#: cannot drift apart — the old constant could be bumped without any migration existing.
+SCHEMA_VERSION = LATEST_VERSION
 
 metadata = MetaData()
 
@@ -87,6 +89,29 @@ runs = Table(
     Column("completed_at", String),
     Column("exit_code", Integer),
     Column("failure_type", String),
+    # Project identity (spec §3). The DB is global (one per user) while artifacts are project-local,
+    # so a run must record which project it belongs to and where its artifacts actually live —
+    # otherwise scoping and artifact resolution have to guess from the current directory.
+    Column("project_id", String, index=True),
+    Column("project_root", String),
+    Column("project_state_dir", String),
+    Column("artifact_dir", String),
+    Column("data", JSON, nullable=False),
+)
+
+#: Persisted capability probes (spec §7). Kept out of ``models`` so a probe can exist for a model the
+#: user never registered as a ModelProfile — which is exactly the `provider probe` → `add` flow.
+#: NOTE: no secret, secret hash, or Authorization header is ever stored here (spec §7).
+model_probes = Table(
+    "model_probes",
+    metadata,
+    Column("cache_key", String, primary_key=True),
+    Column("provider_id", String, nullable=False, index=True),
+    Column("model_id", String, nullable=False),
+    Column("base_url_fingerprint", String, nullable=False),
+    Column("credential_revision", String, nullable=False),
+    Column("probe_version", String, nullable=False),
+    Column("tested_at", String, nullable=False),
     Column("data", JSON, nullable=False),
 )
 
@@ -137,7 +162,7 @@ class Database:
             ),
         )
         db = cls(engine)
-        db.migrate()
+        db.migrate(db_path=db_path)
         return db
 
     @classmethod
@@ -147,22 +172,16 @@ class Database:
         db.migrate()
         return db
 
-    def migrate(self) -> None:
-        """Create tables and record the schema version (forward-only)."""
+    def migrate(self, db_path: Path | None = None) -> int:
+        """Bring the schema up to date through the real migration runner (spec §15).
 
-        metadata.create_all(self.engine)
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                select(schema_meta.c.value).where(schema_meta.c.key == "version")
-            ).first()
-            if row is None:
-                conn.execute(insert(schema_meta).values(key="version", value=str(SCHEMA_VERSION)))
-            elif int(row[0]) < SCHEMA_VERSION:  # pragma: no cover - no v2 yet
-                conn.execute(
-                    update(schema_meta)
-                    .where(schema_meta.c.key == "version")
-                    .values(value=str(SCHEMA_VERSION))
-                )
+        This used to be ``create_all()`` + ``UPDATE schema_meta SET version``, which would happily
+        record a version the schema had not actually reached — ``create_all`` never ALTERs an
+        existing table — and would open a *newer* database without complaint. See
+        ``storage/migrations.py``.
+        """
+
+        return run_migrations(self.engine, db_path=db_path)
 
     def writable(self) -> bool:
         """Doctor check: can we write to the DB? (spec §41)."""

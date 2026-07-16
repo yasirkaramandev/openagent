@@ -113,9 +113,7 @@ def _m002_run_project_scope(conn: Connection) -> None:
         if not root:
             continue
         conn.execute(
-            text(
-                "UPDATE runs SET project_id=:pid, project_root=:root WHERE id=:id"
-            ),
+            text("UPDATE runs SET project_id=:pid, project_root=:root WHERE id=:id"),
             {"pid": project_id_for(Path(root)), "root": str(Path(root)), "id": run_id},
         )
 
@@ -151,6 +149,8 @@ def _m004_event_index_uniqueness(conn: Connection) -> None:
     and nothing would notice; the index silently diverges from events.jsonl.
     """
 
+    if not _table_exists(conn, "events"):
+        return  # nothing to constrain yet; create_all builds it with the index for fresh databases
     # Drop any pre-existing duplicates first, or the unique index cannot be created on an old DB.
     conn.execute(
         text(
@@ -178,7 +178,9 @@ LATEST_VERSION = MIGRATIONS[-1].version
 
 def _ensure_meta(conn: Connection) -> None:
     conn.execute(
-        text("CREATE TABLE IF NOT EXISTS schema_meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)")
+        text(
+            "CREATE TABLE IF NOT EXISTS schema_meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)"
+        )
     )
 
 
