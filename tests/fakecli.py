@@ -23,7 +23,12 @@ from openagent.runtimes.cli.base import (
 )
 from openagent.runtimes.cli.codex import map_codex_event
 from openagent.runtimes.cli.registry import register_cli_adapter
-from openagent.security.process import ManagedProcess, minimal_environment
+from openagent.security.process import (
+    ManagedProcess,
+    TerminationOutcome,
+    TerminationResult,
+    minimal_environment,
+)
 
 SOURCE = "fake-cli"
 
@@ -209,7 +214,8 @@ class FakeCliAdapter:
         finally:
             self._processes.pop(request.run_id, None)
 
-    async def cancel(self, run_id: str) -> None:
+    async def cancel(self, run_id: str) -> TerminationResult:
         proc = self._processes.get(run_id)
         if proc is not None:
-            await proc.cancel()
+            return await proc.cancel()
+        return TerminationResult(TerminationOutcome.ALREADY_GONE)

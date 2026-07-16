@@ -12,7 +12,12 @@ from dataclasses import dataclass, field
 
 from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
-from ...security.process import ManagedProcess, minimal_environment
+from ...security.process import (
+    ManagedProcess,
+    TerminationOutcome,
+    TerminationResult,
+    minimal_environment,
+)
 from .base import AuthStatus, CliCapabilities, CliRunRequest, detect_version, find_executable
 
 
@@ -109,10 +114,11 @@ class GenericCliAdapter:
         finally:
             self._processes.pop(request.run_id, None)
 
-    async def cancel(self, run_id: str) -> None:
+    async def cancel(self, run_id: str) -> TerminationResult:
         proc = self._processes.get(run_id)
         if proc is not None:
-            await proc.cancel()
+            return await proc.cancel()
+        return TerminationResult(TerminationOutcome.ALREADY_GONE)
 
 
 #: Example manifest for a future OpenCode adapter (spec §11).

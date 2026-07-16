@@ -48,7 +48,12 @@ from typing import Any
 from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
 from ...core.permissions import get_profile
-from ...security.process import ManagedProcess, minimal_environment
+from ...security.process import (
+    ManagedProcess,
+    TerminationOutcome,
+    TerminationResult,
+    minimal_environment,
+)
 from .base import (
     AuthStatus,
     CliCapabilities,
@@ -302,10 +307,11 @@ class AntigravityAdapter:
         finally:
             self._processes.pop(request.run_id, None)
 
-    async def cancel(self, run_id: str) -> None:
+    async def cancel(self, run_id: str) -> TerminationResult:
         proc = self._processes.get(run_id)
         if proc is not None:
-            await proc.cancel()
+            return await proc.cancel()
+        return TerminationResult(TerminationOutcome.ALREADY_GONE)
 
 
 def map_antigravity_event(obj: dict[str, Any], run_id: str) -> list[NormalizedEvent]:

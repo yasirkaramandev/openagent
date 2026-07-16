@@ -24,7 +24,11 @@ import pytest
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
 from openagent.core.models import Run, RunStatus, RuntimeType
-from openagent.security.process import is_pid_alive, pid_identity, terminate_process_tree
+from openagent.security.process import (
+    capture_process_identity,
+    is_pid_alive,
+    terminate_process_tree,
+)
 from openagent.services.run_service import RunError
 
 _SLEEPER = "import time; time.sleep(120)"
@@ -131,12 +135,15 @@ async def test_live_orphan_is_never_given_a_second_process(app: OpenAgentApp, tm
 
     proc = subprocess.Popen([sys.executable, "-c", _SLEEPER], start_new_session=True)  # noqa: S603
     try:
+        identity = capture_process_identity(proc.pid)
+        assert identity is not None
         _run(
             app,
             RunStatus.ORPHANED,
             "orphaned_unattached_process",
             pid=proc.pid,
-            pid_started_at=pid_identity(proc.pid),
+            pid_started_at=identity.create_time,
+            process_identity=identity,
         )
         before = len(app.runs._cli_adapters)  # noqa: SLF001 - asserting no adapter is registered
 
@@ -150,4 +157,6 @@ async def test_live_orphan_is_never_given_a_second_process(app: OpenAgentApp, tm
         assert app.runs.get("run_policy").status == RunStatus.ORPHANED
         assert app.runs.get("run_policy").turns == 1, "a refused resume must not count a turn"
     finally:
-        terminate_process_tree(proc.pid)
+        identity = capture_process_identity(proc.pid)
+        if identity is not None:
+            terminate_process_tree(identity)

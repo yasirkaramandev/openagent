@@ -22,10 +22,10 @@ import pytest
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
 from openagent.core.events import EventType, NormalizedEvent
-from openagent.core.models import Run, RunStatus
+from openagent.core.models import ProcessIdentity, Run, RunStatus
 from openagent.security.process import (
+    capture_process_identity,
     is_pid_alive,
-    pid_identity,
     terminate_process_tree,
 )
 from openagent.services.run_service import CancelOutcome
@@ -70,19 +70,26 @@ def _spawn_tree(tmp_path: Path) -> tuple[subprocess.Popen, int, int]:
             if len(parts) == 2:
                 return proc, int(parts[0]), int(parts[1])
         time.sleep(0.02)
-    terminate_process_tree(proc.pid)
+    _cleanup(proc)
     raise AssertionError("child tree never reported its PIDs")
 
 
-def _seed_orphan_run(app: OpenAgentApp, pid: int, create_time: float | None) -> Run:
+def _cleanup(proc: subprocess.Popen) -> None:
+    identity = capture_process_identity(proc.pid)
+    if identity is not None:
+        terminate_process_tree(identity)
+
+
+def _seed_orphan_run(app: OpenAgentApp, identity: ProcessIdentity | None) -> Run:
     """Persist a RUNNING run + a realistic run_dir/events.jsonl, as a real run would have left it."""
 
     run = Run(
         id="run_orphan01",
         agent="ghost",
         status=RunStatus.RUNNING,
-        pid=pid,
-        pid_started_at=create_time,
+        pid=identity.pid if identity else None,
+        pid_started_at=identity.create_time if identity else None,
+        process_identity=identity,
     )
     app.repos.runs.upsert(run)
     run_dir = app.paths.run_dir(run.id)
@@ -98,7 +105,11 @@ def _seed_orphan_run(app: OpenAgentApp, pid: int, create_time: float | None) -> 
             run_id=run.id,
             type=EventType.PROCESS_STARTED,
             source="fake-cli",
-            data={"pid": pid, "create_time": create_time},
+            data={
+                "pid": identity.pid if identity else None,
+                "create_time": identity.create_time if identity else None,
+                "process_identity": identity.model_dump() if identity else None,
+            },
         )
     )
     return run
@@ -107,8 +118,9 @@ def _seed_orphan_run(app: OpenAgentApp, pid: int, create_time: float | None) -> 
 async def test_orphaned_live_process_is_cancelled(app: OpenAgentApp, tmp_path: Path):
     proc, parent_pid, grandchild_pid = _spawn_tree(tmp_path)
     try:
-        create_time = pid_identity(parent_pid)
-        _seed_orphan_run(app, parent_pid, create_time)
+        identity = capture_process_identity(parent_pid)
+        assert identity is not None
+        _seed_orphan_run(app, identity)
 
         # Fresh app == a restart: it owns no adapters/cancellations for this run.
         restarted = OpenAgentApp(app.paths)
@@ -147,7 +159,7 @@ async def test_orphaned_live_process_is_cancelled(app: OpenAgentApp, tmp_path: P
         assert events[-1]["type"] == "run.cancelled"
         assert any(e["type"] == "log" and e["data"].get("killed") is True for e in events)
     finally:
-        terminate_process_tree(proc.pid)
+        _cleanup(proc)
 
 
 async def test_orphaned_reused_pid_is_never_killed(app: OpenAgentApp, tmp_path: Path):
@@ -156,8 +168,10 @@ async def test_orphaned_reused_pid_is_never_killed(app: OpenAgentApp, tmp_path: 
     proc, parent_pid, grandchild_pid = _spawn_tree(tmp_path)
     try:
         # Record a *wrong* create-time so identity resolves to PID_REUSED, not PID_ALIVE.
-        wrong_time = (pid_identity(parent_pid) or time.time()) - 10_000.0
-        _seed_orphan_run(app, parent_pid, wrong_time)
+        identity = capture_process_identity(parent_pid)
+        assert identity is not None
+        wrong = identity.model_copy(update={"create_time": identity.create_time - 10_000.0})
+        _seed_orphan_run(app, wrong)
 
         restarted = OpenAgentApp(app.paths)
         restarted.runs.recover_orphans()
@@ -173,7 +187,7 @@ async def test_orphaned_reused_pid_is_never_killed(app: OpenAgentApp, tmp_path: 
         # And the run was not falsely flipped to cancelled.
         assert restarted.runs.get("run_orphan01").status == RunStatus.ORPHANED
     finally:
-        terminate_process_tree(proc.pid)
+        _cleanup(proc)
 
 
 async def test_orphaned_unknown_pid_is_never_killed(app: OpenAgentApp, tmp_path: Path):
@@ -181,7 +195,7 @@ async def test_orphaned_unknown_pid_is_never_killed(app: OpenAgentApp, tmp_path:
 
     proc, parent_pid, grandchild_pid = _spawn_tree(tmp_path)
     try:
-        _seed_orphan_run(app, parent_pid, None)  # no create-time recorded → PID_UNKNOWN
+        _seed_orphan_run(app, None)  # no complete identity recorded → PID_UNKNOWN
 
         restarted = OpenAgentApp(app.paths)
         restarted.runs.recover_orphans()
@@ -193,7 +207,7 @@ async def test_orphaned_unknown_pid_is_never_killed(app: OpenAgentApp, tmp_path:
         assert outcome is CancelOutcome.NOT_CANCELLABLE
         assert is_pid_alive(parent_pid) and is_pid_alive(grandchild_pid)
     finally:
-        terminate_process_tree(proc.pid)
+        _cleanup(proc)
 
 
 async def test_orphan_unattached_but_pid_reused_at_cancel_time(app: OpenAgentApp, tmp_path: Path):
@@ -205,12 +219,17 @@ async def test_orphan_unattached_but_pid_reused_at_cancel_time(app: OpenAgentApp
 
     proc, parent_pid, grandchild_pid = _spawn_tree(tmp_path)
     try:
-        run = _seed_orphan_run(app, parent_pid, pid_identity(parent_pid))
+        identity = capture_process_identity(parent_pid)
+        assert identity is not None
+        run = _seed_orphan_run(app, identity)
         # Force the terminable reason, then corrupt the recorded identity so the cancel-time check
         # sees a mismatch.
         run.status = RunStatus.ORPHANED
         run.failure_type = "orphaned_unattached_process"
-        run.pid_started_at = (run.pid_started_at or time.time()) - 10_000.0
+        run.process_identity = identity.model_copy(
+            update={"create_time": identity.create_time - 10_000.0}
+        )
+        run.pid_started_at = run.process_identity.create_time
         app.repos.runs.upsert(run)
 
         outcome = await app.runs.cancel("run_orphan01")
@@ -218,7 +237,7 @@ async def test_orphan_unattached_but_pid_reused_at_cancel_time(app: OpenAgentApp
         assert is_pid_alive(parent_pid) and is_pid_alive(grandchild_pid)
         assert app.runs.get("run_orphan01").status == RunStatus.ORPHANED
     finally:
-        terminate_process_tree(proc.pid)
+        _cleanup(proc)
 
 
 async def test_cancel_unknown_run_reports_not_found(app: OpenAgentApp):

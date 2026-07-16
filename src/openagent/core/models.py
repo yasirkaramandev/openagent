@@ -260,6 +260,22 @@ def _normalize_version(value: str) -> str:
 # --------------------------------------------------------------------------- runs/sessions
 
 
+class ProcessIdentity(BaseModel):
+    """The persisted identity of a backend process.
+
+    A PID alone is never an identity: operating systems recycle it.  Creation time is the primary
+    reuse guard, while the executable path and a digest of the actual command line prevent a live
+    but unrelated process from being accepted when the remaining metadata is missing or stale.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pid: int
+    create_time: float
+    executable: str
+    command_identity: str
+
+
 class Run(BaseModel):
     """A single execution (spec §3.5)."""
 
@@ -294,6 +310,10 @@ class Run(BaseModel):
     pid: int | None = None
     #: OS process start time captured with the PID — verifies identity before a later kill (spec §45).
     pid_started_at: float | None = None
+    #: Full PID-reuse-safe process identity. ``pid``/``pid_started_at`` remain readable for legacy
+    #: rows, but new processes always persist this structure and cross-process termination requires
+    #: all four fields.
+    process_identity: ProcessIdentity | None = None
     #: Worktree isolation strategy actually used: ``auto`` | ``none`` | ``copy``.
     worktree_strategy: str = "auto"
     #: Workspace metadata persisted so a resume reconstructs the exact same diff baseline (item 5).

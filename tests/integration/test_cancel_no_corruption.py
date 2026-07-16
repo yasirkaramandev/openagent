@@ -29,8 +29,14 @@ import pytest
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
 from openagent.core.events import EventType, NormalizedEvent
-from openagent.core.models import Run, RunStatus
-from openagent.security.process import is_pid_alive, pid_identity, terminate_process_tree
+from openagent.core.models import ProcessIdentity, Run, RunStatus
+from openagent.security.process import (
+    TerminationOutcome,
+    TerminationResult,
+    capture_process_identity,
+    is_pid_alive,
+    terminate_process_tree,
+)
 from openagent.services.run_service import CancelOutcome
 from openagent.storage.event_log import EventLog
 
@@ -51,15 +57,16 @@ def app(tmp_path: Path) -> OpenAgentApp:
     )
 
 
-def _seed(app: OpenAgentApp, pid: int | None, create_time: float | None) -> Run:
+def _seed(app: OpenAgentApp, identity: ProcessIdentity | None) -> Run:
     """A RUNNING run this process does not own, with a realistic run_dir."""
 
     run = Run(
         id="run_xproc",
         agent="ghost",
         status=RunStatus.RUNNING,
-        pid=pid,
-        pid_started_at=create_time,
+        pid=identity.pid if identity else None,
+        pid_started_at=identity.create_time if identity else None,
+        process_identity=identity,
     )
     app.repos.runs.upsert(run)
     run_dir = app.paths.run_dir(run.id)
@@ -83,7 +90,10 @@ async def test_reused_pid_cancel_leaves_state_untouched(app: OpenAgentApp):
     proc = subprocess.Popen([sys.executable, "-c", _SLEEPER], start_new_session=True)  # noqa: S603
     try:
         # A create-time that does not match the live process → PID_REUSED.
-        _seed(app, proc.pid, (pid_identity(proc.pid) or time.time()) - 10_000.0)
+        identity = capture_process_identity(proc.pid)
+        assert identity is not None
+        wrong = identity.model_copy(update={"create_time": identity.create_time - 10_000.0})
+        _seed(app, wrong)
         before_events, before_status = _snapshot(app, "run_xproc")
 
         outcome = await app.runs.cancel("run_xproc")
@@ -103,7 +113,9 @@ async def test_reused_pid_cancel_leaves_state_untouched(app: OpenAgentApp):
         assert "run.cancelled" not in after_events
         assert after_status == before_status
     finally:
-        terminate_process_tree(proc.pid)
+        identity = capture_process_identity(proc.pid)
+        if identity is not None:
+            terminate_process_tree(identity)
 
 
 async def test_unknown_pid_cancel_leaves_state_untouched(app: OpenAgentApp):
@@ -111,43 +123,82 @@ async def test_unknown_pid_cancel_leaves_state_untouched(app: OpenAgentApp):
 
     proc = subprocess.Popen([sys.executable, "-c", _SLEEPER], start_new_session=True)  # noqa: S603
     try:
-        _seed(app, proc.pid, None)
+        _seed(app, None)
         before_events, _ = _snapshot(app, "run_xproc")
 
         outcome = await app.runs.cancel("run_xproc")
 
-        assert outcome is CancelOutcome.IDENTITY_MISMATCH
+        assert outcome is CancelOutcome.IDENTITY_UNKNOWN
         assert is_pid_alive(proc.pid)
         assert app.runs.get("run_xproc").status == RunStatus.RUNNING
         assert _snapshot(app, "run_xproc")[0] == before_events
         assert "run.cancelled" not in _snapshot(app, "run_xproc")[0]
     finally:
-        terminate_process_tree(proc.pid)
+        identity = capture_process_identity(proc.pid)
+        if identity is not None:
+            terminate_process_tree(identity)
 
 
 async def test_already_gone_pid_cancel_leaves_state_untouched(app: OpenAgentApp):
     """Nothing was stopped because nothing was running — do not claim a cancellation."""
 
-    _seed(app, 2_000_000_000, 1.0)  # a PID that does not exist
+    _seed(
+        app,
+        ProcessIdentity(
+            pid=2_000_000_000,
+            create_time=1.0,
+            executable="/missing/openagent-test",
+            command_identity="0" * 64,
+        ),
+    )
     before_events, _ = _snapshot(app, "run_xproc")
 
     outcome = await app.runs.cancel("run_xproc")
 
-    assert outcome is CancelOutcome.IDENTITY_MISMATCH
+    assert outcome is CancelOutcome.ALREADY_GONE
     assert app.runs.get("run_xproc").status == RunStatus.RUNNING
     assert _snapshot(app, "run_xproc")[0] == before_events
     assert "run.cancelled" not in _snapshot(app, "run_xproc")[0]
 
 
 async def test_no_pid_recorded_cancel_leaves_state_untouched(app: OpenAgentApp):
-    _seed(app, None, None)
+    _seed(app, None)
     before_events, _ = _snapshot(app, "run_xproc")
 
     outcome = await app.runs.cancel("run_xproc")
 
-    assert outcome is CancelOutcome.IDENTITY_MISMATCH
+    assert outcome is CancelOutcome.IDENTITY_UNKNOWN
     assert app.runs.get("run_xproc").status == RunStatus.RUNNING
     assert _snapshot(app, "run_xproc")[0] == before_events
+
+
+@pytest.mark.parametrize(
+    ("termination", "expected"),
+    [
+        (TerminationOutcome.ACCESS_DENIED, CancelOutcome.ACCESS_DENIED),
+        (TerminationOutcome.TERMINATION_FAILED, CancelOutcome.TERMINATION_FAILED),
+        (TerminationOutcome.SURVIVORS_REMAINING, CancelOutcome.SURVIVORS_REMAINING),
+    ],
+)
+async def test_in_process_termination_failure_writes_no_cancel_state(
+    app: OpenAgentApp, termination: TerminationOutcome, expected: CancelOutcome
+):
+    """An adapter result is evidence, not a request acknowledgement."""
+
+    class RefusingAdapter:
+        async def cancel(self, run_id: str) -> TerminationResult:
+            return TerminationResult(termination)
+
+    _seed(app, None)
+    before_events, before_status = _snapshot(app, "run_xproc")
+    app.runs._cli_adapters["run_xproc"] = RefusingAdapter()  # type: ignore[assignment]  # noqa: SLF001
+
+    outcome = await app.runs.cancel("run_xproc")
+
+    assert outcome is expected
+    assert "run_xproc" not in app.runs._cancelled  # noqa: SLF001
+    assert app.runs.get("run_xproc").status == RunStatus.RUNNING
+    assert _snapshot(app, "run_xproc") == (before_events, before_status)
 
 
 async def test_real_termination_does_persist_cancelled(app: OpenAgentApp):
@@ -155,7 +206,9 @@ async def test_real_termination_does_persist_cancelled(app: OpenAgentApp):
 
     proc = subprocess.Popen([sys.executable, "-c", _SLEEPER], start_new_session=True)  # noqa: S603
     try:
-        _seed(app, proc.pid, pid_identity(proc.pid))  # identity matches → really killable
+        identity = capture_process_identity(proc.pid)
+        assert identity is not None
+        _seed(app, identity)
 
         outcome = await app.runs.cancel("run_xproc")
 
@@ -177,4 +230,6 @@ async def test_real_termination_does_persist_cancelled(app: OpenAgentApp):
             == "cancelled"
         )
     finally:
-        terminate_process_tree(proc.pid)
+        identity = capture_process_identity(proc.pid)
+        if identity is not None:
+            terminate_process_tree(identity)

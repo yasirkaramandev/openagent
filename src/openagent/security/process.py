@@ -13,17 +13,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import subprocess
 import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import psutil
 
 from ..core.cancellation import RunCancellation, RunCancelled
+from ..core.models import ProcessIdentity
 
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -95,7 +99,7 @@ class ManagedProcess:
         self._stderr_truncated = False
         self._max_stderr_bytes = max_stderr_bytes
         self._cancelled = False
-        self._create_time: float | None = None
+        self._identity: ProcessIdentity | None = None
 
     @property
     def pid(self) -> int | None:
@@ -109,7 +113,13 @@ class ManagedProcess:
     @property
     def create_time(self) -> float | None:
         """The OS process start time — a reuse-safe identity signal for later termination."""
-        return self._create_time
+        return self._identity.create_time if self._identity else None
+
+    @property
+    def identity(self) -> ProcessIdentity | None:
+        """The full identity captured immediately after launch."""
+
+        return self._identity
 
     async def start(self) -> None:
         self._proc = await asyncio.create_subprocess_exec(
@@ -121,7 +131,13 @@ class ManagedProcess:
             stdin=asyncio.subprocess.DEVNULL,
             start_new_session=not IS_WINDOWS,
         )
-        self._create_time = pid_identity(self._proc.pid)
+        self._identity = capture_process_identity(self._proc.pid)
+        if self._identity is None:
+            # We cannot safely manage a process whose identity we failed to capture. Stop it while
+            # we still own the asyncio handle and fail startup instead of leaving an unkillable run.
+            self._proc.terminate()
+            await self._proc.wait()
+            raise RuntimeError("could not capture backend process identity")
 
     async def stream_stdout(self) -> AsyncIterator[str]:
         """Yield decoded stdout lines. Drains stderr concurrently to avoid buffer deadlock."""
@@ -203,39 +219,219 @@ class ManagedProcess:
         assert self._proc is not None
         return await self._proc.wait()
 
-    async def cancel(self, grace: float = 3.0) -> None:
-        """Terminate the process and every descendant (spec §45). Idempotent."""
+    async def cancel(self, grace: float = 3.0) -> TerminationResult:
+        """Terminate the process and every descendant, returning verified evidence."""
 
-        self._cancelled = True
         if self._proc is None or self._proc.returncode is not None:
-            return
-        terminate_process_tree(self._proc.pid, grace=grace)
+            return TerminationResult(TerminationOutcome.ALREADY_GONE)
+        if self._identity is None:
+            return TerminationResult(TerminationOutcome.IDENTITY_UNKNOWN)
+        result = terminate_process_tree(self._identity, grace=grace)
+        # This flag drives terminal reconciliation. Setting it before termination was proven would
+        # turn access-denied, identity-mismatch, or survivor outcomes into a false run.cancelled.
+        if result.verified_terminated:
+            self._cancelled = True
+        return result
 
 
-def _safe_signal(proc: psutil.Process, *, terminate: bool) -> None:
+class TerminationOutcome(str, Enum):
+    TERMINATED = "terminated"
+    ALREADY_GONE = "already_gone"
+    IDENTITY_UNKNOWN = "identity_unknown"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    ACCESS_DENIED = "access_denied"
+    TERMINATION_FAILED = "termination_failed"
+    SURVIVORS_REMAINING = "survivors_remaining"
+
+
+@dataclass(frozen=True)
+class TerminationResult:
+    """Auditable outcome of a process-tree termination attempt."""
+
+    outcome: TerminationOutcome
+    terminated_pids: tuple[int, ...] = ()
+    survivors: tuple[int, ...] = ()
+    access_denied: tuple[int, ...] = ()
+    detail: str = ""
+
+    @property
+    def verified_terminated(self) -> bool:
+        return self.outcome is TerminationOutcome.TERMINATED and not self.survivors
+
+
+def _command_identity(argv: Sequence[str]) -> str:
+    return hashlib.sha256("\0".join(argv).encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def _capture_process_identity_once(pid: int) -> ProcessIdentity | None:
+    if not pid:
+        return None
     try:
-        if terminate:
-            proc.terminate()
-        else:
-            proc.kill()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):  # pragma: no cover - race/perm
-        pass
+        process = psutil.Process(pid)
+        with process.oneshot():
+            create_time = process.create_time()
+            executable = process.exe()
+            command = process.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+        return None
+    if not executable or not command:
+        return None
+    return ProcessIdentity(
+        pid=pid,
+        create_time=create_time,
+        executable=str(Path(executable).resolve()),
+        command_identity=_command_identity(command),
+    )
 
 
-def terminate_process_tree(pid: int, *, grace: float = 3.0) -> None:
-    """Graceful ``SIGTERM`` → force ``SIGKILL`` of ``pid`` and every descendant (spec §45)."""
+def capture_process_identity(pid: int | None) -> ProcessIdentity | None:
+    """Capture a stable PID/create-time/executable/command identity.
+
+    macOS framework Python and some launcher CLIs re-exec immediately after ``Popen`` returns. A
+    single eager sample records the launcher and then rejects the same PID milliseconds later as an
+    identity mismatch. Sample through that startup window and return only a stable post-exec value.
+    If a very short-lived command exits during the window, its last sample is still useful evidence:
+    future verification can only classify it as already gone, never signal a replacement PID.
+    """
+
+    if not pid:
+        return None
+    deadline = time.monotonic() + 0.25
+    stable_since = time.monotonic()
+    previous = _capture_process_identity_once(pid)
+    if previous is None:
+        return None
+    while time.monotonic() < deadline:
+        time.sleep(0.025)
+        current = _capture_process_identity_once(pid)
+        if current is None:
+            return previous
+        if current != previous:
+            previous = current
+            stable_since = time.monotonic()
+            continue
+        if time.monotonic() - stable_since >= 0.075:
+            return current
+    return previous
+
+
+def _verify_process(
+    identity: ProcessIdentity,
+) -> tuple[psutil.Process | None, TerminationResult | None]:
+    """Return the matching process or a fail-closed result."""
 
     try:
-        parent = psutil.Process(pid)
+        process = psutil.Process(identity.pid)
+        with process.oneshot():
+            create_time = process.create_time()
+            executable = process.exe()
+            command = process.cmdline()
+    except psutil.NoSuchProcess:
+        return None, TerminationResult(TerminationOutcome.ALREADY_GONE)
+    except (psutil.AccessDenied, PermissionError):
+        return None, TerminationResult(
+            TerminationOutcome.ACCESS_DENIED, access_denied=(identity.pid,)
+        )
+    except (psutil.ZombieProcess, OSError) as exc:
+        return None, TerminationResult(TerminationOutcome.IDENTITY_UNKNOWN, detail=str(exc))
+
+    if abs(create_time - identity.create_time) > _IDENTITY_TOLERANCE:
+        return None, TerminationResult(TerminationOutcome.IDENTITY_MISMATCH)
+    try:
+        actual_executable = str(Path(executable).resolve())
+    except OSError:
+        return None, TerminationResult(TerminationOutcome.IDENTITY_UNKNOWN)
+    if (
+        actual_executable != identity.executable
+        or _command_identity(command) != identity.command_identity
+    ):
+        return None, TerminationResult(TerminationOutcome.IDENTITY_MISMATCH)
+    return process, None
+
+
+def _signal(proc: psutil.Process, *, terminate: bool) -> TerminationOutcome | None:
+    try:
+        proc.terminate() if terminate else proc.kill()
+        return None
+    except psutil.NoSuchProcess:
+        return None
+    except psutil.AccessDenied:
+        return TerminationOutcome.ACCESS_DENIED
+    except OSError:
+        return TerminationOutcome.TERMINATION_FAILED
+
+
+def terminate_process_tree(
+    identity: ProcessIdentity, *, grace: float = 3.0, kill_grace: float = 3.0
+) -> TerminationResult:
+    """Terminate an identity-verified process tree and prove every victim is gone."""
+
+    parent, failure = _verify_process(identity)
+    if failure is not None:
+        return failure
+    assert parent is not None
+    try:
         children = parent.children(recursive=True)
     except psutil.NoSuchProcess:
-        return
+        return TerminationResult(TerminationOutcome.ALREADY_GONE)
+    except psutil.AccessDenied:
+        return TerminationResult(TerminationOutcome.ACCESS_DENIED, access_denied=(identity.pid,))
+
     victims = [*children, parent]
+    denied: list[int] = []
+    failures: list[int] = []
     for proc in victims:
-        _safe_signal(proc, terminate=True)
-    _, alive = psutil.wait_procs(victims, timeout=grace)
-    for proc in alive:  # force-kill survivors
-        _safe_signal(proc, terminate=False)
+        problem = _signal(proc, terminate=True)
+        if problem is TerminationOutcome.ACCESS_DENIED:
+            denied.append(proc.pid)
+        elif problem is TerminationOutcome.TERMINATION_FAILED:
+            failures.append(proc.pid)
+    gone, alive = psutil.wait_procs(victims, timeout=grace)
+    for proc in alive:
+        problem = _signal(proc, terminate=False)
+        if problem is TerminationOutcome.ACCESS_DENIED:
+            denied.append(proc.pid)
+        elif problem is TerminationOutcome.TERMINATION_FAILED:
+            failures.append(proc.pid)
+    killed, survivors = psutil.wait_procs(alive, timeout=kill_grace)
+    gone.extend(killed)
+
+    # Re-check rather than trusting wait_procs alone. Process objects protect signal methods against
+    # PID reuse, and a fresh is_running check proves no original victim survived the force-kill.
+    still_alive: list[int] = []
+    for proc in survivors:
+        try:
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                still_alive.append(proc.pid)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            denied.append(proc.pid)
+            still_alive.append(proc.pid)
+    still_alive = sorted(set(still_alive))
+    if still_alive:
+        return TerminationResult(
+            TerminationOutcome.SURVIVORS_REMAINING,
+            terminated_pids=tuple(sorted({p.pid for p in gone})),
+            survivors=tuple(still_alive),
+            access_denied=tuple(sorted(set(denied))),
+        )
+    if denied:
+        return TerminationResult(
+            TerminationOutcome.ACCESS_DENIED,
+            terminated_pids=tuple(sorted({p.pid for p in gone})),
+            access_denied=tuple(sorted(set(denied))),
+        )
+    if failures:
+        return TerminationResult(
+            TerminationOutcome.TERMINATION_FAILED,
+            terminated_pids=tuple(sorted({p.pid for p in gone})),
+            detail=f"signals failed for pids {sorted(set(failures))}",
+        )
+    return TerminationResult(
+        TerminationOutcome.TERMINATED,
+        terminated_pids=tuple(sorted({p.pid for p in gone})),
+    )
 
 
 def pid_identity(pid: int | None) -> float | None:
@@ -287,29 +483,30 @@ def run_process_status(
     return PID_ALIVE if abs(actual - expected_create_time) <= tolerance else PID_REUSED
 
 
+def process_identity_status(identity: ProcessIdentity | None) -> str:
+    """Classify a complete persisted identity without signalling the process."""
+
+    if identity is None:
+        return PID_UNKNOWN
+    process, failure = _verify_process(identity)
+    if process is not None:
+        return PID_ALIVE
+    assert failure is not None
+    if failure.outcome is TerminationOutcome.ALREADY_GONE:
+        return PID_GONE
+    if failure.outcome is TerminationOutcome.IDENTITY_MISMATCH:
+        return PID_REUSED
+    return PID_UNKNOWN
+
+
 def terminate_pid_tree(
-    pid: int | None, expected_create_time: float | None = None, *, grace: float = 3.0
-) -> bool:
-    """Terminate a run's process tree by PID **only** if its identity verifies (spec §45, §6).
+    identity: ProcessIdentity | None, *, grace: float = 3.0, kill_grace: float = 3.0
+) -> TerminationResult:
+    """Strict cross-process entry point: no complete identity means no signal."""
 
-    Fails closed: a kill happens only when :func:`run_process_status` says ``PID_ALIVE`` — i.e. the
-    PID exists *and* its start time matches the one recorded for this run. Gone, reused, or
-    unverifiable all return ``False`` and touch nothing. Idempotent.
-
-    A missing ``expected_create_time`` is **not** a licence to kill. Until v0.1.3 this function had a
-    second, weaker branch: with no recorded create-time it merely checked that the PID existed and
-    then terminated it. PIDs are recycled aggressively, so any run whose create-time was never
-    captured could take out a completely unrelated process that happened to inherit its number — the
-    exact hazard the identity check exists to prevent, and one the docstring claimed was handled.
-    ``run_process_status`` already classifies that case as ``PID_UNKNOWN``; this now honours it.
-    """
-
-    if not pid:
-        return False
-    if run_process_status(pid, expected_create_time) != PID_ALIVE:
-        return False  # gone, reused, or unverifiable — do not touch it
-    terminate_process_tree(pid, grace=grace)
-    return True
+    if identity is None:
+        return TerminationResult(TerminationOutcome.IDENTITY_UNKNOWN)
+    return terminate_process_tree(identity, grace=grace, kill_grace=kill_grace)
 
 
 class OutputLimitExceeded(RuntimeError):
@@ -364,12 +561,18 @@ def run_capture(
         shell=shell,
         start_new_session=not IS_WINDOWS,
     )
+    identity = capture_process_identity(popen.pid)
+    if identity is None:
+        popen.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            popen.wait(timeout=5.0)
+        raise RuntimeError("could not capture command process identity")
     cmd = argv if shell else list(argv)
     if max_output_bytes is None and cancellation is None:
         try:
             raw_out, raw_err = popen.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            terminate_process_tree(popen.pid)
+            terminate_process_tree(identity)
             try:
                 popen.communicate(timeout=5.0)
             except subprocess.TimeoutExpired:  # pragma: no cover - defensive
@@ -381,7 +584,7 @@ def run_capture(
 
     limit = max_output_bytes if max_output_bytes is not None else _UNBOUNDED
     out, err, exceeded = _read_bounded(
-        popen, timeout=timeout, limit=limit, cancellation=cancellation
+        popen, identity=identity, timeout=timeout, limit=limit, cancellation=cancellation
     )
     # A cancel that arrived while the command was running wins over any output it managed to produce:
     # the tree was already terminated by the reader; surface it as a cancellation, not a result.
@@ -399,6 +602,7 @@ def _decode(raw: bytes | None) -> str:
 def _read_bounded(
     popen: subprocess.Popen,
     *,
+    identity: ProcessIdentity,
     timeout: float,
     limit: int,
     cancellation: RunCancellation | None = None,
@@ -468,7 +672,7 @@ def _read_bounded(
         time.sleep(0.02)
 
     if breached.is_set() or timed_out or cancelled:
-        terminate_process_tree(popen.pid)
+        terminate_process_tree(identity)
     for thread in threads:
         thread.join(timeout=2.0)
     with contextlib.suppress(subprocess.TimeoutExpired):

@@ -28,8 +28,12 @@ import pytest
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
 from openagent.core.events import EventType, NormalizedEvent
-from openagent.core.models import Run, RunStatus, RuntimeType
-from openagent.security.process import is_pid_alive, pid_identity, terminate_process_tree
+from openagent.core.models import ProcessIdentity, Run, RunStatus, RuntimeType
+from openagent.security.process import (
+    capture_process_identity,
+    is_pid_alive,
+    terminate_process_tree,
+)
 from openagent.storage.event_log import EventLog
 from openagent.storage.projects import project_id_for
 
@@ -74,7 +78,15 @@ def _live_run_in(app: OpenAgentApp, pid: int) -> Run:
     )
     run.status = RunStatus.RUNNING
     run.pid = pid
-    run.pid_started_at = pid_identity(pid)
+    run.process_identity = capture_process_identity(pid)
+    if run.process_identity is None:
+        run.process_identity = ProcessIdentity(
+            pid=pid,
+            create_time=1.0,
+            executable="/missing/openagent-test",
+            command_identity="0" * 64,
+        )
+    run.pid_started_at = run.process_identity.create_time
     app.repos.runs.upsert(run)
     run_dir = app.runs.run_dir_for(run)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -106,7 +118,9 @@ def test_project_b_orphan_recovery_leaves_project_a_running(two_apps, tmp_path: 
         assert app_a.runs.get(run.id).status == RunStatus.RUNNING
         assert is_pid_alive(proc.pid)
     finally:
-        terminate_process_tree(proc.pid)
+        identity = capture_process_identity(proc.pid)
+        if identity is not None:
+            terminate_process_tree(identity)
 
 
 def test_project_a_still_recovers_its_own_orphans(two_apps):
@@ -226,4 +240,6 @@ async def test_cancel_uses_the_owning_projects_artifact_dir(two_apps):
         # …and B did not fabricate a run directory of its own.
         assert not (app_b.paths.run_dir(run.id)).exists()
     finally:
-        terminate_process_tree(proc.pid)
+        identity = capture_process_identity(proc.pid)
+        if identity is not None:
+            terminate_process_tree(identity)

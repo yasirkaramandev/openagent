@@ -17,7 +17,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
-from ...security.process import ManagedProcess
+from ...security.process import ManagedProcess, TerminationResult
 
 #: Signature of a pure event mapper (``map_codex_event`` / ``map_claude_event``).
 EventMapper = Callable[[dict[str, Any], str], list[NormalizedEvent]]
@@ -81,7 +81,7 @@ class CliAdapter(Protocol):
         self, session_id: str, prompt: str, request: CliRunRequest
     ) -> AsyncIterator[NormalizedEvent]: ...
 
-    async def cancel(self, run_id: str) -> None: ...
+    async def cancel(self, run_id: str) -> TerminationResult: ...
 
 
 def find_executable(*names: str) -> str | None:
@@ -261,7 +261,11 @@ async def run_managed_cli(
         run_id=run_id,
         type=EventType.PROCESS_STARTED,
         source=source,
-        data={"pid": proc.pid, "create_time": proc.create_time},
+        data={
+            "pid": proc.pid,
+            "create_time": proc.create_time,
+            "process_identity": proc.identity.model_dump() if proc.identity else None,
+        },
     )
     observations = TerminalObservations()
     saw_message = False

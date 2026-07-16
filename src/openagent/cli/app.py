@@ -329,11 +329,26 @@ def cancel(id: str = typer.Option(..., "--id")) -> None:
         console.print(f"[dim]{safe_id} has already finished; nothing to cancel[/dim]")
     elif outcome is CancelOutcome.NOT_FOUND:
         _fail(f"run {id!r} not found")
+    elif outcome is CancelOutcome.ALREADY_GONE:
+        _fail(f"{id}: the recorded process has already exited; the run was left untouched.")
+    elif outcome is CancelOutcome.IDENTITY_UNKNOWN:
+        _fail(
+            f"{id}: the recorded process identity is incomplete or cannot be verified; refused to "
+            "signal it. The run was left untouched."
+        )
     elif outcome is CancelOutcome.IDENTITY_MISMATCH:
         _fail(
-            f"{id}: the recorded process is gone or its PID was reused; refused to terminate an "
+            f"{id}: the PID now belongs to a different executable or command; refused to terminate an "
             "unrelated process. The run was left untouched."
         )
+    elif outcome is CancelOutcome.ACCESS_DENIED:
+        _fail(f"{id}: access was denied while terminating the process tree; state was not changed.")
+    elif outcome is CancelOutcome.SURVIVORS_REMAINING:
+        _fail(
+            f"{id}: one or more process-tree members survived termination; state was not changed."
+        )
+    elif outcome is CancelOutcome.TERMINATION_FAILED:
+        _fail(f"{id}: process-tree termination failed; state was not changed.")
     elif outcome is CancelOutcome.NOT_CANCELLABLE:
         _fail(f"{id}: orphaned run has no safely identifiable live process to cancel.")
 

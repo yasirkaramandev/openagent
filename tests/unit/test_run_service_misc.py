@@ -5,6 +5,7 @@ import pytest
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
 from openagent.core.models import Run, RunStatus
+from openagent.security.process import capture_process_identity
 from openagent.services.run_service import RunError
 
 
@@ -44,9 +45,15 @@ def test_orphan_recovery_fails_closed_on_unattached_live_run(app: OpenAgentApp):
 
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        created = psutil.Process(proc.pid).create_time()
+        identity = capture_process_identity(proc.pid)
+        assert identity is not None
         run = Run(
-            id="run_live", agent="x", status=RunStatus.RUNNING, pid=proc.pid, pid_started_at=created
+            id="run_live",
+            agent="x",
+            status=RunStatus.RUNNING,
+            pid=proc.pid,
+            pid_started_at=identity.create_time,
+            process_identity=identity,
         )
         app.repos.runs.upsert(run)
         app.paths.run_dir(run.id).mkdir(
@@ -86,13 +93,16 @@ def test_orphan_recovery_detects_pid_reuse(app: OpenAgentApp):
 
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        created = psutil.Process(proc.pid).create_time()
+        identity = capture_process_identity(proc.pid)
+        assert identity is not None
+        wrong = identity.model_copy(update={"create_time": identity.create_time - 3600.0})
         run = Run(
             id="run_reused",
             agent="x",
             status=RunStatus.RUNNING,
             pid=proc.pid,
-            pid_started_at=created - 3600.0,
+            pid_started_at=wrong.create_time,
+            process_identity=wrong,
         )
         app.repos.runs.upsert(run)
         recovered = app.runs.recover_orphans()

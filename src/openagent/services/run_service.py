@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.cancellation import CancellationRegistry, RunCancellation, RunCancelled
 from ..core.events import EventType, NormalizedEvent, RunPhase
-from ..core.models import AgentProfile, Run, RunStatus, RuntimeType, enum_value
+from ..core.models import AgentProfile, ProcessIdentity, Run, RunStatus, RuntimeType, enum_value
 from ..core.permissions import get_profile
 from ..core.projection import RunProjection
 from ..reporting.artifacts import ArtifactWriter, RunArtifacts, TestSummary
@@ -41,7 +41,13 @@ from ..runtimes.api_agent.loop import run_api_agent
 from ..runtimes.cli.base import CliAdapter, CliRunRequest
 from ..runtimes.cli.registry import build_cli_adapter
 from ..security.approvals import ApprovalCallback, ApprovalGate
-from ..security.process import PID_ALIVE, pid_identity, run_process_status, terminate_pid_tree
+from ..security.process import (
+    PID_ALIVE,
+    TerminationOutcome,
+    TerminationResult,
+    process_identity_status,
+    terminate_pid_tree,
+)
 from ..storage.event_log import EventLog
 from ..storage.projects import canonical_root, project_id_for
 from ..tools.base import AskUserResolver, ToolContext
@@ -99,10 +105,32 @@ class CancelOutcome(str, Enum):
     TERMINATED = "terminated"  # a live process tree was identity-verified and killed
     ALREADY_TERMINAL = "already_terminal"  # the run had already reached a terminal state
     NOT_FOUND = "not_found"  # no such run
-    #: The recorded PID no longer maps to *our* process (gone/reused/unverifiable) — refused to kill.
+    ALREADY_GONE = "already_gone"
+    IDENTITY_UNKNOWN = "identity_unknown"
     IDENTITY_MISMATCH = "identity_mismatch"
+    ACCESS_DENIED = "access_denied"
+    TERMINATION_FAILED = "termination_failed"
+    SURVIVORS_REMAINING = "survivors_remaining"
     #: An orphaned run with no safely identifiable live process (e.g. orphaned_pid_gone/reused).
     NOT_CANCELLABLE = "not_cancellable"
+
+
+_TERMINATION_CANCEL_OUTCOME = {
+    TerminationOutcome.ALREADY_GONE: CancelOutcome.ALREADY_GONE,
+    TerminationOutcome.IDENTITY_UNKNOWN: CancelOutcome.IDENTITY_UNKNOWN,
+    TerminationOutcome.IDENTITY_MISMATCH: CancelOutcome.IDENTITY_MISMATCH,
+    TerminationOutcome.ACCESS_DENIED: CancelOutcome.ACCESS_DENIED,
+    TerminationOutcome.TERMINATION_FAILED: CancelOutcome.TERMINATION_FAILED,
+    TerminationOutcome.SURVIVORS_REMAINING: CancelOutcome.SURVIVORS_REMAINING,
+}
+
+
+def _cancel_outcome(result: TerminationResult) -> CancelOutcome:
+    """Translate process evidence without collapsing distinct failure modes."""
+
+    if result.verified_terminated:
+        return CancelOutcome.TERMINATED
+    return _TERMINATION_CANCEL_OUTCOME.get(result.outcome, CancelOutcome.TERMINATION_FAILED)
 
 
 class RunError(RuntimeError):
@@ -480,6 +508,7 @@ class RunService:
             return self._finalize_failure(run, run_dir, art, state, exc)
         finally:
             self.cancellations.discard(run.id)
+            self._cancelled.discard(run.id)
 
     def _finalize_failure(
         self, run: Run, run_dir: Path, art: RunArtifacts, state: dict, exc: Exception
@@ -787,8 +816,14 @@ class RunService:
         if not run.provider_session_id:
             raise RunError("no session id recorded for this run")
 
-        async with lock:
-            return await self._resume_locked(run, agent, prompt, on_event)
+        try:
+            async with lock:
+                return await self._resume_locked(run, agent, prompt, on_event)
+        finally:
+            # Locks are per in-flight turn, not permanent run state. Keeping one for every run made
+            # a long-lived TUI/service grow without bound and retained stale event-loop objects.
+            if not lock.locked():
+                self._resume_locks.pop(run.id, None)
 
     async def _resume_locked(
         self, run: Run, agent: AgentProfile, prompt: str, on_event: EventHook | None
@@ -889,6 +924,7 @@ class RunService:
         finally:
             self._cli_adapters.pop(run.id, None)
             self.cancellations.discard(run.id)
+            self._cancelled.discard(run.id)
 
     def _finalize_resume(
         self,
@@ -1162,19 +1198,23 @@ class RunService:
 
         if run.status in _TERMINAL or _status_value(run) in {s.value for s in _TERMINAL}:
             return CancelOutcome.ALREADY_TERMINAL  # idempotent: already finished
-        self._cancelled.add(run_id)
-
-        # An in-process run (API or CLI) has a live cancellation flag: raise it first, so an API
-        # loop stops even though there is no process to kill.
-        signalled = self.cancellations.cancel(run_id, reason)
-
         adapter = self._cli_adapters.get(run_id)
         if adapter is not None:
-            # Same process: kill the tree; the running executor will finalize (emit run.cancelled).
-            await adapter.cancel(run_id)
+            # Prove process-tree termination before poisoning any cancellation flag. Otherwise an
+            # access-denied or identity-mismatch result makes the executor synthesize cancelled.
+            result = await adapter.cancel(run_id)
+            if not isinstance(result, TerminationResult):
+                return CancelOutcome.TERMINATION_FAILED
+            if not result.verified_terminated:
+                return _cancel_outcome(result)
+            self._cancelled.add(run_id)
+            self.cancellations.cancel(run_id, reason)
             return CancelOutcome.TERMINATED
+
+        # A process-free API loop can be cancelled by its controller. It owns finalization.
+        signalled = self.cancellations.cancel(run_id, reason)
         if signalled:
-            # the API loop owns finalization — do not race it by writing a status here
+            self._cancelled.add(run_id)
             return CancelOutcome.SIGNALLED
 
         # Cross-process / after restart: terminate by PID with identity verification, then finalize.
@@ -1182,10 +1222,10 @@ class RunService:
         # report identity_mismatch — so a cancel that killed nothing still wrote run.cancelled,
         # flipped the DB and rewrote status.json, while the real process (if any) kept running. A
         # cancellation that did not happen must leave no trace: refuse first, record only on success.
-        killed = terminate_pid_tree(run.pid, run.pid_started_at)
-        if not killed:
-            self._cancelled.discard(run_id)  # nothing was stopped; do not poison a later resolve
-            return CancelOutcome.IDENTITY_MISMATCH
+        result = terminate_pid_tree(run.process_identity)
+        if not result.verified_terminated:
+            return _cancel_outcome(result)
+        self._cancelled.add(run_id)
         self._persist_cancelled(run, reason, "user_cancelled")
         return CancelOutcome.TERMINATED
 
@@ -1200,13 +1240,17 @@ class RunService:
 
         if run.failure_type != "orphaned_unattached_process":
             return CancelOutcome.NOT_CANCELLABLE
-        status = run_process_status(run.pid, run.pid_started_at)
+        status = process_identity_status(run.process_identity)
         if status != PID_ALIVE:
             # gone / reused / unverifiable — fail closed, touch nothing.
+            if status == "gone":
+                return CancelOutcome.ALREADY_GONE
+            if status == "unknown":
+                return CancelOutcome.IDENTITY_UNKNOWN
             return CancelOutcome.IDENTITY_MISMATCH
-        killed = terminate_pid_tree(run.pid, run.pid_started_at)
-        if not killed:  # raced: exited or reused between the check above and the kill
-            return CancelOutcome.IDENTITY_MISMATCH
+        result = terminate_pid_tree(run.process_identity)
+        if not result.verified_terminated:  # raced between the check above and the signal
+            return _cancel_outcome(result)
         self._cancelled.add(run.id)
         self._record_orphan_terminated(run)
         self._persist_cancelled(run, reason, "orphaned_process_terminated_by_user")
@@ -1296,7 +1340,7 @@ class RunService:
             # controller) → genuinely still running here; leave it alone.
             if run.id in self._cli_adapters or self.cancellations.get(run.id) is not None:
                 continue
-            status = run_process_status(run.pid, run.pid_started_at)
+            status = process_identity_status(run.process_identity)
             if status == PID_ALIVE:
                 run.failure_type = run.failure_type or "orphaned_unattached_process"
                 self._record_orphan_event(run, status)
@@ -1442,7 +1486,13 @@ def _capture(event: NormalizedEvent, art: RunArtifacts | None, run: Run, state: 
     # The PID now arrives on process.started — run.started is OpenAgent's own event and has no pid.
     if etype == EventType.PROCESS_STARTED.value and data.get("pid"):
         run.pid = data["pid"]
-        run.pid_started_at = data.get("create_time") or pid_identity(data["pid"])
+        raw_identity = data.get("process_identity")
+        run.process_identity = (
+            ProcessIdentity.model_validate(raw_identity) if raw_identity is not None else None
+        )
+        run.pid_started_at = (
+            run.process_identity.create_time if run.process_identity else data.get("create_time")
+        )
     elif etype == EventType.RUN_PHASE.value and data.get("phase"):
         run.phase = str(data["phase"])
     elif etype == EventType.SESSION_CREATED.value and data.get("provider_session_id"):
