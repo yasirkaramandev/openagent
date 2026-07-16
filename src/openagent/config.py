@@ -68,12 +68,8 @@ def get_paths(project_root: Path | None = None) -> Paths:
     Honors ``OPENAGENT_DATA_DIR`` / ``OPENAGENT_CONFIG_DIR`` (used by tests to sandbox state).
     """
 
-    data_dir = _env_override(
-        "OPENAGENT_DATA_DIR", Path(platformdirs.user_data_dir(APP_NAME))
-    )
-    config_dir = _env_override(
-        "OPENAGENT_CONFIG_DIR", Path(platformdirs.user_config_dir(APP_NAME))
-    )
+    data_dir = _env_override("OPENAGENT_DATA_DIR", Path(platformdirs.user_data_dir(APP_NAME)))
+    config_dir = _env_override("OPENAGENT_CONFIG_DIR", Path(platformdirs.user_config_dir(APP_NAME)))
     root = (project_root or Path.cwd()).resolve()
     return Paths(
         data_dir=data_dir,

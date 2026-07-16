@@ -22,8 +22,9 @@ class AgentDetailScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static(f"Agent · {self.agent_name}  ([b]R[/b] run · [b]E[/b] edit)",
-                     classes="screen-title")
+        yield Static(
+            f"Agent · {self.agent_name}  ([b]R[/b] run · [b]E[/b] edit)", classes="screen-title"
+        )
         with VerticalScroll():
             yield Static(self._body_text(), id="body")
         yield Footer()
@@ -34,8 +35,11 @@ class AgentDetailScreen(Screen):
             return "[red]agent not found[/red]"
         rt = agent.runtime
         rtype = rt.type if isinstance(rt.type, str) else rt.type.value
-        binding = (f"- CLI: `{rt.cli}`" if rtype == "cli"
-                   else f"- Provider: `{rt.provider}`\n- Model: `{rt.model}`")
+        binding = (
+            f"- CLI: `{rt.cli}`"
+            if rtype == "cli"
+            else f"- Provider: `{rt.provider}`\n- Model: `{rt.model}`"
+        )
         return (
             f"[b]{agent.title or agent.name}[/b]\n\n"
             f"- Name: `{agent.name}`\n"
@@ -50,6 +54,7 @@ class AgentDetailScreen(Screen):
 
     def action_run(self) -> None:
         from .run_console import RunSetupScreen
+
         self.app.push_screen(RunSetupScreen(preselect=self.agent_name))
 
     def action_edit(self) -> None:

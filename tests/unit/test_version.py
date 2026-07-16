@@ -17,7 +17,7 @@ from typer.testing import CliRunner
 import openagent
 from openagent.cli.app import app
 
-TARGET = "0.1.1"
+TARGET = "0.1.2"
 _PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
 
@@ -43,4 +43,6 @@ def test_pyproject_keeps_a_single_version_source() -> None:
     text = _PYPROJECT.read_text(encoding="utf-8")
     assert 'dynamic = ["version"]' in text
     assert re.search(r"(?m)^\[tool\.hatch\.version\]", text)
-    assert not re.search(r'(?m)^version\s*=\s*"', text), "a hardcoded version re-appeared in pyproject"
+    assert not re.search(r'(?m)^version\s*=\s*"', text), (
+        "a hardcoded version re-appeared in pyproject"
+    )

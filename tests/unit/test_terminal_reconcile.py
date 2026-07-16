@@ -23,8 +23,9 @@ def _obs(*events: NormalizedEvent) -> TerminalObservations:
 
 
 def _final(obs: TerminalObservations, *, exit_code: int | None = 0, cancelled: bool = False) -> str:
-    ev = reconcile_terminal(run_id="run_x", source="test", observations=obs,
-                            exit_code=exit_code, cancelled=cancelled)
+    ev = reconcile_terminal(
+        run_id="run_x", source="test", observations=obs, exit_code=exit_code, cancelled=cancelled
+    )
     t = ev.type if isinstance(ev.type, str) else ev.type.value
     return t
 
@@ -46,8 +47,9 @@ def test_failed_then_completed_exit0_is_failed() -> None:
 
 def test_completed_then_completed_exit0_is_completed_once() -> None:
     obs = _obs(_ev(EventType.RUN_COMPLETED), _ev(EventType.RUN_COMPLETED))
-    ev = reconcile_terminal(run_id="run_x", source="test", observations=obs,
-                            exit_code=0, cancelled=False)
+    ev = reconcile_terminal(
+        run_id="run_x", source="test", observations=obs, exit_code=0, cancelled=False
+    )
     assert (ev.type if isinstance(ev.type, str) else ev.type.value) == COMPLETED
 
 
@@ -58,8 +60,9 @@ def test_cancelled_then_completed_is_cancelled() -> None:
 
 def test_completed_with_nonzero_exit_is_failed() -> None:
     obs = _obs(_ev(EventType.RUN_COMPLETED))
-    ev = reconcile_terminal(run_id="run_x", source="test", observations=obs,
-                            exit_code=1, cancelled=False)
+    ev = reconcile_terminal(
+        run_id="run_x", source="test", observations=obs, exit_code=1, cancelled=False
+    )
     assert (ev.type if isinstance(ev.type, str) else ev.type.value) == FAILED
     assert ev.data.get("error_type") == "exit_code_mismatch"
 
@@ -69,8 +72,9 @@ def test_no_event_exit0_is_failed() -> None:
 
 
 def test_no_event_exit0_reports_no_terminal_event() -> None:
-    ev = reconcile_terminal(run_id="run_x", source="test", observations=_obs(),
-                            exit_code=0, cancelled=False)
+    ev = reconcile_terminal(
+        run_id="run_x", source="test", observations=_obs(), exit_code=0, cancelled=False
+    )
     assert ev.data.get("error_type") == "no_terminal_event"
 
 
@@ -90,6 +94,7 @@ def test_explicit_process_cancel_wins_over_completed() -> None:
 
 def test_conflict_is_flagged_terminal_conflict() -> None:
     obs = _obs(_ev(EventType.RUN_COMPLETED), _ev(EventType.RUN_FAILED))
-    ev = reconcile_terminal(run_id="run_x", source="test", observations=obs,
-                            exit_code=0, cancelled=False)
+    ev = reconcile_terminal(
+        run_id="run_x", source="test", observations=obs, exit_code=0, cancelled=False
+    )
     assert ev.data.get("error_type") == "terminal_conflict"

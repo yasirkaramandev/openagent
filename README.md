@@ -174,6 +174,86 @@ openagent message --id <run-id> -p "now add a test"
 openagent cancel --id <run-id>
 ```
 
+## NVIDIA Build
+
+[NVIDIA Build](https://build.nvidia.com/) is NVIDIA's **hosted catalog of NIM APIs**: one NVIDIA API
+key reaches the models it publishes, over the OpenAI Chat Completions protocol at
+`https://integrate.api.nvidia.com/v1`. (Self-hosting NIM yourself? Use the `custom`
+OpenAI-compatible provider instead — this preset is for the hosted service.)
+
+**Get an API key**
+
+1. Sign in to [build.nvidia.com](https://build.nvidia.com/).
+2. Open a model page.
+3. Click **Generate API Key** / **Get API Key**.
+4. Paste it into the hidden prompt below, or save it as `NVIDIA_API_KEY`.
+5. **Never put the key directly in a command** — it would land in your shell history and CI logs.
+
+Keys commonly begin with `nvapi-`, but that is only a hint: OpenAgent does not enforce the format.
+
+**Connect it** — the OS keychain is the recommended method (the key is prompted with hidden input and
+never becomes a command argument):
+
+```bash
+openagent provider add nvidia-build --type nvidia-build
+```
+
+Or reference an environment variable instead of storing a secret:
+
+```bash
+export NVIDIA_API_KEY="…"          # PowerShell: $env:NVIDIA_API_KEY="…"
+openagent provider add nvidia-build --type nvidia-build --key-env NVIDIA_API_KEY
+```
+
+**Browse the catalog, then validate a model.** NVIDIA's catalog contains chat, embedding, reranking,
+vision and other model types — *a catalog entry is not automatically compatible with OpenAgent
+agents*, and reaching `/models` does not even prove your key works (the catalog may be public). So
+`provider models` reports `capabilities: null` for every entry, and only `provider probe` validates:
+
+```bash
+openagent provider models nvidia-build --search nemotron
+openagent provider models nvidia-build --owner nvidia --json
+openagent provider probe nvidia-build --model nvidia/nemotron-3-ultra-550b-a55b
+```
+
+The probe really exercises the model — text, streaming, **and tool calling** — and claims only what it
+observed. An OpenAgent API agent needs all three; a model that answers questions but cannot call tools
+cannot operate OpenAgent's tools, and the probe says so instead of pretending:
+
+```bash
+openagent provider probe nvidia-build --model <publisher/model> --json
+# {"provider":"nvidia-build","model":"…","text":true,"streaming":true,
+#  "tool_calling":true,"agent_compatible":true,"category":"verified","tested_at":"…"}
+```
+
+`openagent provider test nvidia-build` only checks that the catalog is reachable; it never claims the
+key is valid. Pass `--model <id>` to make it run a real probe.
+
+**Create an agent and run it.** Creating an agent on an unvalidated catalog model is refused — pass
+`--allow-unverified-model` to override explicitly (the agent is then flagged as unverified):
+
+```bash
+openagent add \
+  --name nvidia-coder \
+  --provider nvidia-build \
+  --model nvidia/nemotron-3-ultra-550b-a55b \
+  --profile safe-edit
+
+openagent run --name nvidia-coder --worktree auto \
+  --prompt "Inspect this repository and summarize its structure."
+
+openagent output --id <run-id> --format json
+openagent output --id <run-id> --format events
+```
+
+> The model id above is an example. Catalogs rotate — list the catalog and probe a current model
+> rather than trusting a hardcoded id.
+
+**Privacy:** some NVIDIA models stream a `reasoning_content` field. That is raw chain-of-thought, and
+OpenAgent never stores or displays it — not in `events.jsonl`, `timeline.md`, `result.json`, or the
+UI. Only the final answer is kept (and, if reported, the numeric reasoning-token count). Your API key
+is likewise scrubbed from every artifact and log.
+
 ## AI Agent Skill
 
 AI assistants can learn OpenAgent's safe CLI workflow from a bundled **skill**:

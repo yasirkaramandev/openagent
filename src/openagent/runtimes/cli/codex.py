@@ -101,8 +101,12 @@ class CodexAdapter:
             return None
         version = detect_version(self.executable)
         return CliInstallation(
-            id="cli_codex", type="codex", executable=self.executable,
-            version=version, adapter="codex-json", authenticated=None,
+            id="cli_codex",
+            type="codex",
+            executable=self.executable,
+            version=version,
+            adapter="codex-json",
+            authenticated=None,
             validated_version=VALIDATED_VERSION,
         )
 
@@ -115,7 +119,10 @@ class CodexAdapter:
 
     async def capabilities(self) -> CliCapabilities:
         return CliCapabilities(
-            structured_events=True, resumable=True, edits_files=True, runs_commands=True,
+            structured_events=True,
+            resumable=True,
+            edits_files=True,
+            runs_commands=True,
         )
 
     # ------------------------------------------------------------------ running
@@ -133,15 +140,19 @@ class CodexAdapter:
         # "unexpected argument '--sandbox' found". Resume therefore never worked against a real Codex;
         # only the argv-ignoring test fake made it look like it did.
         args = [
-            self.executable or "codex", "exec",
+            self.executable or "codex",
+            "exec",
             *self._common_args(request),
-            "resume", session_id, prompt,
+            "resume",
+            session_id,
+            prompt,
         ]
         return self._drive(request, args)
 
     def _build_args(self, request: CliRunRequest) -> list[str]:
         return [
-            self.executable or "codex", "exec",
+            self.executable or "codex",
+            "exec",
             *self._common_args(request),
             request.prompt,
         ]
@@ -150,9 +161,12 @@ class CodexAdapter:
         sandbox = get_profile(request.permission_profile).codex_sandbox
         args = [
             "--json",
-            "--sandbox", sandbox,
-            "-c", f"model_reasoning_summary={REASONING_SUMMARY_MODE}",
-            "-o", str(self._final_message_path(request)),
+            "--sandbox",
+            sandbox,
+            "-c",
+            f"model_reasoning_summary={REASONING_SUMMARY_MODE}",
+            "-o",
+            str(self._final_message_path(request)),
         ]
         if request.model:
             # Without this an agent inherits whatever ~/.codex/config.toml names, which may be a
@@ -186,7 +200,9 @@ class CodexAdapter:
     ) -> AsyncIterator[NormalizedEvent]:
         if not self.executable:
             yield NormalizedEvent(
-                run_id=request.run_id, type=EventType.RUN_FAILED, source=SOURCE,
+                run_id=request.run_id,
+                type=EventType.RUN_FAILED,
+                source=SOURCE,
                 data={"error_type": "cli_not_found", "message": "codex is not installed"},
             )
             return
@@ -205,7 +221,11 @@ class CodexAdapter:
 
         try:
             async for event in run_managed_cli(
-                proc=proc, run_id=request.run_id, source=SOURCE, mapper=mapper, finalizer=finalizer,
+                proc=proc,
+                run_id=request.run_id,
+                source=SOURCE,
+                mapper=mapper,
+                finalizer=finalizer,
             ):
                 yield event
         finally:
@@ -245,11 +265,19 @@ def final_message_fallback(
 
     if outcome.saw_message or outcome.cancelled or not text:
         return []
-    return [NormalizedEvent(
-        run_id=run_id, type=EventType.MESSAGE_COMPLETED, source=SOURCE,
-        data={"item_id": "final_message", "status": ItemStatus.COMPLETED.value,
-              "text": text[:MAX_COMMAND_OUTPUT_CHARS * 4], "fallback": True},
-    )]
+    return [
+        NormalizedEvent(
+            run_id=run_id,
+            type=EventType.MESSAGE_COMPLETED,
+            source=SOURCE,
+            data={
+                "item_id": "final_message",
+                "status": ItemStatus.COMPLETED.value,
+                "text": text[: MAX_COMMAND_OUTPUT_CHARS * 4],
+                "fallback": True,
+            },
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- event mapping
@@ -271,14 +299,17 @@ def map_codex_event(
         return [ev(EventType.RUN_PHASE, phase="running")]
     if etype == "turn.completed":
         usage = obj.get("usage") or {}
-        return [ev(
-            EventType.USAGE_UPDATED,
-            input_tokens=int(usage.get("input_tokens") or 0),
-            cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
-            output_tokens=int(usage.get("output_tokens") or 0),
-            # Codex names it reasoning_output_tokens; OpenAgent normalizes to reasoning_tokens.
-            reasoning_tokens=int(usage.get("reasoning_output_tokens") or 0),
-        ), ev(EventType.RUN_COMPLETED)]
+        return [
+            ev(
+                EventType.USAGE_UPDATED,
+                input_tokens=int(usage.get("input_tokens") or 0),
+                cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                # Codex names it reasoning_output_tokens; OpenAgent normalizes to reasoning_tokens.
+                reasoning_tokens=int(usage.get("reasoning_output_tokens") or 0),
+            ),
+            ev(EventType.RUN_COMPLETED),
+        ]
     if etype == "turn.failed":
         message = _error_message((obj.get("error") or {}).get("message"))
         return [ev(EventType.RUN_FAILED, error_type=classify_error(message), message=message)]
@@ -303,8 +334,14 @@ def _map_item(
         text = str(item.get("text") or "")
         if not completed or not text.strip():
             return []
-        return [ev(EventType.MESSAGE_COMPLETED, item_id=item_id,
-                   status=ItemStatus.COMPLETED.value, text=text)]
+        return [
+            ev(
+                EventType.MESSAGE_COMPLETED,
+                item_id=item_id,
+                status=ItemStatus.COMPLETED.value,
+                text=text,
+            )
+        ]
 
     if itype == "reasoning":
         # The reasoning **summary** Codex itself exposes (never raw chain-of-thought, item 1).
@@ -312,13 +349,21 @@ def _map_item(
         if not text:
             return []  # never render a blank summary
         status = ItemStatus.COMPLETED.value if completed else ItemStatus.IN_PROGRESS.value
-        return [ev(EventType.REASONING_SUMMARY, item_id=item_id, status=status, text=text,
-                   title="Reasoning summary")]
+        return [
+            ev(
+                EventType.REASONING_SUMMARY,
+                item_id=item_id,
+                status=status,
+                text=text,
+                title="Reasoning summary",
+            )
+        ]
 
     if itype in ("todo_list", "plan"):
         entries = [
             {"text": str(x.get("text") or ""), "completed": bool(x.get("completed"))}
-            for x in (item.get("items") or []) if isinstance(x, dict)
+            for x in (item.get("items") or [])
+            if isinstance(x, dict)
         ]
         status = ItemStatus.COMPLETED.value if completed else ItemStatus.IN_PROGRESS.value
         return [ev(EventType.PLAN_UPDATED, item_id=item_id, status=status, items=entries)]
@@ -332,20 +377,38 @@ def _map_item(
     if itype == "web_search":
         query = str(item.get("query") or "")
         if completed:
-            return [ev(EventType.WEB_SEARCH_COMPLETED, item_id=item_id,
-                       status=ItemStatus.COMPLETED.value, query=query)]
+            return [
+                ev(
+                    EventType.WEB_SEARCH_COMPLETED,
+                    item_id=item_id,
+                    status=ItemStatus.COMPLETED.value,
+                    query=query,
+                )
+            ]
         if etype == "item.started":
             # The query is empty on start and arrives on completion — don't show a blank search.
-            return [ev(EventType.WEB_SEARCH_STARTED, item_id=item_id,
-                       status=ItemStatus.IN_PROGRESS.value, query=query)]
+            return [
+                ev(
+                    EventType.WEB_SEARCH_STARTED,
+                    item_id=item_id,
+                    status=ItemStatus.IN_PROGRESS.value,
+                    query=query,
+                )
+            ]
         return []
 
     if itype in ("mcp_tool_call", "tool_call"):
         return _map_tool_call(item, item_id, etype, completed, ev)
 
     if itype == "error":
-        return [ev(EventType.LOG, level="error", item_id=item_id,
-                   message=_error_message(item.get("message")))]
+        return [
+            ev(
+                EventType.LOG,
+                level="error",
+                item_id=item_id,
+                message=_error_message(item.get("message")),
+            )
+        ]
 
     if completed:
         return [ev(EventType.LOG, item_type=itype, item_id=item_id)]
@@ -361,22 +424,45 @@ def _map_command(
     exit_code = item.get("exit_code")
 
     if etype == "item.started":
-        return [ev(EventType.COMMAND_STARTED, item_id=item_id,
-                   status=ItemStatus.IN_PROGRESS.value, command=command)]
+        return [
+            ev(
+                EventType.COMMAND_STARTED,
+                item_id=item_id,
+                status=ItemStatus.IN_PROGRESS.value,
+                command=command,
+            )
+        ]
 
     if etype == "item.updated":
         # ``aggregated_output`` is the *whole* buffer each time, not a delta: mark it a snapshot so
         # readers replace the visible output rather than appending the full buffer again (item 5).
         if not output:
             return []
-        return [ev(EventType.COMMAND_OUTPUT, item_id=item_id,
-                   status=ItemStatus.IN_PROGRESS.value, command=command,
-                   output=output, snapshot=True)]
+        return [
+            ev(
+                EventType.COMMAND_OUTPUT,
+                item_id=item_id,
+                status=ItemStatus.IN_PROGRESS.value,
+                command=command,
+                output=output,
+                snapshot=True,
+            )
+        ]
 
     # completed — a failed/declined command must never look successful (item 5).
     status = _command_status(native, exit_code)
-    return [ev(EventType.COMMAND_COMPLETED, item_id=item_id, status=status, command=command,
-               exit_code=exit_code, output=output, snapshot=True, native_status=native or None)]
+    return [
+        ev(
+            EventType.COMMAND_COMPLETED,
+            item_id=item_id,
+            status=status,
+            command=command,
+            exit_code=exit_code,
+            output=output,
+            snapshot=True,
+            native_status=native or None,
+        )
+    ]
 
 
 def _command_status(native: str, exit_code: Any) -> str:
@@ -384,8 +470,7 @@ def _command_status(native: str, exit_code: Any) -> str:
         return ItemStatus.FAILED.value
     if native == "completed":
         # Codex reports 'completed' for a command that ran — success still depends on the exit code.
-        return (ItemStatus.COMPLETED.value if exit_code in (0, None)
-                else ItemStatus.FAILED.value)
+        return ItemStatus.COMPLETED.value if exit_code in (0, None) else ItemStatus.FAILED.value
     if exit_code is None:
         return ItemStatus.COMPLETED.value
     return ItemStatus.COMPLETED.value if exit_code == 0 else ItemStatus.FAILED.value
@@ -400,8 +485,9 @@ def _map_file_change(
         return []
 
     if completed:
-        status = (ItemStatus.FAILED.value if native in _FAILED_STATUSES
-                  else ItemStatus.COMPLETED.value)
+        status = (
+            ItemStatus.FAILED.value if native in _FAILED_STATUSES else ItemStatus.COMPLETED.value
+        )
     else:
         status = ItemStatus.IN_PROGRESS.value
 
@@ -414,10 +500,16 @@ def _map_file_change(
         path = _relative_path(str(change.get("path") or ""), workspace)
         # One file_change item can touch several paths; give each its own addressable id so
         # started→completed updates the *same* file's card without collapsing the others (item 3).
-        events.append(ev(
-            event_type, item_id=f"{item_id}#{index}", status=status, path=path, change=verb,
-            native_status=native or None,
-        ))
+        events.append(
+            ev(
+                event_type,
+                item_id=f"{item_id}#{index}",
+                status=status,
+                path=path,
+                change=verb,
+                native_status=native or None,
+            )
+        )
     return events
 
 
@@ -432,17 +524,35 @@ def _map_tool_call(
         data["server"] = server
 
     if etype == "item.started":
-        return [ev(EventType.TOOL_STARTED, status=ItemStatus.IN_PROGRESS.value,
-                   arguments_summary=_summarize(item.get("arguments")), **data)]
+        return [
+            ev(
+                EventType.TOOL_STARTED,
+                status=ItemStatus.IN_PROGRESS.value,
+                arguments_summary=_summarize(item.get("arguments")),
+                **data,
+            )
+        ]
     if not completed:
         return []
 
     failed = native in _FAILED_STATUSES or bool(item.get("error"))
     if failed:
-        return [ev(EventType.TOOL_FAILED, status=ItemStatus.FAILED.value,
-                   error=_summarize(item.get("error")) or "tool call failed", **data)]
-    return [ev(EventType.TOOL_COMPLETED, status=ItemStatus.COMPLETED.value,
-               result_summary=_summarize(item.get("result")), **data)]
+        return [
+            ev(
+                EventType.TOOL_FAILED,
+                status=ItemStatus.FAILED.value,
+                error=_summarize(item.get("error")) or "tool call failed",
+                **data,
+            )
+        ]
+    return [
+        ev(
+            EventType.TOOL_COMPLETED,
+            status=ItemStatus.COMPLETED.value,
+            result_summary=_summarize(item.get("result")),
+            **data,
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- helpers
@@ -509,8 +619,17 @@ def classify_error(message: str) -> str:
         return "provider_rate_limited"
     if "insufficient" in low and ("credit" in low or "balance" in low or "fund" in low):
         return "insufficient_balance"
-    if any(x in low for x in ("unauthorized", "authentication", "not logged in", "401",
-                              "invalid api key", "please sign in")):
+    if any(
+        x in low
+        for x in (
+            "unauthorized",
+            "authentication",
+            "not logged in",
+            "401",
+            "invalid api key",
+            "please sign in",
+        )
+    ):
         return "authentication_failed"
     if "context" in low and ("length" in low or "window" in low or "too long" in low):
         return "context_limit"

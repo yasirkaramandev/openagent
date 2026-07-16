@@ -70,7 +70,12 @@ class PreflightReport:
     checks: list[Check] = field(default_factory=list)
 
     def add(
-        self, name: str, ok: bool, detail: str = "", *, mandatory: bool = True,
+        self,
+        name: str,
+        ok: bool,
+        detail: str = "",
+        *,
+        mandatory: bool = True,
         error_type: str = "preflight_failed",
     ) -> Check:
         check = Check(name=name, ok=ok, detail=detail, mandatory=mandatory, error_type=error_type)
@@ -116,21 +121,32 @@ class PreflightService:
         self.app = app
 
     async def check(
-        self, *, agent_name: str, permission_profile: str | None = None,
+        self,
+        *,
+        agent_name: str,
+        permission_profile: str | None = None,
         workspace: Path | None = None,
     ) -> PreflightReport:
         report = PreflightReport()
         agent = self.app.repos.agents.get(agent_name)
         if agent is None:
-            report.add("Agent exists", False, f"no agent named {agent_name!r}",
-                       error_type="agent_not_found")
+            report.add(
+                "Agent exists",
+                False,
+                f"no agent named {agent_name!r}",
+                error_type="agent_not_found",
+            )
             return report
         report.add("Agent exists", True, agent.name)
 
         profile_name = permission_profile or agent.permission_profile
         if profile_name not in PROFILES:
-            report.add("Permission profile", False, f"unknown profile {profile_name!r}",
-                       error_type="permission_profile_invalid")
+            report.add(
+                "Permission profile",
+                False,
+                f"unknown profile {profile_name!r}",
+                error_type="permission_profile_invalid",
+            )
             return report
         report.add("Permission profile", True, profile_name)
 
@@ -151,73 +167,113 @@ class PreflightService:
     ) -> None:
         cli_type = agent.runtime.cli or ""
         if cli_type not in known_cli_types():
-            report.add("CLI type is known", False,
-                       f"{cli_type!r} is not a known CLI (known: {', '.join(known_cli_types())})",
-                       error_type="cli_not_found")
+            report.add(
+                "CLI type is known",
+                False,
+                f"{cli_type!r} is not a known CLI (known: {', '.join(known_cli_types())})",
+                error_type="cli_not_found",
+            )
             return
         report.add("CLI type is known", True, cli_type)
 
         adapter = build_cli_adapter(cli_type)
         executable = getattr(adapter, "executable", None)
         if not executable:
-            report.add(f"{cli_type} is installed", False,
-                       f"{cli_type} was not found on PATH — install it, then re-run readiness",
-                       error_type="cli_not_found")
+            report.add(
+                f"{cli_type} is installed",
+                False,
+                f"{cli_type} was not found on PATH — install it, then re-run readiness",
+                error_type="cli_not_found",
+            )
             return
         report.add(f"{cli_type} found", True, executable)
 
         path = Path(executable)
-        report.add("Executable is runnable", path.is_file() and os.access(path, os.X_OK),
-                   str(path), error_type="cli_not_found")
+        report.add(
+            "Executable is runnable",
+            path.is_file() and os.access(path, os.X_OK),
+            str(path),
+            error_type="cli_not_found",
+        )
 
         version = detect_version(executable)
-        report.add("Version detected", bool(version), version or "could not read --version",
-                   mandatory=False)
+        report.add(
+            "Version detected",
+            bool(version),
+            version or "could not read --version",
+            mandatory=False,
+        )
 
         try:
             auth = await adapter.inspect_auth()
-            report.add("Authentication detected", bool(auth.authenticated), auth.detail,
-                       error_type="authentication_failed")
+            report.add(
+                "Authentication detected",
+                bool(auth.authenticated),
+                auth.detail,
+                error_type="authentication_failed",
+            )
         except Exception as exc:  # noqa: BLE001 - auth probing is best-effort
-            report.add("Authentication detected", False, f"could not check auth: {exc}",
-                       error_type="authentication_failed")
+            report.add(
+                "Authentication detected",
+                False,
+                f"could not check auth: {exc}",
+                error_type="authentication_failed",
+            )
 
         if cli_type == "codex":
             self._check_codex(report, executable, profile_name)
         elif cli_type == "antigravity":
             allowed, reason = adapter.permission_status(profile_name)  # type: ignore[attr-defined]
-            report.add("Adapter supports the requested mode", allowed, reason,
-                       error_type="permission_mode_unsupported")
+            report.add(
+                "Adapter supports the requested mode",
+                allowed,
+                reason,
+                error_type="permission_mode_unsupported",
+            )
         else:
             profile = get_profile(profile_name)
             caps = await adapter.capabilities()
             supported = caps.edits_files or not profile.can_edit_files
-            report.add("Adapter supports the requested mode", supported,
-                       f"{profile_name} on {cli_type}",
-                       error_type="permission_mode_unsupported")
+            report.add(
+                "Adapter supports the requested mode",
+                supported,
+                f"{profile_name} on {cli_type}",
+                error_type="permission_mode_unsupported",
+            )
 
     def _check_codex(self, report: PreflightReport, executable: str, profile_name: str) -> None:
         """Codex-specific readiness: ``codex exec``, JSON output, and the sandbox we will request."""
 
         help_text = _exec_help(executable)
         if help_text is None:
-            report.add("codex exec is available", False,
-                       "`codex exec --help` did not run — the CLI may be broken or too old",
-                       error_type="cli_not_found")
+            report.add(
+                "codex exec is available",
+                False,
+                "`codex exec --help` did not run — the CLI may be broken or too old",
+                error_type="cli_not_found",
+            )
             return
         report.add("codex exec is available", True, "`codex exec --help` ok")
-        report.add("codex exec supports --json", "--json" in help_text,
-                   "JSONL event stream" if "--json" in help_text
-                   else "this codex build has no --json output; OpenAgent needs it for live events",
-                   error_type="schema_mismatch")
+        report.add(
+            "codex exec supports --json",
+            "--json" in help_text,
+            "JSONL event stream"
+            if "--json" in help_text
+            else "this codex build has no --json output; OpenAgent needs it for live events",
+            error_type="schema_mismatch",
+        )
 
         sandbox = get_profile(profile_name).codex_sandbox
         # `codex exec --help` lists the accepted --sandbox values; only claim support for a real one.
         supported = sandbox in help_text
-        report.add(f"Sandbox '{sandbox}' supported", supported,
-                   f"{profile_name} → --sandbox {sandbox}" if supported
-                   else f"this codex build does not accept --sandbox {sandbox}",
-                   error_type="permission_mode_unsupported")
+        report.add(
+            f"Sandbox '{sandbox}' supported",
+            supported,
+            f"{profile_name} → --sandbox {sandbox}"
+            if supported
+            else f"this codex build does not accept --sandbox {sandbox}",
+            error_type="permission_mode_unsupported",
+        )
 
     # ------------------------------------------------------------------ API
 
@@ -225,9 +281,12 @@ class PreflightService:
         name = agent.runtime.provider or ""
         provider = self.app.repos.providers.get_by_name(name)
         if provider is None:
-            report.add("Provider exists", False,
-                       f"agent points at provider {name!r}, which is not registered",
-                       error_type="provider_not_found")
+            report.add(
+                "Provider exists",
+                False,
+                f"agent points at provider {name!r}, which is not registered",
+                error_type="provider_not_found",
+            )
             return
         report.add("Provider exists", True, f"{provider.name} ({provider.provider_type})")
 
@@ -243,12 +302,16 @@ class PreflightService:
         else:
             try:
                 available = self.app.credentials.available(cred)
-                detail = (f"{ctype.value} credential resolved" if available
-                          else f"{ctype.value} credential is missing — re-add the provider's key")
+                detail = (
+                    f"{ctype.value} credential resolved"
+                    if available
+                    else f"{ctype.value} credential is missing — re-add the provider's key"
+                )
             except Exception as exc:  # noqa: BLE001 - a broken keychain must not crash preflight
                 available, detail = False, f"could not read credential: {exc}"
-            report.add("Credential is available", available, detail,
-                       error_type="credential_missing")
+            report.add(
+                "Credential is available", available, detail, error_type="credential_missing"
+            )
 
         try:
             base_url = resolve_base_url(provider)
@@ -258,15 +321,20 @@ class PreflightService:
             return
 
         model = (agent.runtime.model or "").strip()
-        report.add("Model is set", bool(model), model or "the agent has no model id",
-                   error_type="model_missing")
+        report.add(
+            "Model is set",
+            bool(model),
+            model or "the agent has no model id",
+            error_type="model_missing",
+        )
 
         try:
             build_adapter(provider, self.app.credentials.resolve(cred))
             report.add("Provider adapter builds", True, provider.protocol.value)
         except Exception as exc:  # noqa: BLE001 - surface a construction failure as a blocker
-            report.add("Provider adapter builds", False, str(exc),
-                       error_type="provider_adapter_failed")
+            report.add(
+                "Provider adapter builds", False, str(exc), error_type="provider_adapter_failed"
+            )
 
 
 # --------------------------------------------------------------------------- helpers
@@ -300,7 +368,10 @@ def _exec_help(executable: str) -> str | None:
     try:
         result = subprocess.run(  # noqa: S603 - executable came from our own PATH lookup
             [executable, "exec", "--help"],
-            capture_output=True, text=True, timeout=15, check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
         text = (result.stdout or "") + (result.stderr or "")
         _HELP_CACHE[executable] = text if result.returncode == 0 and text else None

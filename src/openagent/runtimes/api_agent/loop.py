@@ -73,8 +73,12 @@ async def run_api_agent(
 
     def _cancelled(step: int) -> ApiRunOutcome:
         return ApiRunOutcome(
-            completed=False, cancelled=True, usage=total, steps=step,
-            error_type="user_cancelled", error_message=cancel.reason or "cancelled by user",
+            completed=False,
+            cancelled=True,
+            usage=total,
+            steps=step,
+            error_type="user_cancelled",
+            error_message=cancel.reason or "cancelled by user",
         )
 
     for step in range(1, agent.max_steps + 1):
@@ -83,8 +87,12 @@ async def run_api_agent(
 
         _emit(EventType.MESSAGE_STARTED, step=step)
         request = NormalizedModelRequest(
-            model=model, messages=conversation, tools=tools, system=system,
-            temperature=temperature, stream=True,
+            model=model,
+            messages=conversation,
+            tools=tools,
+            system=system,
+            temperature=temperature,
+            stream=True,
         )
 
         text_parts: list[str] = []
@@ -116,8 +124,8 @@ async def run_api_agent(
                     total.reasoning_tokens += event.usage.reasoning_tokens
                     if event.usage.provider_cost is not None:
                         total.provider_cost = (
-                            (total.provider_cost or 0.0) + event.usage.provider_cost
-                        )
+                            total.provider_cost or 0.0
+                        ) + event.usage.provider_cost
                     _emit(EventType.USAGE_UPDATED, **event.usage.model_dump())
                 elif event.type == ModelEventType.ERROR:
                     error_type, error_message = event.error_type, event.error_message
@@ -128,14 +136,22 @@ async def run_api_agent(
             await _aclose(stream)
 
         text = "".join(text_parts)
-        _emit(EventType.MESSAGE_COMPLETED, item_id=f"msg_{step}",
-              status=ItemStatus.COMPLETED.value, text=text,
-              tool_calls=[c.name for c in tool_calls], step=step)
+        _emit(
+            EventType.MESSAGE_COMPLETED,
+            item_id=f"msg_{step}",
+            status=ItemStatus.COMPLETED.value,
+            text=text,
+            tool_calls=[c.name for c in tool_calls],
+            step=step,
+        )
 
         if error_type is not None:
             return ApiRunOutcome(
-                completed=False, usage=total, steps=step,
-                error_type=error_type, error_message=error_message,
+                completed=False,
+                usage=total,
+                steps=step,
+                error_type=error_type,
+                error_message=error_message,
             )
 
         conversation.append(Message(role=Role.ASSISTANT, content=text, tool_calls=tool_calls))
@@ -146,22 +162,37 @@ async def run_api_agent(
         for call in tool_calls:
             if cancel.cancelled:  # never start another tool after a cancel
                 return _cancelled(step)
-            _emit(EventType.TOOL_REQUESTED, item_id=call.id, tool=call.name,
-                  arguments=call.arguments)
-            _emit(EventType.TOOL_STARTED, item_id=call.id, tool=call.name,
-                  status=ItemStatus.IN_PROGRESS.value)
+            _emit(
+                EventType.TOOL_REQUESTED, item_id=call.id, tool=call.name, arguments=call.arguments
+            )
+            _emit(
+                EventType.TOOL_STARTED,
+                item_id=call.id,
+                tool=call.name,
+                status=ItemStatus.IN_PROGRESS.value,
+            )
             try:
                 result = executor.execute(call)
             except TaskFinished as finished:
-                _emit(EventType.TOOL_COMPLETED, item_id=call.id, tool="finish_task",
-                      status=ItemStatus.COMPLETED.value, summary=finished.summary)
+                _emit(
+                    EventType.TOOL_COMPLETED,
+                    item_id=call.id,
+                    tool="finish_task",
+                    status=ItemStatus.COMPLETED.value,
+                    summary=finished.summary,
+                )
                 return ApiRunOutcome(
                     completed=True, summary=finished.summary, usage=total, steps=step
                 )
             except RunCancelled:
                 # A blocking tool (an approval or ask_user modal) was released by the cancel.
-                _emit(EventType.TOOL_FAILED, item_id=call.id, tool=call.name,
-                      status=ItemStatus.CANCELLED.value, error="run cancelled")
+                _emit(
+                    EventType.TOOL_FAILED,
+                    item_id=call.id,
+                    tool=call.name,
+                    status=ItemStatus.CANCELLED.value,
+                    error="run cancelled",
+                )
                 return _cancelled(step)
 
             # A tool may have blocked on the user (ask_user/approval) while a cancel arrived.
@@ -169,19 +200,29 @@ async def run_api_agent(
                 return _cancelled(step)
 
             event_type = EventType.TOOL_COMPLETED if result.ok else EventType.TOOL_FAILED
-            _emit(event_type, item_id=call.id, tool=call.name, ok=result.ok,
-                  status=ItemStatus.COMPLETED.value if result.ok else ItemStatus.FAILED.value)
+            _emit(
+                event_type,
+                item_id=call.id,
+                tool=call.name,
+                ok=result.ok,
+                status=ItemStatus.COMPLETED.value if result.ok else ItemStatus.FAILED.value,
+            )
             conversation.append(
                 Message(
                     role=Role.TOOL,
                     tool_call_id=call.id,
-                    content=(result.content or ("ok" if result.ok else "failed"))[:_MAX_TOOL_RESULT_CHARS],
+                    content=(result.content or ("ok" if result.ok else "failed"))[
+                        :_MAX_TOOL_RESULT_CHARS
+                    ],
                 )
             )
 
     return ApiRunOutcome(
-        completed=False, usage=total, steps=agent.max_steps,
-        error_type="max_steps_exceeded", error_message=f"exceeded {agent.max_steps} steps",
+        completed=False,
+        usage=total,
+        steps=agent.max_steps,
+        error_type="max_steps_exceeded",
+        error_message=f"exceeded {agent.max_steps} steps",
     )
 
 

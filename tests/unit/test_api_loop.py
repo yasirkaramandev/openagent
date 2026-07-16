@@ -47,36 +47,55 @@ def _agent() -> AgentProfile:
 
 def _executor(root: Path) -> ToolExecutor:
     ctx = ToolContext(
-        workspace_root=root, profile=get_profile(SAFE_EDIT),
-        approval_gate=ApprovalGate(auto_approve=True), run_id="run_test",
+        workspace_root=root,
+        profile=get_profile(SAFE_EDIT),
+        approval_gate=ApprovalGate(auto_approve=True),
+        run_id="run_test",
     )
     return ToolExecutor(ctx)
 
 
 async def test_loop_runs_tool_then_finishes(tmp_path: Path):
     (tmp_path / "main.py").write_text("value = 1\n")
-    adapter = ScriptedAdapter([
-        # turn 1: request an apply_patch tool call
+    adapter = ScriptedAdapter(
         [
-            NormalizedModelEvent(
-                type=ModelEventType.TOOL_CALL,
-                tool_call=ToolCall(id="c1", name="apply_patch", arguments={
-                    "path": "main.py", "old_string": "value = 1", "new_string": "value = 2"}),
-            ),
-            NormalizedModelEvent(type=ModelEventType.USAGE, usage=TokenUsage(input_tokens=10, output_tokens=5)),
-            NormalizedModelEvent(type=ModelEventType.DONE),
-        ],
-        # turn 2: final text answer, no tool calls
-        [
-            NormalizedModelEvent(type=ModelEventType.TEXT_DELTA, text="Updated value to 2."),
-            NormalizedModelEvent(type=ModelEventType.USAGE, usage=TokenUsage(input_tokens=12, output_tokens=6)),
-            NormalizedModelEvent(type=ModelEventType.DONE),
-        ],
-    ])
+            # turn 1: request an apply_patch tool call
+            [
+                NormalizedModelEvent(
+                    type=ModelEventType.TOOL_CALL,
+                    tool_call=ToolCall(
+                        id="c1",
+                        name="apply_patch",
+                        arguments={
+                            "path": "main.py",
+                            "old_string": "value = 1",
+                            "new_string": "value = 2",
+                        },
+                    ),
+                ),
+                NormalizedModelEvent(
+                    type=ModelEventType.USAGE, usage=TokenUsage(input_tokens=10, output_tokens=5)
+                ),
+                NormalizedModelEvent(type=ModelEventType.DONE),
+            ],
+            # turn 2: final text answer, no tool calls
+            [
+                NormalizedModelEvent(type=ModelEventType.TEXT_DELTA, text="Updated value to 2."),
+                NormalizedModelEvent(
+                    type=ModelEventType.USAGE, usage=TokenUsage(input_tokens=12, output_tokens=6)
+                ),
+                NormalizedModelEvent(type=ModelEventType.DONE),
+            ],
+        ]
+    )
     events: list[NormalizedEvent] = []
     outcome = await run_api_agent(
-        run_id="run_test", agent=_agent(), prompt="bump value to 2",
-        adapter=adapter, executor=_executor(tmp_path), workspace_root=tmp_path,
+        run_id="run_test",
+        agent=_agent(),
+        prompt="bump value to 2",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
         emit=events.append,
     )
     assert outcome.completed
@@ -91,21 +110,30 @@ async def test_loop_runs_tool_then_finishes(tmp_path: Path):
 
 async def test_loop_accumulates_provider_cost_across_turns(tmp_path: Path):
     """provider_cost is summed across turns into the outcome usage (item 12)."""
-    adapter = ScriptedAdapter([
+    adapter = ScriptedAdapter(
         [
-            NormalizedModelEvent(type=ModelEventType.USAGE,
-                                 usage=TokenUsage(input_tokens=10, output_tokens=5, provider_cost=0.01)),
-            NormalizedModelEvent(
-                type=ModelEventType.TOOL_CALL,
-                tool_call=ToolCall(id="c1", name="finish_task", arguments={"summary": "done"}),
-            ),
-            NormalizedModelEvent(type=ModelEventType.DONE),
-        ],
-    ])
+            [
+                NormalizedModelEvent(
+                    type=ModelEventType.USAGE,
+                    usage=TokenUsage(input_tokens=10, output_tokens=5, provider_cost=0.01),
+                ),
+                NormalizedModelEvent(
+                    type=ModelEventType.TOOL_CALL,
+                    tool_call=ToolCall(id="c1", name="finish_task", arguments={"summary": "done"}),
+                ),
+                NormalizedModelEvent(type=ModelEventType.DONE),
+            ],
+        ]
+    )
     events: list[NormalizedEvent] = []
     outcome = await run_api_agent(
-        run_id="r", agent=_agent(), prompt="x", adapter=adapter,
-        executor=_executor(tmp_path), workspace_root=tmp_path, emit=events.append,
+        run_id="r",
+        agent=_agent(),
+        prompt="x",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
+        emit=events.append,
     )
     assert outcome.completed
     assert outcome.usage.provider_cost == 0.01
@@ -115,31 +143,52 @@ async def test_loop_accumulates_provider_cost_across_turns(tmp_path: Path):
 
 
 async def test_loop_finish_task_tool(tmp_path: Path):
-    adapter = ScriptedAdapter([
+    adapter = ScriptedAdapter(
         [
-            NormalizedModelEvent(
-                type=ModelEventType.TOOL_CALL,
-                tool_call=ToolCall(id="c1", name="finish_task", arguments={"summary": "nothing to do"}),
-            ),
-            NormalizedModelEvent(type=ModelEventType.DONE),
-        ],
-    ])
+            [
+                NormalizedModelEvent(
+                    type=ModelEventType.TOOL_CALL,
+                    tool_call=ToolCall(
+                        id="c1", name="finish_task", arguments={"summary": "nothing to do"}
+                    ),
+                ),
+                NormalizedModelEvent(type=ModelEventType.DONE),
+            ],
+        ]
+    )
     outcome = await run_api_agent(
-        run_id="r", agent=_agent(), prompt="noop", adapter=adapter,
-        executor=_executor(tmp_path), workspace_root=tmp_path, emit=lambda e: None,
+        run_id="r",
+        agent=_agent(),
+        prompt="noop",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
+        emit=lambda e: None,
     )
     assert outcome.completed
     assert outcome.summary == "nothing to do"
 
 
 async def test_loop_reports_error(tmp_path: Path):
-    adapter = ScriptedAdapter([
-        [NormalizedModelEvent(type=ModelEventType.ERROR, error_type="authentication_failed",
-                              error_message="bad key")],
-    ])
+    adapter = ScriptedAdapter(
+        [
+            [
+                NormalizedModelEvent(
+                    type=ModelEventType.ERROR,
+                    error_type="authentication_failed",
+                    error_message="bad key",
+                )
+            ],
+        ]
+    )
     outcome = await run_api_agent(
-        run_id="r", agent=_agent(), prompt="x", adapter=adapter,
-        executor=_executor(tmp_path), workspace_root=tmp_path, emit=lambda e: None,
+        run_id="r",
+        agent=_agent(),
+        prompt="x",
+        adapter=adapter,
+        executor=_executor(tmp_path),
+        workspace_root=tmp_path,
+        emit=lambda e: None,
     )
     assert not outcome.completed
     assert outcome.error_type == "authentication_failed"
@@ -186,11 +235,18 @@ async def test_stalled_stream_is_cancelled_without_a_new_chunk(tmp_path: Path):
     adapter = StallingAdapter()
     cancel = RunCancellation("run_stall")
     events: list[NormalizedEvent] = []
-    task = asyncio.create_task(run_api_agent(
-        run_id="run_stall", agent=_agent(), prompt="x", adapter=adapter,
-        executor=_executor(tmp_path), workspace_root=tmp_path, emit=events.append,
-        cancellation=cancel,
-    ))
+    task = asyncio.create_task(
+        run_api_agent(
+            run_id="run_stall",
+            agent=_agent(),
+            prompt="x",
+            adapter=adapter,
+            executor=_executor(tmp_path),
+            workspace_root=tmp_path,
+            emit=events.append,
+            cancellation=cancel,
+        )
+    )
 
     await asyncio.wait_for(adapter.entered.wait(), timeout=2)  # the loop is now awaiting __anext__
     cancel.cancel("user requested stop")

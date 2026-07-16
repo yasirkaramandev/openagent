@@ -49,8 +49,12 @@ class EditAgentScreen(Screen):
             yield Label("Tags (comma-separated)")
             yield Input(value=", ".join(agent.tags) if agent else "", id="tags")
             yield Label("Permission profile")
-            yield Select(profiles, value=agent.permission_profile if agent else "safe-edit",
-                         id="profile", allow_blank=False)
+            yield Select(
+                profiles,
+                value=agent.permission_profile if agent else "safe-edit",
+                id="profile",
+                allow_blank=False,
+            )
             yield Label("System prompt (optional)")
             ta = TextArea(id="system_prompt")
             if agent:
@@ -78,7 +82,8 @@ class EditAgentScreen(Screen):
                 description=self.query_one("#description", Input).value.strip(),
                 tags=tags,
                 system_prompt=self.query_one("#system_prompt", TextArea).text.strip(),
-                permission_profile=selected_string(self.query_one("#profile", Select)) or "safe-edit",
+                permission_profile=selected_string(self.query_one("#profile", Select))
+                or "safe-edit",
             )
         except AgentError as exc:
             self.query_one("#edit-error", Static).update(f"[red]{exc}[/red]")

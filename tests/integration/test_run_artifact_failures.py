@@ -39,10 +39,14 @@ def oa(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OpenAgentApp:
     (project / "seed.txt").write_text("seed\n")
     _git(["add", "-A"], project)
     _git(["commit", "-q", "-m", "init"], project)
-    app = OpenAgentApp(Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
-    ))
+    app = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "data",
+            config_dir=tmp_path / "config",
+            db_path=tmp_path / "data" / "openagent.db",
+            project_root=project,
+        )
+    )
     app.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
     install_fake_cli(monkeypatch, FakeCliAdapter(write_fake_script(tmp_path)))
     return app
@@ -58,8 +62,9 @@ async def _run(oa: OpenAgentApp):
 
 
 def _terminals_in_log(oa: OpenAgentApp, run_id: str) -> list[str]:
-    events = [json.loads(line) for line in
-              oa.runs.output(run_id, "events").splitlines() if line.strip()]
+    events = [
+        json.loads(line) for line in oa.runs.output(run_id, "events").splitlines() if line.strip()
+    ]
     return [e["type"] for e in events if e["type"] in _TERMINALS]
 
 
@@ -94,6 +99,22 @@ async def test_terminal_append_failure_still_terminates(oa: OpenAgentApp, monkey
     # The DB is authoritative: even though the terminal event could not be appended, the run is
     # terminal and its recorded status is not "completed".
     assert enum_value(oa.runs.get(result.id).status) == "failed"
+
+    # §5: the whole bundle is reconciled — nothing is left claiming the run completed.
+    status = json.loads(oa.runs.output(result.id, "status"))
+    result_json = json.loads(oa.runs.output(result.id, "json"))
+    assert status["status"] == "failed"
+    assert result_json["status"] == "failed"
+    # A stale "completed" timeline must not survive.
+    timeline = (oa.paths.run_dir(result.id) / "timeline.md").read_text()
+    status_line = next(ln for ln in timeline.splitlines() if ln.startswith("- Status:"))
+    assert "completed" not in status_line and "failed" in status_line
+    # events.jsonl carries no success terminal.
+    assert "run.completed" not in oa.runs.output(result.id, "events")
+    # The partial bundle is explicitly flagged, with the failing stage.
+    assert status.get("artifacts_partial") is True
+    assert result_json.get("artifacts_partial") is True
+    assert result_json.get("artifact_failure", {}).get("stage") == "finalize"
 
 
 async def test_write_status_failure_still_terminates(oa: OpenAgentApp, monkeypatch):

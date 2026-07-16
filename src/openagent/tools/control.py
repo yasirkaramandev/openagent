@@ -50,7 +50,8 @@ def ask_user(ctx: ToolContext, question: str) -> ToolResult:
             ctx.emit("question.cancelled", {"question": question, "reason": reason})
         return ToolResult.success(
             "No interactive user is available; proceed with your best judgment and note assumptions.",
-            question=question, answered=False,
+            question=question,
+            answered=False,
         )
 
     answer = answer.strip()

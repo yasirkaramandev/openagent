@@ -83,11 +83,15 @@ def test_hostile_text_survives_projection_and_is_escaped_at_render():
     projection = RunProjection("run_1")
     projection.apply(_event(EventType.REASONING_SUMMARY, item_id="r1", text=payload))
     projection.apply(_event(EventType.MESSAGE_COMPLETED, item_id="m1", text=payload))
-    projection.apply(_event(EventType.COMMAND_COMPLETED, item_id="c1", command=payload,
-                            output=payload, exit_code=0))
+    projection.apply(
+        _event(
+            EventType.COMMAND_COMPLETED, item_id="c1", command=payload, output=payload, exit_code=0
+        )
+    )
     projection.apply(_event(EventType.FILE_MODIFIED, item_id="f1", path=payload, change="modified"))
-    projection.apply(_event(EventType.PLAN_UPDATED, item_id="p1",
-                            items=[{"text": payload, "completed": False}]))
+    projection.apply(
+        _event(EventType.PLAN_UPDATED, item_id="p1", items=[{"text": payload, "completed": False}])
+    )
     projection.apply(_event(EventType.WEB_SEARCH_COMPLETED, item_id="w1", query=payload))
     projection.apply(_event(EventType.TOOL_COMPLETED, item_id="t1", tool=payload))
 

@@ -9,7 +9,17 @@ agent drives the real `openagent` CLI the way it is designed to be driven.
 
 | Skill | What it covers |
 | --- | --- |
-| [`openagent`](openagent/SKILL.md) | Agent/provider setup, model selection, running tasks, inspecting artifacts, cancellation, resume, and the security boundaries an AI must respect. |
+| [`openagent`](openagent/SKILL.md) | Agent/provider setup (including NVIDIA Build), model selection and capability probing, running tasks, inspecting artifacts, orphan handling and identity-verified cancellation, resume, and the security boundaries an AI must respect. |
+
+Two things the skill is emphatic about, because getting them wrong is actively harmful:
+
+- **`orphaned` does not mean the process is gone.** It means OpenAgent lost ownership of the run. The
+  process may be gone, reused, unverifiable, or still alive. Read `failure_type`, and stop a live one
+  with `openagent cancel --id <run-id>` (which verifies PID + create-time identity) — never a manual
+  `kill`, which can hit an unrelated process that reused the PID.
+- **A catalog listing is not a capability claim.** NVIDIA Build's `/models` mixes chat, embedding,
+  rerank and vision models, and reaching it does not prove the API key works. Only
+  `openagent provider probe` validates a model.
 
 ## How to give a skill to an AI agent
 

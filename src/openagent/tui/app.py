@@ -97,8 +97,10 @@ class DashboardScreen(Screen):
             with Vertical(classes="panel"):
                 yield Static("[b]Menu[/b]  (↑/↓ + Enter)", id="menu-title")
                 yield ListView(
-                    *[ListItem(Static(f"{label} — [dim]{desc}[/dim]"), id=f"m-{key}")
-                      for key, label, desc in _MENU],
+                    *[
+                        ListItem(Static(f"{label} — [dim]{desc}[/dim]"), id=f"m-{key}")
+                        for key, label, desc in _MENU
+                    ],
                     id="menu",
                 )
         yield Footer()
@@ -115,8 +117,11 @@ class DashboardScreen(Screen):
         providers = oa.providers.list()
         clis = oa.clis.list()
         runs = oa.runs.list(100)
-        active = [r for r in runs if (enum_value(r.status))
-                  in ("running", "starting", "queued", "waiting_approval")]
+        active = [
+            r
+            for r in runs
+            if (enum_value(r.status)) in ("running", "starting", "queued", "waiting_approval")
+        ]
         failed = [r for r in runs if (enum_value(r.status)) == "failed"]
         text = (
             f"[b]OpenAgent[/b]   project: [cyan]{oa.paths.project_root.name}[/cyan]\n\n"
@@ -190,8 +195,11 @@ class OpenAgentTUI(App):
         live = LiveRun(run.id)
         self.live_runs[run.id] = live
         self.run_worker(
-            lambda: self._execute_run(run, live), thread=True, exclusive=False,
-            name=f"run-{run.id}", group="runs",
+            lambda: self._execute_run(run, live),
+            thread=True,
+            exclusive=False,
+            name=f"run-{run.id}",
+            group="runs",
         )
         return live
 
@@ -203,8 +211,11 @@ class OpenAgentTUI(App):
         live.projection = self.oa.runs.projection(run_id)
         self.live_runs[run_id] = live
         self.run_worker(
-            lambda: self._execute_resume(run_id, prompt, live), thread=True, exclusive=False,
-            name=f"resume-{run_id}", group="runs",
+            lambda: self._execute_resume(run_id, prompt, live),
+            thread=True,
+            exclusive=False,
+            name=f"resume-{run_id}",
+            group="runs",
         )
         return live
 
@@ -222,9 +233,14 @@ class OpenAgentTUI(App):
 
         error: str | None = None
         try:
-            asyncio.run(self.oa.runs.execute(
-                run, on_event=on_event, approval_callback=approval, ask_user_callback=ask_user,
-            ))
+            asyncio.run(
+                self.oa.runs.execute(
+                    run,
+                    on_event=on_event,
+                    approval_callback=approval,
+                    ask_user_callback=ask_user,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced in the console, never a crash dialog
             error = str(exc)
         finally:

@@ -14,15 +14,19 @@ from openagent.tools.control import ask_user
 
 def _ctx(root: Path, *, resolver=None, emit=None) -> ToolContext:
     return ToolContext(
-        workspace_root=root, profile=get_profile(SAFE_EDIT),
-        approval_gate=ApprovalGate(auto_approve=False), run_id="run_test",
-        emit=emit, ask_user_callback=resolver,
+        workspace_root=root,
+        profile=get_profile(SAFE_EDIT),
+        approval_gate=ApprovalGate(auto_approve=False),
+        run_id="run_test",
+        emit=emit,
+        ask_user_callback=resolver,
     )
 
 
 def _record_emit(events: list[tuple[str, dict]]):
     def emit(name: str, data: dict) -> None:
         events.append((name, data))
+
     return emit
 
 

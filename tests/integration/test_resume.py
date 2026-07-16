@@ -29,8 +29,10 @@ def app(tmp_path: Path) -> OpenAgentApp:
     git("add", "-A")
     git("commit", "-q", "-m", "init")
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     oa = OpenAgentApp(paths)
     oa.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
@@ -70,8 +72,9 @@ async def test_resume_accumulates_turns_and_artifacts(app: OpenAgentApp, use_fak
     assert events.count("run.completed") == 2  # one per turn, earlier one preserved
 
 
-async def test_failed_resume_preserves_earlier_artifacts(app: OpenAgentApp, tmp_path: Path,
-                                                         monkeypatch: pytest.MonkeyPatch):
+async def test_failed_resume_preserves_earlier_artifacts(
+    app: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     adapter = FakeCliAdapter(write_fake_script(tmp_path), mode="complete", resume_mode="fail1")
     install_fake_cli(monkeypatch, adapter)
     run = app.runs.create(agent_name="fake-coder", prompt="first", worktree="auto")

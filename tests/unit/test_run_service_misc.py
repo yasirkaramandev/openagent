@@ -13,8 +13,10 @@ def app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     return OpenAgentApp(paths)
 
@@ -43,10 +45,13 @@ def test_orphan_recovery_fails_closed_on_unattached_live_run(app: OpenAgentApp):
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         created = psutil.Process(proc.pid).create_time()
-        run = Run(id="run_live", agent="x", status=RunStatus.RUNNING,
-                  pid=proc.pid, pid_started_at=created)
+        run = Run(
+            id="run_live", agent="x", status=RunStatus.RUNNING, pid=proc.pid, pid_started_at=created
+        )
         app.repos.runs.upsert(run)
-        app.paths.run_dir(run.id).mkdir(parents=True, exist_ok=True)  # so the audit note can be written
+        app.paths.run_dir(run.id).mkdir(
+            parents=True, exist_ok=True
+        )  # so the audit note can be written
 
         recovered = app.runs.recover_orphans()
 
@@ -58,8 +63,11 @@ def test_orphan_recovery_fails_closed_on_unattached_live_run(app: OpenAgentApp):
         assert psutil.pid_exists(proc.pid)
 
         # The live PID and a "not terminated" note are recorded for the user (event/artifact).
-        events = [json.loads(line) for line in
-                  (app.paths.run_dir(run.id) / "events.jsonl").read_text().splitlines() if line.strip()]
+        events = [
+            json.loads(line)
+            for line in (app.paths.run_dir(run.id) / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
         orphan = next(e for e in events if e["data"].get("kind") == "orphan")
         assert orphan["data"]["pid"] == proc.pid
         assert orphan["data"]["killed"] is False
@@ -79,8 +87,13 @@ def test_orphan_recovery_detects_pid_reuse(app: OpenAgentApp):
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         created = psutil.Process(proc.pid).create_time()
-        run = Run(id="run_reused", agent="x", status=RunStatus.RUNNING,
-                  pid=proc.pid, pid_started_at=created - 3600.0)
+        run = Run(
+            id="run_reused",
+            agent="x",
+            status=RunStatus.RUNNING,
+            pid=proc.pid,
+            pid_started_at=created - 3600.0,
+        )
         app.repos.runs.upsert(run)
         recovered = app.runs.recover_orphans()
         assert "run_reused" in recovered
@@ -103,9 +116,19 @@ def test_rebuild_artifacts_accumulates_provider_cost(app: OpenAgentApp):
     app.repos.runs.upsert(run)
     log = EventLog(app.paths.run_dir(run.id))
     for cost, inp in ((0.01, 10), (0.02, 3)):
-        log.append(NormalizedEvent(run_id=run.id, type=EventType.USAGE_UPDATED, source="test",
-                                   data={"input_tokens": inp, "cached_input_tokens": 0,
-                                         "output_tokens": 1, "provider_cost": cost}))
+        log.append(
+            NormalizedEvent(
+                run_id=run.id,
+                type=EventType.USAGE_UPDATED,
+                source="test",
+                data={
+                    "input_tokens": inp,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 1,
+                    "provider_cost": cost,
+                },
+            )
+        )
     art, _ = app.runs._rebuild_artifacts(run)
     assert art.usage["input_tokens"] == 13
     assert art.usage["provider_cost"] == 0.03
@@ -119,9 +142,19 @@ def test_rebuild_artifacts_cost_none_when_no_cost_reported(app: OpenAgentApp):
     run = Run(id="run_nocost", agent="x", status=RunStatus.RUNNING)
     app.repos.runs.upsert(run)
     log = EventLog(app.paths.run_dir(run.id))
-    log.append(NormalizedEvent(run_id=run.id, type=EventType.USAGE_UPDATED, source="test",
-                               data={"input_tokens": 5, "cached_input_tokens": 0,
-                                     "output_tokens": 2, "provider_cost": None}))
+    log.append(
+        NormalizedEvent(
+            run_id=run.id,
+            type=EventType.USAGE_UPDATED,
+            source="test",
+            data={
+                "input_tokens": 5,
+                "cached_input_tokens": 0,
+                "output_tokens": 2,
+                "provider_cost": None,
+            },
+        )
+    )
     art, _ = app.runs._rebuild_artifacts(run)
     assert art.usage["provider_cost"] is None
 
@@ -174,19 +207,28 @@ async def test_run_console_header_shows_a_human_status(tmp_path):
 
     project = tmp_path / "proj"
     project.mkdir()
+
     def _git(*args):
         subprocess.run(["git", *args], cwd=project, check=True, capture_output=True)
+
     _git("init", "-q")
     _git("config", "user.email", "t@t.com")
     _git("config", "user.name", "t")
     (project / "seed.txt").write_text("seed\n")
     _git("add", "-A")
     _git("commit", "-q", "-m", "init")
-    oa = OpenAgentApp(Paths(data_dir=tmp_path / "d", config_dir=tmp_path / "c",
-                            db_path=tmp_path / "d" / "o.db", project_root=project))
+    oa = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "d",
+            config_dir=tmp_path / "c",
+            db_path=tmp_path / "d" / "o.db",
+            project_root=project,
+        )
+    )
     oa.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
 
     import pytest as _pytest
+
     mp = _pytest.MonkeyPatch()
     try:
         install_fake_cli(mp, FakeCliAdapter(write_fake_script(tmp_path)))

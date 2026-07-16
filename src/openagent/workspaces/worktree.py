@@ -20,8 +20,18 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-_IGNORE_DIRS = {".git", ".openagent", ".venv", "node_modules", "__pycache__", ".mypy_cache",
-                ".pytest_cache", ".ruff_cache", "dist", "build"}
+_IGNORE_DIRS = {
+    ".git",
+    ".openagent",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+}
 _MAX_DIFF_BYTES = 400_000
 
 AUTO = "auto"
@@ -56,13 +66,13 @@ class Workspace:
     """A prepared place for a run to work in."""
 
     run_id: str
-    root: Path            # where the agent runs (worktree dir, or copy, or the repo itself)
-    source: Path          # the user's project root
+    root: Path  # where the agent runs (worktree dir, or copy, or the repo itself)
+    source: Path  # the user's project root
     is_git: bool
     strategy: str = AUTO
     branch: str | None = None
     base_commit: str | None = None
-    is_copy: bool = False   # True when using an isolated directory copy
+    is_copy: bool = False  # True when using an isolated directory copy
     in_place: bool = False  # True for strategy "none" (runs in the source tree directly)
     #: For non-git diffing (copies and in-place non-git runs): an **immutable snapshot** of the
     #: source tree captured at creation, before the agent touched anything. The diff compares the
@@ -104,7 +114,9 @@ class WorktreeManager:
         self.project_root = project_root
         self.worktrees_dir = worktrees_dir
 
-    def create(self, run_id: str, *, strategy: str = AUTO, use_worktree: bool | None = None) -> Workspace:
+    def create(
+        self, run_id: str, *, strategy: str = AUTO, use_worktree: bool | None = None
+    ) -> Workspace:
         """Prepare an isolated workspace for ``run_id`` using an explicit strategy.
 
         ``use_worktree`` is a back-compat shim: ``False`` maps to ``strategy="none"``.
@@ -123,8 +135,13 @@ class WorktreeManager:
             # snapshot so an in-place run's before/after are never read from the same folder (item 5).
             baseline_dir = None if git else self._make_baseline(run_id)
             return Workspace(
-                run_id=run_id, root=self.project_root, source=self.project_root,
-                is_git=git, strategy=NONE, in_place=True, baseline_dir=baseline_dir,
+                run_id=run_id,
+                root=self.project_root,
+                source=self.project_root,
+                is_git=git,
+                strategy=NONE,
+                in_place=True,
+                baseline_dir=baseline_dir,
             )
 
         if strategy == AUTO and git:
@@ -139,8 +156,13 @@ class WorktreeManager:
         target = self.worktrees_dir / run_id
         _git(["worktree", "add", "-b", branch, str(target), base_commit], self.project_root)
         return Workspace(
-            run_id=run_id, root=target, source=self.project_root,
-            is_git=True, strategy=AUTO, branch=branch, base_commit=base_commit,
+            run_id=run_id,
+            root=target,
+            source=self.project_root,
+            is_git=True,
+            strategy=AUTO,
+            branch=branch,
+            base_commit=base_commit,
         )
 
     def _copy_workspace(self, run_id: str, git: bool) -> Workspace:
@@ -148,13 +170,19 @@ class WorktreeManager:
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(
-            self.project_root, target,
+            self.project_root,
+            target,
             ignore=shutil.ignore_patterns(*_IGNORE_DIRS),
         )
         # The working copy is the "after"; an immutable baseline snapshot is the "before".
         return Workspace(
-            run_id=run_id, root=target, source=self.project_root, is_git=git,
-            strategy=COPY, is_copy=True, baseline_dir=self._make_baseline(run_id),
+            run_id=run_id,
+            root=target,
+            source=self.project_root,
+            is_git=git,
+            strategy=COPY,
+            is_copy=True,
+            baseline_dir=self._make_baseline(run_id),
         )
 
     def _make_baseline(self, run_id: str) -> Path:
@@ -164,7 +192,9 @@ class WorktreeManager:
         if baseline.exists():
             shutil.rmtree(baseline)
         shutil.copytree(
-            self.project_root, baseline, ignore=shutil.ignore_patterns(*_IGNORE_DIRS),
+            self.project_root,
+            baseline,
+            ignore=shutil.ignore_patterns(*_IGNORE_DIRS),
         )
         return baseline
 
@@ -245,8 +275,10 @@ class WorktreeManager:
                 chunks.append(f"Binary file {rel} changed\n")
                 continue
             diff = difflib.unified_diff(
-                before.splitlines(keepends=True), after.splitlines(keepends=True),
-                fromfile=f"a/{rel}", tofile=f"b/{rel}",
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
             )
             chunks.append("".join(diff))
         return ("".join(chunks))[:_MAX_DIFF_BYTES]

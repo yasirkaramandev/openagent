@@ -28,10 +28,20 @@ def test_init():
 
 
 def test_provider_add_with_key_env_and_list():
-    add = runner.invoke(app, [
-        "provider", "add", "testco", "--type", "custom",
-        "--base-url", "https://api.test/v1", "--key-env", "TESTCO_KEY",
-    ])
+    add = runner.invoke(
+        app,
+        [
+            "provider",
+            "add",
+            "testco",
+            "--type",
+            "custom",
+            "--base-url",
+            "https://api.test/v1",
+            "--key-env",
+            "TESTCO_KEY",
+        ],
+    )
     assert add.exit_code == 0, add.stdout
     listed = runner.invoke(app, ["provider", "list"])
     assert "testco" in listed.stdout
@@ -46,10 +56,20 @@ def test_provider_add_key_required_no_credential_rejected():
 
 
 def test_provider_remove_refused_when_in_use():
-    add = runner.invoke(app, [
-        "provider", "add", "ds", "--type", "custom",
-        "--base-url", "https://api.test/v1", "--key-env", "DS_KEY",
-    ])
+    add = runner.invoke(
+        app,
+        [
+            "provider",
+            "add",
+            "ds",
+            "--type",
+            "custom",
+            "--base-url",
+            "https://api.test/v1",
+            "--key-env",
+            "DS_KEY",
+        ],
+    )
     assert add.exit_code == 0, add.stdout
     agent = runner.invoke(app, ["add", "--name", "ds-coder", "--provider", "ds", "--model", "m"])
     assert agent.exit_code == 0, agent.stdout
@@ -61,10 +81,20 @@ def test_provider_remove_refused_when_in_use():
 
 
 def test_add_cli_agent_creates_openagent_md():
-    result = runner.invoke(app, [
-        "add", "--name", "codex-coder", "--title", "Codex Coder",
-        "--cli", "codex", "--tag", "coder",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "add",
+            "--name",
+            "codex-coder",
+            "--title",
+            "Codex Coder",
+            "--cli",
+            "codex",
+            "--tag",
+            "coder",
+        ],
+    )
     assert result.exit_code == 0, result.stdout
     assert Path("OPENAGENT.md").exists()
     text = Path("OPENAGENT.md").read_text()
@@ -138,9 +168,18 @@ def test_cli_agent_add_persists_model_and_reaches_run_argv():
     from openagent.runtimes.cli.antigravity import AntigravityAdapter
     from openagent.runtimes.cli.base import CliRunRequest
 
-    result = runner.invoke(app, [
-        "add", "--name", "agy-worker", "--cli", "antigravity", "--model", "Gemini 3.5 Flash (Low)",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "add",
+            "--name",
+            "agy-worker",
+            "--cli",
+            "antigravity",
+            "--model",
+            "Gemini 3.5 Flash (Low)",
+        ],
+    )
     assert result.exit_code == 0, result.stdout
 
     shown = runner.invoke(app, ["agent", "show", "agy-worker"])
@@ -151,8 +190,13 @@ def test_cli_agent_add_persists_model_and_reaches_run_argv():
     # And the persisted model is exactly what a real run would hand the CLI (RunService._run_cli
     # builds the request with ``model=agent.runtime.model or None``).
     args = AntigravityAdapter(executable="agy", allow_experimental_edit=False)._build_args(
-        CliRunRequest(run_id="r", prompt="x", workspace=Path.cwd(), permission_profile="read-only",
-                      model=agent["runtime"]["model"] or None),
+        CliRunRequest(
+            run_id="r",
+            prompt="x",
+            workspace=Path.cwd(),
+            permission_profile="read-only",
+            model=agent["runtime"]["model"] or None,
+        ),
         "x",
     )
     assert args[args.index("--model") + 1] == "Gemini 3.5 Flash (Low)"
@@ -161,9 +205,40 @@ def test_cli_agent_add_persists_model_and_reaches_run_argv():
 def test_agent_add_subcommand_also_persists_cli_model():
     import json
 
-    result = runner.invoke(app, [
-        "agent", "add", "--name", "codex-coder", "--cli", "codex", "--model", "gpt-5.5",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "add",
+            "--name",
+            "codex-coder",
+            "--cli",
+            "codex",
+            "--model",
+            "gpt-5.5",
+        ],
+    )
     assert result.exit_code == 0, result.stdout
     agent = json.loads(runner.invoke(app, ["agent", "show", "codex-coder"]).stdout)
     assert agent["runtime"]["model"] == "gpt-5.5"
+
+
+def test_cancel_missing_run_reports_not_found_not_false_success():
+    # `openagent cancel` must never print "cancelled" for a run that does not exist (§3.3).
+    result = runner.invoke(app, ["cancel", "--id", "run_nope"])
+    assert result.exit_code == 1
+    combined = result.stdout + str(result.stderr or "")
+    assert "not found" in combined
+    assert "cancelled" not in result.stdout.lower()
+
+
+def test_cancel_finished_run_is_not_reported_as_cancelled():
+    from openagent.app import OpenAgentApp
+    from openagent.core.models import Run, RunStatus
+
+    oa = OpenAgentApp.create()
+    oa.repos.runs.upsert(Run(id="run_done", agent="x", status=RunStatus.COMPLETED))
+    result = runner.invoke(app, ["cancel", "--id", "run_done"])
+    assert result.exit_code == 0
+    assert "already finished" in result.stdout
+    assert "cancelled" not in result.stdout.lower()

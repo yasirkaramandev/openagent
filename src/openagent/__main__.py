@@ -12,9 +12,11 @@ def main() -> None:
     argv = sys.argv[1:]
     if not argv:
         from .tui.app import run_tui
+
         run_tui()
         return
     from .cli.app import app
+
     app()
 
 

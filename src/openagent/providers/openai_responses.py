@@ -53,8 +53,11 @@ class OpenAIResponsesAdapter:
 
     async def list_models(self) -> list[RemoteModel]:
         data = await self.transport.get_json("/models")
-        return [RemoteModel(id=i["id"], display_name=i.get("id"))
-                for i in data.get("data", []) if i.get("id")]
+        return [
+            RemoteModel(id=i["id"], display_name=i.get("id"))
+            for i in data.get("data", [])
+            if i.get("id")
+        ]
 
     async def probe_model(self, model_id: str) -> ModelCapabilities:
         return await default_probe(self, model_id)
@@ -77,7 +80,9 @@ class OpenAIResponsesAdapter:
                     yield event
         except TransportError as exc:
             yield NormalizedModelEvent(
-                type=ModelEventType.ERROR, error_type=exc.error_type.value, error_message=exc.message
+                type=ModelEventType.ERROR,
+                error_type=exc.error_type.value,
+                error_message=exc.message,
             )
 
     async def _complete(self, payload: dict[str, Any]) -> AsyncIterator[NormalizedModelEvent]:
@@ -189,7 +194,9 @@ def _events_from_response(
                     )
                 )
     if data.get("usage"):
-        events.append(NormalizedModelEvent(type=ModelEventType.USAGE, usage=_parse_usage(data["usage"])))
+        events.append(
+            NormalizedModelEvent(type=ModelEventType.USAGE, usage=_parse_usage(data["usage"]))
+        )
     # An incomplete or failed response is NOT a successful completion (item 8): emit a normalized
     # error instead of DONE so the run is not counted as completed.
     if incomplete:
@@ -210,7 +217,9 @@ def _incomplete_error(data: dict[str, Any], response_id: str | None) -> Normaliz
     else:
         etype = ErrorType.INCOMPLETE_RESPONSE
     return NormalizedModelEvent(
-        type=ModelEventType.ERROR, error_type=etype.value, response_id=response_id,
+        type=ModelEventType.ERROR,
+        error_type=etype.value,
+        response_id=response_id,
         error_message=f"response incomplete: {reason or 'unknown reason'}",
     )
 
@@ -223,7 +232,9 @@ def _failed_error(data: dict[str, Any], response_id: str | None) -> NormalizedMo
     else:
         etype = ErrorType.INVALID_REQUEST
     return NormalizedModelEvent(
-        type=ModelEventType.ERROR, error_type=etype.value, response_id=response_id,
+        type=ModelEventType.ERROR,
+        error_type=etype.value,
+        response_id=response_id,
         error_message=f"response failed: {err.get('message') or code or 'unknown error'}",
     )
 

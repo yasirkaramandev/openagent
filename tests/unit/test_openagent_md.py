@@ -11,9 +11,11 @@ from openagent.reporting.openagent_md import (
 
 def _agent(name: str) -> AgentProfile:
     return AgentProfile(
-        name=name, title=f"{name} title",
+        name=name,
+        title=f"{name} title",
         runtime=AgentRuntime(type=RuntimeType.CLI, cli="codex"),
-        tags=["coder"], description="does things",
+        tags=["coder"],
+        description="does things",
     )
 
 
@@ -49,6 +51,7 @@ def test_write_preserves_prose_outside_markers(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- injection (item 14)
+
 
 def _evil(name: str, **fields: str) -> AgentProfile:
     return AgentProfile(

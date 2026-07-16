@@ -90,7 +90,11 @@ def _run_agy_models(executable: str) -> list[str]:
 
     try:
         result = subprocess.run(
-            [executable, "models"], capture_output=True, text=True, timeout=15, check=False,
+            [executable, "models"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"`agy models` did not run: {exc}") from exc
@@ -112,11 +116,13 @@ class AntigravityAdapter:
         self.executable = executable or find_executable("agy", "antigravity")
         self._processes: dict[str, ManagedProcess] = {}
         self.allow_experimental_edit = (
-            _env_flag(EXPERIMENTAL_EDIT_ENV) if allow_experimental_edit is None
+            _env_flag(EXPERIMENTAL_EDIT_ENV)
+            if allow_experimental_edit is None
             else allow_experimental_edit
         )
         self.allow_dangerous_bypass = (
-            _env_flag(DANGEROUS_BYPASS_ENV) if allow_dangerous_bypass is None
+            _env_flag(DANGEROUS_BYPASS_ENV)
+            if allow_dangerous_bypass is None
             else allow_dangerous_bypass
         )
 
@@ -124,9 +130,14 @@ class AntigravityAdapter:
         if not self.executable:
             return None
         return CliInstallation(
-            id="cli_antigravity", type="antigravity", executable=self.executable,
-            version=detect_version(self.executable), adapter="antigravity-json",
-            authenticated=None, experimental=False, validated_version=VALIDATED_VERSION,
+            id="cli_antigravity",
+            type="antigravity",
+            executable=self.executable,
+            version=detect_version(self.executable),
+            adapter="antigravity-json",
+            authenticated=None,
+            experimental=False,
+            validated_version=VALIDATED_VERSION,
         )
 
     async def inspect_auth(self) -> AuthStatus:
@@ -145,7 +156,10 @@ class AntigravityAdapter:
         # the adapter is flagged ``experimental`` rather than pretending editing is verified & safe.
         editing = self.allow_experimental_edit or self.allow_dangerous_bypass
         return CliCapabilities(
-            structured_events=True, resumable=True, edits_files=editing, runs_commands=editing,
+            structured_events=True,
+            resumable=True,
+            edits_files=editing,
+            runs_commands=editing,
             experimental=True,
         )
 
@@ -245,15 +259,22 @@ class AntigravityAdapter:
     ) -> AsyncIterator[NormalizedEvent]:
         if not self.executable:
             yield NormalizedEvent(
-                run_id=request.run_id, type=EventType.RUN_FAILED, source=SOURCE,
-                data={"error_type": "cli_not_found", "message": "antigravity (agy) is not installed"},
+                run_id=request.run_id,
+                type=EventType.RUN_FAILED,
+                source=SOURCE,
+                data={
+                    "error_type": "cli_not_found",
+                    "message": "antigravity (agy) is not installed",
+                },
             )
             return
         try:
             args = self._build_args(request, prompt, conversation=conversation)
         except AntigravityPermissionError as exc:
             yield NormalizedEvent(
-                run_id=request.run_id, type=EventType.RUN_FAILED, source=SOURCE,
+                run_id=request.run_id,
+                type=EventType.RUN_FAILED,
+                source=SOURCE,
                 data={"error_type": "permission_mode_unsupported", "message": str(exc)},
             )
             return
@@ -261,10 +282,14 @@ class AntigravityAdapter:
             _, reason = self.permission_status(request.permission_profile)
             if get_profile(request.permission_profile).can_edit_files:
                 yield NormalizedEvent(
-                    run_id=request.run_id, type=EventType.LOG, source=SOURCE,
-                    data={"level": "warning", "message":
-                          "Antigravity is running with its native permission checks DISABLED "
-                          f"({reason}). OpenAgent cannot observe its internal tool calls."},
+                    run_id=request.run_id,
+                    type=EventType.LOG,
+                    source=SOURCE,
+                    data={
+                        "level": "warning",
+                        "message": "Antigravity is running with its native permission checks DISABLED "
+                        f"({reason}). OpenAgent cannot observe its internal tool calls.",
+                    },
                 )
         env = minimal_environment(request.credential_env)
         proc = ManagedProcess(args, cwd=request.workspace, env=env)
@@ -305,24 +330,38 @@ def map_antigravity_event(obj: dict[str, Any], run_id: str) -> list[NormalizedEv
 
     usage = obj.get("usage")
     if isinstance(usage, dict):
-        events.append(ev(
-            EventType.USAGE_UPDATED,
-            input_tokens=int(usage.get("input_tokens") or 0),
-            cached_input_tokens=0,  # Antigravity reports no cached tokens
-            output_tokens=int(usage.get("output_tokens") or 0),
-            # Antigravity names reasoning tokens "thinking_tokens"; OpenAgent normalizes to
-            # reasoning_tokens so the usage schema matches every other backend (codex/api) — item 9.
-            reasoning_tokens=int(usage.get("thinking_tokens") or 0),
-            provider_cost=None,  # subscription product — no per-run monetary cost is reported
-        ))
+        events.append(
+            ev(
+                EventType.USAGE_UPDATED,
+                input_tokens=int(usage.get("input_tokens") or 0),
+                cached_input_tokens=0,  # Antigravity reports no cached tokens
+                output_tokens=int(usage.get("output_tokens") or 0),
+                # Antigravity names reasoning tokens "thinking_tokens"; OpenAgent normalizes to
+                # reasoning_tokens so the usage schema matches every other backend (codex/api) — item 9.
+                reasoning_tokens=int(usage.get("thinking_tokens") or 0),
+                provider_cost=None,  # subscription product — no per-run monetary cost is reported
+            )
+        )
 
     status = str(obj.get("status") or "").upper()
     if status == "SUCCESS":
-        events.append(ev(EventType.RUN_COMPLETED, result=response if isinstance(response, str) else ""))
+        events.append(
+            ev(EventType.RUN_COMPLETED, result=response if isinstance(response, str) else "")
+        )
     elif status == "CANCELLED":
-        events.append(ev(EventType.RUN_CANCELLED,
-                         reason=str(obj.get("message") or "antigravity reported cancelled")))
+        events.append(
+            ev(
+                EventType.RUN_CANCELLED,
+                reason=str(obj.get("message") or "antigravity reported cancelled"),
+            )
+        )
     else:
-        message = obj.get("error") or obj.get("message") or f"antigravity reported {status or 'no status'}"
-        events.append(ev(EventType.RUN_FAILED, error_type="antigravity_error", message=str(message)))
+        message = (
+            obj.get("error")
+            or obj.get("message")
+            or f"antigravity reported {status or 'no status'}"
+        )
+        events.append(
+            ev(EventType.RUN_FAILED, error_type="antigravity_error", message=str(message))
+        )
     return events

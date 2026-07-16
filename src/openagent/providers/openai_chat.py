@@ -72,7 +72,16 @@ class OpenAIChatAdapter:
         models: list[RemoteModel] = []
         for item in items:
             if isinstance(item, dict) and item.get("id"):
-                models.append(RemoteModel(id=item["id"], display_name=item.get("id")))
+                # Preserve ``owned_by`` (the publisher the catalog reports) so a mixed catalog like
+                # NVIDIA Build can be filtered by publisher, and never assumed chat-compatible (§14.1).
+                models.append(
+                    RemoteModel(
+                        id=item["id"],
+                        display_name=item.get("id"),
+                        owned_by=item.get("owned_by"),
+                        context_window=item.get("context_window") or item.get("context_length"),
+                    )
+                )
         return models
 
     async def probe_model(self, model_id: str) -> ModelCapabilities:
@@ -98,7 +107,9 @@ class OpenAIChatAdapter:
                     yield event
         except TransportError as exc:
             yield NormalizedModelEvent(
-                type=ModelEventType.ERROR, error_type=exc.error_type.value, error_message=exc.message
+                type=ModelEventType.ERROR,
+                error_type=exc.error_type.value,
+                error_message=exc.message,
             )
 
     async def _complete(self, payload: dict[str, Any]) -> AsyncIterator[NormalizedModelEvent]:
@@ -115,7 +126,9 @@ class OpenAIChatAdapter:
             )
         for call in message.get("tool_calls") or []:
             yield NormalizedModelEvent(
-                type=ModelEventType.TOOL_CALL, tool_call=_parse_tool_call(call), response_id=response_id
+                type=ModelEventType.TOOL_CALL,
+                tool_call=_parse_tool_call(call),
+                response_id=response_id,
             )
         if data.get("usage"):
             yield NormalizedModelEvent(type=ModelEventType.USAGE, usage=_parse_usage(data["usage"]))
@@ -134,9 +147,14 @@ class OpenAIChatAdapter:
                 usage = _parse_usage(chunk["usage"])
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
+                # NB: only ``content`` is surfaced. NVIDIA (and some others) emit a separate
+                # ``reasoning_content`` delta — that is raw chain-of-thought and is deliberately
+                # ignored here so it never reaches an event, artifact, or the UI (spec §12).
                 if delta.get("content"):
                     yield NormalizedModelEvent(
-                        type=ModelEventType.TEXT_DELTA, text=delta["content"], response_id=response_id
+                        type=ModelEventType.TEXT_DELTA,
+                        text=delta["content"],
+                        response_id=response_id,
                     )
                 for tc in delta.get("tool_calls") or []:
                     idx = tc.get("index", 0)
@@ -173,9 +191,7 @@ class OpenAIChatAdapter:
         if temp is not None:
             payload["temperature"] = temp
         if request.tools:
-            payload["tools"] = [
-                {"type": "function", "function": tool} for tool in request.tools
-            ]
+            payload["tools"] = [{"type": "function", "function": tool} for tool in request.tools]
             choice = self.compat.normalize_tool_choice("auto")
             if choice is not None:
                 payload["tool_choice"] = choice
@@ -203,7 +219,10 @@ def _to_openai_messages(request: NormalizedModelRequest) -> list[dict[str, Any]]
                         {
                             "id": call.id,
                             "type": "function",
-                            "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments),
+                            },
                         }
                         for call in msg.tool_calls
                     ],
@@ -225,10 +244,13 @@ def _parse_tool_call(call: dict[str, Any]) -> ToolCall:
 
 def _parse_usage(usage: dict[str, Any]) -> TokenUsage:
     details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    # Only the numeric reasoning-token *count* is normalized (spec §12) — never any reasoning text.
     return TokenUsage(
         input_tokens=usage.get("prompt_tokens", 0),
         cached_input_tokens=details.get("cached_tokens", 0),
         output_tokens=usage.get("completion_tokens", 0),
+        reasoning_tokens=int(completion_details.get("reasoning_tokens", 0) or 0),
     )
 
 

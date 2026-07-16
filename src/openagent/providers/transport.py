@@ -19,6 +19,14 @@ from ..core.errors import ErrorType, classify_http_status, is_retryable
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
+#: A 202 means the provider queued the request and expects the caller to poll for a result. The chat
+#: runtime is synchronous and has no polling, so a 202 is an explicit, honest failure — never an empty
+#: "success" with no content (spec §15.5; some NVIDIA model types behave this way).
+_ASYNC_MESSAGE = (
+    "Asynchronous NVIDIA invocation is not supported by the OpenAgent chat runtime yet "
+    "(the endpoint returned HTTP 202 with a request id instead of a completion)."
+)
+
 
 class TransportError(Exception):
     def __init__(self, error_type: ErrorType, message: str, status: int | None = None) -> None:
@@ -71,6 +79,8 @@ class Transport:
                 attempt += 1
                 continue
 
+            if response.status_code == 202:
+                raise TransportError(ErrorType.ASYNC_UNSUPPORTED, _ASYNC_MESSAGE, status=202)
             if response.status_code >= 400:
                 retry_after = _retry_after(response)
                 if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
@@ -98,24 +108,37 @@ class Transport:
         while True:
             try:
                 async with self.client().stream("POST", path, json=payload) as response:
+                    if response.status_code == 202:
+                        await response.aread()
+                        raise TransportError(
+                            ErrorType.ASYNC_UNSUPPORTED, _ASYNC_MESSAGE, status=202
+                        )
                     if response.status_code >= 400:
                         body = (await response.aread()).decode("utf-8", errors="replace")
                         retry_after = _retry_after(response)
                         # Header errors arrive before any event, so retrying is still safe.
-                        if (response.status_code in _RETRY_STATUSES and attempt < self.max_retries
-                                and not received_event):
+                        if (
+                            response.status_code in _RETRY_STATUSES
+                            and attempt < self.max_retries
+                            and not received_event
+                        ):
                             await self._sleep(attempt, retry_after)
                             attempt += 1
                             continue  # retry outer loop
                         raise TransportError(
-                            classify_http_status(response.status_code), body,
+                            classify_http_status(response.status_code),
+                            body,
                             status=response.status_code,
                         )
                     async for line in response.aiter_lines():
                         stripped = line.strip()
-                        if not stripped or stripped.startswith(":") or not stripped.startswith("data:"):
+                        if (
+                            not stripped
+                            or stripped.startswith(":")
+                            or not stripped.startswith("data:")
+                        ):
                             continue
-                        payload_str = stripped[len("data:"):].strip()
+                        payload_str = stripped[len("data:") :].strip()
                         if payload_str == "[DONE]":
                             return
                         try:
@@ -142,7 +165,8 @@ class Transport:
         response = await self.client().get(path)
         if response.status_code >= 400:
             raise TransportError(
-                classify_http_status(response.status_code), _error_text(response),
+                classify_http_status(response.status_code),
+                _error_text(response),
                 status=response.status_code,
             )
         return response.json()

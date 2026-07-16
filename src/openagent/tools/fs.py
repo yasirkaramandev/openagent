@@ -63,7 +63,9 @@ def search_text(ctx: ToolContext, query: str, glob: str = "*") -> ToolResult:
                 continue
             fpath = Path(dirpath) / name
             try:
-                for i, line in enumerate(fpath.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                for i, line in enumerate(
+                    fpath.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+                ):
                     if query in line:
                         rel = fpath.relative_to(root)
                         hits.append(f"{rel}:{i}: {line.strip()[:200]}")
@@ -83,7 +85,9 @@ def write_file(ctx: ToolContext, path: str, content: str) -> ToolResult:
     target.write_text(content, encoding="utf-8")
     if ctx.emit:
         ctx.emit("file.modified" if existed else "file.created", {"path": path})
-    return ToolResult.success(f"wrote {len(content)} bytes to {path}", path=path, created=not existed)
+    return ToolResult.success(
+        f"wrote {len(content)} bytes to {path}", path=path, created=not existed
+    )
 
 
 def apply_patch(
@@ -105,9 +109,17 @@ def apply_patch(
     if count == 0:
         raise ToolError("old_string not found in file")
     if count > 1 and not replace_all:
-        raise ToolError(f"old_string is not unique ({count} matches); set replace_all or add context")
-    updated = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
+        raise ToolError(
+            f"old_string is not unique ({count} matches); set replace_all or add context"
+        )
+    updated = (
+        text.replace(old_string, new_string)
+        if replace_all
+        else text.replace(old_string, new_string, 1)
+    )
     target.write_text(updated, encoding="utf-8")
     if ctx.emit:
         ctx.emit("file.modified", {"path": path})
-    return ToolResult.success(f"patched {path} ({count if replace_all else 1} replacement(s))", path=path)
+    return ToolResult.success(
+        f"patched {path} ({count if replace_all else 1} replacement(s))", path=path
+    )

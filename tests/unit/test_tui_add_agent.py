@@ -28,29 +28,42 @@ def _model_option_values(select: Select) -> list[str]:
     """Discovered model ids currently offered, excluding the blank/NULL sentinel."""
     return [v for v in select_all_option_values(select) if isinstance(v, str)]
 
+
 # --------------------------------------------------------------------------- fixtures / helpers
+
 
 def _app(tmp_path: Path, *, with_provider: bool = False) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
-    oa = OpenAgentApp(Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
-    ))
+    oa = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "data",
+            config_dir=tmp_path / "config",
+            db_path=tmp_path / "data" / "openagent.db",
+            project_root=project,
+        )
+    )
     if with_provider:
-        oa.providers.add(name="deepseek-main", provider_type="deepseek",
-                         api_key="sk-x", store_key=False)
+        oa.providers.add(
+            name="deepseek-main", provider_type="deepseek", api_key="sk-x", store_key=False
+        )
     return oa
 
 
 def _entry(cli_type: str, display: str, *, installed: bool = True) -> CliRegistryEntry:
     return CliRegistryEntry(
-        type=cli_type, display_name=display,
+        type=cli_type,
+        display_name=display,
         executable=f"/usr/local/bin/{cli_type}" if installed else None,
-        version="1.2.3" if installed else None, installed=installed,
-        authenticated=True if installed else None, auth_detail="ok" if installed else "",
-        adapter=f"{cli_type}-json", structured_events=True, resumable=True,
-        experimental=False, status_label="Verified" if installed else "Not installed",
+        version="1.2.3" if installed else None,
+        installed=installed,
+        authenticated=True if installed else None,
+        auth_detail="ok" if installed else "",
+        adapter=f"{cli_type}-json",
+        structured_events=True,
+        resumable=True,
+        experimental=False,
+        status_label="Verified" if installed else "Not installed",
     )
 
 
@@ -77,6 +90,7 @@ def _mock_cli_registry(monkeypatch):
 def _use_cli_entries(monkeypatch, entries):
     async def _fake():
         return entries
+
     monkeypatch.setattr("openagent.tui.screens.add_agent.cli_registry_entries", _fake)
 
 
@@ -144,6 +158,7 @@ async def _details_then_review(pilot, screen, name: str) -> None:
 
 def _preset_index(name: str) -> int:
     from openagent.providers.factory import preset_names
+
     return preset_names().index(name)
 
 
@@ -153,6 +168,7 @@ def _cli_index(cli_type: str) -> int:
 
 # --------------------------------------------------------------------------- Step 1: backend choice
 
+
 async def test_first_screen_is_backend_choice_not_full_form(tmp_path: Path):
     app = OpenAgentTUI(_app(tmp_path))
     async with app.run_test() as pilot:
@@ -161,8 +177,14 @@ async def test_first_screen_is_backend_choice_not_full_form(tmp_path: Path):
         assert screen.query_one("#step-backend").display is True
         assert "Step 1 of 5" in str(screen.query_one("#step-indicator").render())
         # No provider/model/CLI-selector/key fields on the first screen.
-        for hidden in ("#step-cli", "#step-provider", "#step-connection", "#step-model",
-                       "#common-fields", "#step-review"):
+        for hidden in (
+            "#step-cli",
+            "#step-provider",
+            "#step-connection",
+            "#step-model",
+            "#common-fields",
+            "#step-review",
+        ):
             assert screen.query_one(hidden).display is False
 
 
@@ -191,6 +213,7 @@ async def test_backend_api_then_continue_shows_provider_cards(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- CLI path: create
+
 
 async def test_create_codex_agent_via_keyboard(tmp_path: Path):
     oa = _app(tmp_path)
@@ -263,14 +286,16 @@ async def test_antigravity_unavailable_blocks_creation(tmp_path: Path, monkeypat
 
 # --------------------------------------------------------------------------- CLI path: model discovery (Phase 4)
 
+
 async def test_cli_model_discovery_populates_select_and_pins_model(tmp_path: Path, monkeypatch):
     """Discover Models runs the adapter's real discovery; a chosen id pins onto AgentRuntime.model."""
 
     from openagent.runtimes.cli.registry import CliModelDiscovery
 
     async def _fake_discover(cli_type, executable=None):
-        return CliModelDiscovery(cli_type, True, ["Gemini 3.5 Flash (Low)", "Claude Sonnet 4.6"],
-                                 "agy models")
+        return CliModelDiscovery(
+            cli_type, True, ["Gemini 3.5 Flash (Low)", "Claude Sonnet 4.6"], "agy models"
+        )
 
     monkeypatch.setattr("openagent.tui.screens.add_agent.discover_cli_models", _fake_discover)
     oa = _app(tmp_path)
@@ -298,14 +323,17 @@ async def test_cli_model_discovery_populates_select_and_pins_model(tmp_path: Pat
     assert agent is not None and agent.runtime.model == "Gemini 3.5 Flash (Low)"
 
 
-async def test_cli_model_discovery_unavailable_keeps_manual_and_default_paths(tmp_path: Path, monkeypatch):
+async def test_cli_model_discovery_unavailable_keeps_manual_and_default_paths(
+    tmp_path: Path, monkeypatch
+):
     """When a CLI can't list models, the wizard says so honestly and manual/blank still work."""
 
     from openagent.runtimes.cli.registry import CliModelDiscovery
 
     async def _fake_discover(cli_type, executable=None):
-        return CliModelDiscovery(cli_type, False, [], "",
-                                 "automatic model discovery is unavailable for Codex CLI")
+        return CliModelDiscovery(
+            cli_type, False, [], "", "automatic model discovery is unavailable for Codex CLI"
+        )
 
     monkeypatch.setattr("openagent.tui.screens.add_agent.discover_cli_models", _fake_discover)
     oa = _app(tmp_path)
@@ -332,6 +360,7 @@ async def test_cli_model_discovery_unavailable_keeps_manual_and_default_paths(tm
 
 
 # --------------------------------------------------------------------------- model step (item 11)
+
 
 async def test_model_selection_is_its_own_step_before_details(tmp_path: Path):
     """Model is a dedicated step between the backend choice and Agent Details (item 11)."""
@@ -371,7 +400,9 @@ async def test_switching_cli_resets_the_discovered_model_list(tmp_path: Path, mo
         screen._refresh_models()
         await pilot.pause()
         await pilot.pause()
-        assert _model_option_values(screen.query_one("#model_select", Select)) == ["Gemini 3.5 Flash (Low)"]
+        assert _model_option_values(screen.query_one("#model_select", Select)) == [
+            "Gemini 3.5 Flash (Low)"
+        ]
         screen.query_one("#model_select", Select).value = "Gemini 3.5 Flash (Low)"
         await pilot.pause()
 
@@ -381,7 +412,9 @@ async def test_switching_cli_resets_the_discovered_model_list(tmp_path: Path, mo
         await _pick_radio(pilot, screen, "cli", 0)  # Codex
         await _continue(pilot)
         assert screen.step == "model"
-        assert _model_option_values(screen.query_one("#model_select", Select)) == [], "stale list leaked"
+        assert _model_option_values(screen.query_one("#model_select", Select)) == [], (
+            "stale list leaked"
+        )
         assert screen.state.model is None, "a stale model selection leaked across CLIs"
 
 
@@ -404,6 +437,7 @@ async def test_review_shows_the_real_model(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- API path: new connection
+
 
 async def test_api_new_connection_creates_provider_and_agent(tmp_path: Path):
     oa = _app(tmp_path)  # no providers -> only the "new" connection mode
@@ -495,6 +529,7 @@ async def test_api_local_provider_no_key_manual_model(tmp_path: Path):
 
 # --------------------------------------------------------------------------- API path: existing conn
 
+
 async def test_api_existing_connection_no_key_field(tmp_path: Path):
     oa = _app(tmp_path, with_provider=True)  # a saved provider -> "existing" is offered
     app = OpenAgentTUI(oa)
@@ -519,6 +554,7 @@ async def test_api_existing_connection_no_key_field(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- navigation / cancel
+
 
 async def test_back_without_change_preserves_non_secret_input(tmp_path: Path):
     oa = _app(tmp_path)
@@ -577,6 +613,7 @@ async def test_cancel_creates_nothing(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- action bar visibility
+
 
 @pytest.mark.parametrize("size", [(80, 24), (100, 30), (120, 40)])
 async def test_action_bar_visible_at_terminal_sizes(tmp_path: Path, size):

@@ -126,7 +126,9 @@ async def collect(events: AsyncIterator[NormalizedModelEvent]) -> CollectedRespo
 _PROBE_SENTINEL = "PROBE_OK_7F"
 
 
-async def default_probe(adapter: Any, model_id: str, *, tool_probe: bool = True) -> ModelCapabilities:
+async def default_probe(
+    adapter: Any, model_id: str, *, tool_probe: bool = True
+) -> ModelCapabilities:
     """Honest capability probe shared by the model adapters (item 9).
 
     Each capability is claimed **only when actually observed** with the request shape that proves
@@ -148,7 +150,8 @@ async def default_probe(adapter: Any, model_id: str, *, tool_probe: bool = True)
         model=model_id,
         system=f"You are a probe. Reply with exactly this token and nothing else: {_PROBE_SENTINEL}",
         messages=[Message(role=Role.USER, content="Follow your instructions.")],
-        max_tokens=16, stream=False,
+        max_tokens=16,
+        stream=False,
     )
     try:
         result = await collect(adapter.stream_response(text_req))
@@ -172,11 +175,15 @@ async def default_probe(adapter: Any, model_id: str, *, tool_probe: bool = True)
         tool_req = NormalizedModelRequest(
             model=model_id,
             messages=[Message(role=Role.USER, content="Call the ping tool with value 1.")],
-            tools=[{
-                "name": "ping", "description": "health probe",
-                "parameters": {"type": "object", "properties": {"value": {"type": "integer"}}},
-            }],
-            max_tokens=64, stream=False,
+            tools=[
+                {
+                    "name": "ping",
+                    "description": "health probe",
+                    "parameters": {"type": "object", "properties": {"value": {"type": "integer"}}},
+                }
+            ],
+            max_tokens=64,
+            stream=False,
         )
         try:
             tres = await collect(adapter.stream_response(tool_req))

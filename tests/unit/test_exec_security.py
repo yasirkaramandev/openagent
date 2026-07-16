@@ -34,8 +34,10 @@ def secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _ctx(root: Path, profile: str, *, auto_approve: bool) -> ToolContext:
     return ToolContext(
-        workspace_root=root, profile=get_profile(profile),
-        approval_gate=ApprovalGate(auto_approve=auto_approve), run_id="run_sec",
+        workspace_root=root,
+        profile=get_profile(profile),
+        approval_gate=ApprovalGate(auto_approve=auto_approve),
+        run_id="run_sec",
     )
 
 
@@ -56,7 +58,9 @@ def test_env_dump_contains_no_secrets(secret_env, tmp_path: Path, command: str):
 def test_python_env_probe_is_minimal_when_approved(secret_env, tmp_path: Path):
     """Even the shell/interpreter path (approved) runs in a minimal environment."""
     ctx = _ctx(tmp_path, DEVELOPMENT, auto_approve=True)
-    result = run_command(ctx, f'{sys.executable} -c "import os,json;print(json.dumps(dict(os.environ)))"')
+    result = run_command(
+        ctx, f'{sys.executable} -c "import os,json;print(json.dumps(dict(os.environ)))"'
+    )
     assert _leaked(result.content) == []
 
 

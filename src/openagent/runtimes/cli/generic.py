@@ -39,13 +39,18 @@ class GenericCliAdapter:
         if not self.executable:
             return None
         return CliInstallation(
-            id=f"cli_{self.manifest.id}", type=self.manifest.id, executable=self.executable,
-            version=detect_version(self.executable), adapter="generic",
+            id=f"cli_{self.manifest.id}",
+            type=self.manifest.id,
+            executable=self.executable,
+            version=detect_version(self.executable),
+            adapter="generic",
             experimental=self.manifest.experimental,
         )
 
     async def inspect_auth(self) -> AuthStatus:
-        return AuthStatus(authenticated=bool(self.executable), detail="assumed via existing CLI login")
+        return AuthStatus(
+            authenticated=bool(self.executable), detail="assumed via existing CLI login"
+        )
 
     async def capabilities(self) -> CliCapabilities:
         return CliCapabilities(
@@ -67,27 +72,40 @@ class GenericCliAdapter:
     async def _drive(self, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]:
         if not self.executable:
             yield NormalizedEvent(
-                run_id=request.run_id, type=EventType.RUN_FAILED, source=self.manifest.id,
+                run_id=request.run_id,
+                type=EventType.RUN_FAILED,
+                source=self.manifest.id,
                 data={"error_type": "cli_not_found"},
             )
             return
-        args = [self.executable if t == "{executable}" else t.replace("{prompt}", request.prompt)
-                for t in self.manifest.run_template]
+        args = [
+            self.executable if t == "{executable}" else t.replace("{prompt}", request.prompt)
+            for t in self.manifest.run_template
+        ]
         env = minimal_environment({**self.manifest.env, **request.credential_env})
         proc = ManagedProcess(args, cwd=request.workspace, env=env)
         self._processes[request.run_id] = proc
         await proc.start()
-        yield NormalizedEvent(run_id=request.run_id, type=EventType.RUN_STARTED,
-                              source=self.manifest.id, data={"pid": proc.pid})
+        yield NormalizedEvent(
+            run_id=request.run_id,
+            type=EventType.RUN_STARTED,
+            source=self.manifest.id,
+            data={"pid": proc.pid},
+        )
         try:
             async for line in proc.stream_stdout():
                 if line.strip():
-                    yield NormalizedEvent(run_id=request.run_id, type=EventType.MESSAGE_DELTA,
-                                          source=self.manifest.id, data={"text": line})
+                    yield NormalizedEvent(
+                        run_id=request.run_id,
+                        type=EventType.MESSAGE_DELTA,
+                        source=self.manifest.id,
+                        data={"text": line},
+                    )
             code = await proc.wait()
             etype = EventType.RUN_COMPLETED if code == 0 else EventType.RUN_FAILED
-            yield NormalizedEvent(run_id=request.run_id, type=etype, source=self.manifest.id,
-                                  data={"exit_code": code})
+            yield NormalizedEvent(
+                run_id=request.run_id, type=etype, source=self.manifest.id, data={"exit_code": code}
+            )
         finally:
             self._processes.pop(request.run_id, None)
 

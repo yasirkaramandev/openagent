@@ -45,25 +45,111 @@ class PolicyResult:
 
 #: Executables an agent may run directly. Matched against the basename of ``argv[0]``. Anything not
 #: here requires explicit approval — the allowlist, not the denylist, is the boundary.
-_ALLOWED_EXECUTABLES = frozenset({
-    # language runtimes / package managers
-    "python", "python3", "py", "pip", "pip3", "pipx", "uv", "poetry", "pytest",
-    "node", "npm", "npx", "yarn", "pnpm", "bun", "deno", "tsc",
-    "go", "cargo", "rustc", "java", "javac", "mvn", "gradle", "gradlew",
-    "ruby", "gem", "bundle", "rake", "php", "composer", "dotnet",
-    # build / test / lint / format
-    "make", "cmake", "ninja", "meson", "tox", "nox", "ruff", "mypy", "black",
-    "isort", "flake8", "pylint", "eslint", "prettier", "jest", "mocha", "vitest",
-    # version control (dangerous git verbs are handled by the denylist / approval patterns)
-    "git", "hg",
-    # common read/inspect unix tools
-    "ls", "cat", "echo", "printf", "pwd", "head", "tail", "wc", "sort", "uniq",
-    "cut", "grep", "egrep", "fgrep", "rg", "ag", "find", "fd", "tree", "stat",
-    "file", "diff", "cmp", "env", "printenv", "true", "false", "date", "sleep",
-    "which", "basename", "dirname", "realpath", "readlink",
-    # scoped file ops (destructive variants caught by approval/deny patterns)
-    "mkdir", "touch", "cp", "mv", "ln", "sed", "awk", "tr", "tee", "xargs", "test",
-})
+_ALLOWED_EXECUTABLES = frozenset(
+    {
+        # language runtimes / package managers
+        "python",
+        "python3",
+        "py",
+        "pip",
+        "pip3",
+        "pipx",
+        "uv",
+        "poetry",
+        "pytest",
+        "node",
+        "npm",
+        "npx",
+        "yarn",
+        "pnpm",
+        "bun",
+        "deno",
+        "tsc",
+        "go",
+        "cargo",
+        "rustc",
+        "java",
+        "javac",
+        "mvn",
+        "gradle",
+        "gradlew",
+        "ruby",
+        "gem",
+        "bundle",
+        "rake",
+        "php",
+        "composer",
+        "dotnet",
+        # build / test / lint / format
+        "make",
+        "cmake",
+        "ninja",
+        "meson",
+        "tox",
+        "nox",
+        "ruff",
+        "mypy",
+        "black",
+        "isort",
+        "flake8",
+        "pylint",
+        "eslint",
+        "prettier",
+        "jest",
+        "mocha",
+        "vitest",
+        # version control (dangerous git verbs are handled by the denylist / approval patterns)
+        "git",
+        "hg",
+        # common read/inspect unix tools
+        "ls",
+        "cat",
+        "echo",
+        "printf",
+        "pwd",
+        "head",
+        "tail",
+        "wc",
+        "sort",
+        "uniq",
+        "cut",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ag",
+        "find",
+        "fd",
+        "tree",
+        "stat",
+        "file",
+        "diff",
+        "cmp",
+        "env",
+        "printenv",
+        "true",
+        "false",
+        "date",
+        "sleep",
+        "which",
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",
+        # scoped file ops (destructive variants caught by approval/deny patterns)
+        "mkdir",
+        "touch",
+        "cp",
+        "mv",
+        "ln",
+        "sed",
+        "awk",
+        "tr",
+        "tee",
+        "xargs",
+        "test",
+    }
+)
 
 #: Shell interpreters. Allowing them defeats ``shell=False`` argv sandboxing, so they are treated as
 #: high-risk and require approval even though they are "known" binaries.
@@ -84,9 +170,15 @@ _DENY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(aws|gcloud|az)\s+.*\blogin\b"), "cloud CLI login is not allowed"),
     (re.compile(r"\bsudo\b"), "sudo is not allowed"),
     (re.compile(r"\bsecurity\s+find-generic-password\b"), "keychain access is not allowed"),
-    (re.compile(r"(?i)\b(cat|less|more|head|tail|bat)\b[^\n|;&]*\.env\b"), "reading .env is not allowed"),
+    (
+        re.compile(r"(?i)\b(cat|less|more|head|tail|bat)\b[^\n|;&]*\.env\b"),
+        "reading .env is not allowed",
+    ),
     (re.compile(r"(?i)id_rsa|id_ed25519|\.ssh/"), "SSH private key access is not allowed"),
-    (re.compile(r"(?i)\b(cat|less|more)\b[^\n|;&]*(credentials|\.aws/)"), "reading credentials is not allowed"),
+    (
+        re.compile(r"(?i)\b(cat|less|more)\b[^\n|;&]*(credentials|\.aws/)"),
+        "reading credentials is not allowed",
+    ),
 ]
 
 # High-risk: allowed only after approval.
@@ -140,8 +232,10 @@ def evaluate(command: str, *, network_allowed: bool = False) -> PolicyResult:
     # 2. Shell operators can't run under shell=False; gate them behind approval.
     if _SHELL_META.search(normalized) or not argv:
         return PolicyResult(
-            Decision.APPROVAL, "shell operators require explicit approval",
-            argv=argv, needs_shell=True,
+            Decision.APPROVAL,
+            "shell operators require explicit approval",
+            argv=argv,
+            needs_shell=True,
         )
 
     # 3. Network use when the profile forbids it.
@@ -149,7 +243,9 @@ def evaluate(command: str, *, network_allowed: bool = False) -> PolicyResult:
         for pattern in _NETWORK_PATTERNS:
             if pattern.search(normalized):
                 return PolicyResult(
-                    Decision.APPROVAL, "network-oriented command requires approval for this profile", argv=argv,
+                    Decision.APPROVAL,
+                    "network-oriented command requires approval for this profile",
+                    argv=argv,
                 )
 
     # 4. Destructive but sometimes-legitimate verbs.
@@ -161,12 +257,16 @@ def evaluate(command: str, *, network_allowed: bool = False) -> PolicyResult:
     # 5. Shell interpreters escape argv sandboxing → high-risk.
     if exe in _SHELL_INTERPRETERS:
         return PolicyResult(
-            Decision.APPROVAL, f"{exe} is a shell interpreter and requires approval", argv=argv,
+            Decision.APPROVAL,
+            f"{exe} is a shell interpreter and requires approval",
+            argv=argv,
         )
     # 6. The allowlist is the primary boundary: unknown executables need approval.
     if exe not in _ALLOWED_EXECUTABLES:
         return PolicyResult(
-            Decision.APPROVAL, f"{exe!r} is not on the executable allowlist", argv=argv,
+            Decision.APPROVAL,
+            f"{exe!r} is not on the executable allowlist",
+            argv=argv,
         )
 
     return PolicyResult(Decision.ALLOW, argv=argv)

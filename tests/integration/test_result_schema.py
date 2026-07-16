@@ -32,17 +32,17 @@ def _app(tmp_path: Path) -> OpenAgentApp:
     g("add", "-A")
     g("commit", "-q", "-m", "init")
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     oa = OpenAgentApp(paths)
     oa.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
     return oa
 
 
-async def test_result_json_matches_schema_initial_and_resumed(
-    tmp_path: Path, monkeypatch
-):
+async def test_result_json_matches_schema_initial_and_resumed(tmp_path: Path, monkeypatch):
     adapter = FakeCliAdapter(write_fake_script(tmp_path), mode="complete", resume_mode="resume")
     install_fake_cli(monkeypatch, adapter)
     oa = _app(tmp_path)

@@ -23,11 +23,13 @@ from ...security.process import ManagedProcess
 EventMapper = Callable[[dict[str, Any], str], list[NormalizedEvent]]
 
 #: The terminal event types every CLI adapter must resolve a run to exactly one of (spec §6.2).
-TERMINAL_EVENT_TYPES = frozenset({
-    EventType.RUN_COMPLETED.value,
-    EventType.RUN_FAILED.value,
-    EventType.RUN_CANCELLED.value,
-})
+TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.RUN_COMPLETED.value,
+        EventType.RUN_FAILED.value,
+        EventType.RUN_CANCELLED.value,
+    }
+)
 
 
 @dataclass
@@ -75,7 +77,9 @@ class CliAdapter(Protocol):
 
     def start_run(self, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]: ...
 
-    def resume_run(self, session_id: str, prompt: str, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]: ...
+    def resume_run(
+        self, session_id: str, prompt: str, request: CliRunRequest
+    ) -> AsyncIterator[NormalizedEvent]: ...
 
     async def cancel(self, run_id: str) -> None: ...
 
@@ -165,14 +169,22 @@ def reconcile_terminal(
 
     def fail(error_type: str, message: str) -> NormalizedEvent:
         return NormalizedEvent(
-            run_id=run_id, type=EventType.RUN_FAILED, source=source,
-            data={"error_type": error_type, "exit_code": exit_code, "message": message,
-                  "stderr": (stderr or "")[-2000:]},
+            run_id=run_id,
+            type=EventType.RUN_FAILED,
+            source=source,
+            data={
+                "error_type": error_type,
+                "exit_code": exit_code,
+                "message": message,
+                "stderr": (stderr or "")[-2000:],
+            },
         )
 
     if cancelled:
         return NormalizedEvent(
-            run_id=run_id, type=EventType.RUN_CANCELLED, source=source,
+            run_id=run_id,
+            type=EventType.RUN_CANCELLED,
+            source=source,
             data={"reason": "cancelled by user", "exit_code": exit_code},
         )
 
@@ -181,8 +193,10 @@ def reconcile_terminal(
     # A native failure always wins over a completion (fail-closed); flag genuine contradictions.
     if failed is not None:
         if comp is not None or canc is not None:
-            return fail("terminal_conflict",
-                        "CLI emitted conflicting terminal events; a failure was reported")
+            return fail(
+                "terminal_conflict",
+                "CLI emitted conflicting terminal events; a failure was reported",
+            )
         return failed
     # A native cancellation (no failure) stands, even alongside a completion claim.
     if canc is not None:
@@ -190,13 +204,14 @@ def reconcile_terminal(
     if comp is not None:
         if exit_code in (0, None):
             return comp
-        return fail("exit_code_mismatch",
-                    f"CLI reported success but exited with code {exit_code}")
+        return fail("exit_code_mismatch", f"CLI reported success but exited with code {exit_code}")
 
     clean = exit_code in (0, None)
     detail = "clean exit but no terminal event" if clean else f"exit code {exit_code}"
-    return fail("no_terminal_event" if clean else "command_failed",
-                f"CLI produced no successful result ({detail})")
+    return fail(
+        "no_terminal_event" if clean else "command_failed",
+        f"CLI produced no successful result ({detail})",
+    )
 
 
 @dataclass
@@ -216,7 +231,11 @@ Finalizer = Callable[[StreamOutcome], list[NormalizedEvent]]
 
 
 async def run_managed_cli(
-    *, proc: ManagedProcess, run_id: str, source: str, mapper: EventMapper,
+    *,
+    proc: ManagedProcess,
+    run_id: str,
+    source: str,
+    mapper: EventMapper,
     finalizer: Finalizer | None = None,
 ) -> AsyncIterator[NormalizedEvent]:
     """Start ``proc``, normalize its JSONL output, and enforce the terminal-state contract.
@@ -239,7 +258,9 @@ async def run_managed_cli(
 
     await proc.start()
     yield NormalizedEvent(
-        run_id=run_id, type=EventType.PROCESS_STARTED, source=source,
+        run_id=run_id,
+        type=EventType.PROCESS_STARTED,
+        source=source,
         data={"pid": proc.pid, "create_time": proc.create_time},
     )
     observations = TerminalObservations()
@@ -253,7 +274,10 @@ async def run_managed_cli(
                 observations.observe(event)  # buffer all outcomes; reconciled once at the end
                 continue
             etype = event.type if isinstance(event.type, str) else event.type.value
-            if etype == EventType.MESSAGE_COMPLETED.value and str(event.data.get("text") or "").strip():
+            if (
+                etype == EventType.MESSAGE_COMPLETED.value
+                and str(event.data.get("text") or "").strip()
+            ):
                 saw_message = True
             yield event
     code = await proc.wait()
@@ -262,8 +286,12 @@ async def run_managed_cli(
         for event in finalizer(outcome):
             yield event
     yield reconcile_terminal(
-        run_id=run_id, source=source, observations=observations,
-        exit_code=code, cancelled=proc.cancelled, stderr=proc.stderr,
+        run_id=run_id,
+        source=source,
+        observations=observations,
+        exit_code=code,
+        cancelled=proc.cancelled,
+        stderr=proc.stderr,
     )
 
 

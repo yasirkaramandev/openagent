@@ -28,9 +28,23 @@ IS_WINDOWS = sys.platform.startswith("win")
 
 #: Environment variables that are safe/necessary to inherit for a child CLI to function.
 _SAFE_ENV_KEYS = (
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
-    "TERM", "TMPDIR", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
-    "SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT",  # Windows
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "COMSPEC",
+    "PATHEXT",  # Windows
 )
 
 
@@ -166,9 +180,9 @@ def pid_identity(pid: int | None) -> float | None:
 _IDENTITY_TOLERANCE = 1.0
 
 #: Identity classifications for a recorded run PID (spec §45).
-PID_ALIVE = "alive"      # the same process is still running (PID + create-time match)
-PID_GONE = "gone"        # no such PID (or no PID recorded)
-PID_REUSED = "reused"    # PID is live but belongs to a *different* process (create-time differs)
+PID_ALIVE = "alive"  # the same process is still running (PID + create-time match)
+PID_GONE = "gone"  # no such PID (or no PID recorded)
+PID_REUSED = "reused"  # PID is live but belongs to a *different* process (create-time differs)
 PID_UNKNOWN = "unknown"  # PID is live but identity can't be verified (no recorded time / denied)
 
 
@@ -309,7 +323,10 @@ def _decode(raw: bytes | None) -> str:
 
 
 def _read_bounded(
-    popen: subprocess.Popen, *, timeout: float, limit: int,
+    popen: subprocess.Popen,
+    *,
+    timeout: float,
+    limit: int,
     cancellation: RunCancellation | None = None,
 ) -> tuple[bytes, bytes, bool]:
     """Stream a process's stdout/stderr with a hard combined byte cap and a deadline.

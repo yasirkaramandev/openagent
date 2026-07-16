@@ -36,11 +36,20 @@ def oa(tmp_path: Path) -> OpenAgentApp:
     (project / "seed.txt").write_text("seed\n")
     _git(["add", "-A"], project)
     _git(["commit", "-q", "-m", "init"], project)
-    paths = Paths(data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-                  db_path=tmp_path / "data" / "openagent.db", project_root=project)
+    paths = Paths(
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
+    )
     app = OpenAgentApp(paths)
-    app.agents.create(name="fake-coder", title="Fake Coder", runtime_type=RuntimeType.CLI,
-                      cli="fake", description="a fixture agent")
+    app.agents.create(
+        name="fake-coder",
+        title="Fake Coder",
+        runtime_type=RuntimeType.CLI,
+        cli="fake",
+        description="a fixture agent",
+    )
     return app
 
 
@@ -121,8 +130,9 @@ async def test_run_streams_into_the_console_and_reaches_completed(oa: OpenAgentA
         assert "completed" in str(console.query_one("#status", Static).content)
 
 
-async def test_leaving_the_console_does_not_kill_the_run(oa: OpenAgentApp, tmp_path: Path,
-                                                         monkeypatch: pytest.MonkeyPatch):
+async def test_leaving_the_console_does_not_kill_the_run(
+    oa: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Closing the console must not cancel the agent — the run is owned by the app (item 10).
 
     The run is executed as an app-level worker precisely so that popping the screen cannot take it
@@ -181,8 +191,9 @@ async def test_leaving_the_console_does_not_kill_the_run(oa: OpenAgentApp, tmp_p
         await _await_terminal(oa, pilot, run_id)
 
 
-async def test_cancel_from_the_console_really_stops_the_run(oa: OpenAgentApp, tmp_path: Path,
-                                                            monkeypatch: pytest.MonkeyPatch):
+async def test_cancel_from_the_console_really_stops_the_run(
+    oa: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     adapter = FakeCliAdapter(write_fake_script(tmp_path), mode="longrun")
     install_fake_cli(monkeypatch, adapter)
 
@@ -210,10 +221,13 @@ async def test_cancel_from_the_console_really_stops_the_run(oa: OpenAgentApp, tm
 
         # Exactly one terminal event, and it is the cancellation — never a later "completed".
         raw = oa.runs.output(run_id, "events").splitlines()
-        terminals = [line for line in raw
-                     if '"type":"run.completed"' in line.replace(" ", "")
-                     or '"type":"run.failed"' in line.replace(" ", "")
-                     or '"type":"run.cancelled"' in line.replace(" ", "")]
+        terminals = [
+            line
+            for line in raw
+            if '"type":"run.completed"' in line.replace(" ", "")
+            or '"type":"run.failed"' in line.replace(" ", "")
+            or '"type":"run.cancelled"' in line.replace(" ", "")
+        ]
         assert len(terminals) == 1
         assert "run.cancelled" in terminals[0]
 
@@ -259,8 +273,9 @@ async def test_console_reopens_a_finished_run_from_the_event_log(oa: OpenAgentAp
 
 async def test_no_secret_under_openagent_dir(oa: OpenAgentApp, use_fake):
     """After a run, nothing secret-looking is left under .openagent/ (verification item 10)."""
-    run = oa.runs.create(agent_name="fake-coder", prompt="store sk-LEAK1234567890abcdEFGH please",
-                         worktree="auto")
+    run = oa.runs.create(
+        agent_name="fake-coder", prompt="store sk-LEAK1234567890abcdEFGH please", worktree="auto"
+    )
     await oa.runs.execute(run)
     state_dir = oa.paths.project_state_dir
     for path in state_dir.rglob("*"):

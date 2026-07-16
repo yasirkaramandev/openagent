@@ -16,17 +16,22 @@ def make_adapter() -> OpenAIResponsesAdapter:
 
 def req(stream: bool = False, tools=None) -> NormalizedModelRequest:
     return NormalizedModelRequest(
-        model="gpt-x", system="be brief",
-        messages=[Message(role=Role.USER, content="hi")], tools=tools or [], stream=stream,
+        model="gpt-x",
+        system="be brief",
+        messages=[Message(role=Role.USER, content="hi")],
+        tools=tools or [],
+        stream=stream,
     )
 
 
 async def test_text_output(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "resp_1",
-        "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}],
-        "usage": {"input_tokens": 6, "output_tokens": 2},
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "resp_1",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}],
+            "usage": {"input_tokens": 6, "output_tokens": 2},
+        }
+    )
     result = await collect(make_adapter().stream_response(req()))
     assert result.text == "hello"
     assert result.response_id == "resp_1"
@@ -34,13 +39,19 @@ async def test_text_output(httpx_mock: HTTPXMock):
 
 
 async def test_function_call_output(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "resp_2",
-        "output": [
-            {"type": "function_call", "call_id": "fc_1", "name": "search_text",
-             "arguments": json.dumps({"query": "TODO"})},
-        ],
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "resp_2",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "fc_1",
+                    "name": "search_text",
+                    "arguments": json.dumps({"query": "TODO"}),
+                },
+            ],
+        }
+    )
     result = await collect(make_adapter().stream_response(req(tools=[{"name": "search_text"}])))
     assert result.tool_calls[0].name == "search_text"
     assert result.tool_calls[0].arguments == {"query": "TODO"}
@@ -48,8 +59,12 @@ async def test_function_call_output(httpx_mock: HTTPXMock):
 
 
 async def test_tool_result_roundtrip_payload(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={"id": "r", "output": [
-        {"type": "message", "content": [{"type": "output_text", "text": "done"}]}]})
+    httpx_mock.add_response(
+        json={
+            "id": "r",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "done"}]}],
+        }
+    )
     request = NormalizedModelRequest(
         model="gpt-x",
         messages=[
@@ -72,44 +87,67 @@ async def test_error(httpx_mock: HTTPXMock):
 
 # --------------------------------------------------------------------------- incomplete (item 8)
 
+
 async def test_incomplete_max_tokens_is_context_limit(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "resp_i", "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-        "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}],
-        "usage": {"input_tokens": 6, "output_tokens": 16},
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "resp_i",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "partial"}]}
+            ],
+            "usage": {"input_tokens": 6, "output_tokens": 16},
+        }
+    )
     result = await collect(make_adapter().stream_response(req()))
     assert result.is_error
     assert result.error_type == "context_limit"
 
 
 async def test_incomplete_content_filter_maps_to_content_filtered(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "resp_i2", "status": "incomplete",
-        "incomplete_details": {"reason": "content_filter"}, "output": [],
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "resp_i2",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [],
+        }
+    )
     result = await collect(make_adapter().stream_response(req()))
     assert result.error_type == "content_filtered"
 
 
 async def test_incomplete_other_reason_is_incomplete_response(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "resp_i3", "status": "incomplete",
-        "incomplete_details": {"reason": "something_else"}, "output": [],
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "resp_i3",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "something_else"},
+            "output": [],
+        }
+    )
     result = await collect(make_adapter().stream_response(req()))
     assert result.error_type == "incomplete_response"
 
 
 async def test_incomplete_does_not_surface_tool_calls(httpx_mock: HTTPXMock):
     # A truncated response may contain a partial function_call — it must not be executed.
-    httpx_mock.add_response(json={
-        "id": "resp_i4", "status": "incomplete",
-        "incomplete_details": {"reason": "max_output_tokens"},
-        "output": [{"type": "function_call", "call_id": "fc_x", "name": "run_command",
-                    "arguments": "{"}],
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "resp_i4",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "fc_x",
+                    "name": "run_command",
+                    "arguments": "{",
+                }
+            ],
+        }
+    )
     result = await collect(make_adapter().stream_response(req(tools=[{"name": "run_command"}])))
     assert result.is_error
     assert result.tool_calls == []

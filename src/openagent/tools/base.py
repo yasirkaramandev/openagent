@@ -64,8 +64,12 @@ class ToolContext:
         self, action: str, detail: str, *, command: str = "", reason: str = ""
     ) -> bool:
         request = ApprovalRequest(
-            run_id=self.run_id, action=action, detail=detail,
-            command=command or detail, reason=reason, workspace=str(self.workspace_root),
+            run_id=self.run_id,
+            action=action,
+            detail=detail,
+            command=command or detail,
+            reason=reason,
+            workspace=str(self.workspace_root),
         )
         return self.approval_gate.decide(request).value == "accepted"
 

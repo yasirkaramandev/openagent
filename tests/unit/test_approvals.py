@@ -6,8 +6,14 @@ from openagent.security.approvals import ApprovalGate, ApprovalOutcome, Approval
 
 
 def _req() -> ApprovalRequest:
-    return ApprovalRequest(run_id="r", action="run_command", detail="rm -rf build",
-                           command="rm -rf build", reason="recursive delete", workspace="/ws")
+    return ApprovalRequest(
+        run_id="r",
+        action="run_command",
+        detail="rm -rf build",
+        command="rm -rf build",
+        reason="recursive delete",
+        workspace="/ws",
+    )
 
 
 def test_non_interactive_defaults_to_deny():

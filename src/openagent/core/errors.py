@@ -32,6 +32,10 @@ class ErrorType(str, Enum):
     TIMEOUT = "timeout"
     #: The stream dropped after we had already yielded events — not safe to replay (spec §44).
     CONNECTION_LOST = "connection_lost"
+    #: The provider accepted the request asynchronously (HTTP 202 + request id). OpenAgent's chat
+    #: runtime is synchronous and does not poll, so a 202 is an explicit failure, never an empty
+    #: success (spec §15.5, some NVIDIA model types).
+    ASYNC_UNSUPPORTED = "async_unsupported"
     UNKNOWN = "unknown"
 
 

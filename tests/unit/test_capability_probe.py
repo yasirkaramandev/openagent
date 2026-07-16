@@ -18,8 +18,13 @@ SENTINEL = "PROBE_OK_7F"
 
 class FakeAdapter:
     def __init__(
-        self, *, text: str = SENTINEL, stream_text: bool = True, tool: bool = True,
-        text_error: bool = False, stream_error: bool = False,
+        self,
+        *,
+        text: str = SENTINEL,
+        stream_text: bool = True,
+        tool: bool = True,
+        text_error: bool = False,
+        stream_error: bool = False,
     ) -> None:
         self.text = text
         self.stream_text = stream_text
@@ -41,14 +46,18 @@ class FakeAdapter:
             yield NormalizedModelEvent(type=ModelEventType.DONE)
         elif request.stream:  # streaming probe
             if self.stream_error:
-                yield NormalizedModelEvent(type=ModelEventType.ERROR, error_type="provider_overloaded")
+                yield NormalizedModelEvent(
+                    type=ModelEventType.ERROR, error_type="provider_overloaded"
+                )
                 return
             if self.stream_text:
                 yield NormalizedModelEvent(type=ModelEventType.TEXT_DELTA, text="streamed")
             yield NormalizedModelEvent(type=ModelEventType.DONE)
         else:  # text / system-prompt probe
             if self.text_error:
-                yield NormalizedModelEvent(type=ModelEventType.ERROR, error_type="authentication_failed")
+                yield NormalizedModelEvent(
+                    type=ModelEventType.ERROR, error_type="authentication_failed"
+                )
                 return
             if self.text:
                 yield NormalizedModelEvent(type=ModelEventType.TEXT_DELTA, text=self.text)

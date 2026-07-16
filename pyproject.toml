@@ -48,7 +48,10 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-httpx>=0.30",
-    "ruff>=0.5",
+    # Pinned exactly: `ruff format --check .` is a CI gate, and formatting output changes between
+    # ruff releases. An unpinned range would make the gate fail (or silently reformat) purely because
+    # a new ruff shipped — the baseline must be reproducible (spec §8).
+    "ruff==0.15.21",
     "mypy>=1.10",
     "types-pyyaml",
     "types-psutil",

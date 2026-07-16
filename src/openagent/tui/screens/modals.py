@@ -34,8 +34,13 @@ class ConfirmModal(ModalScreen[bool]):
     ConfirmModal Button { margin: 0 0 0 2; }
     """
 
-    def __init__(self, question: str, *, confirm_label: str = "Confirm",
-                 confirm_variant: ButtonVariant = "error") -> None:
+    def __init__(
+        self,
+        question: str,
+        *,
+        confirm_label: str = "Confirm",
+        confirm_variant: ButtonVariant = "error",
+    ) -> None:
         super().__init__()
         self.question = question
         self.confirm_label = confirm_label
@@ -205,8 +210,9 @@ class InPlaceConfirmModal(ModalScreen[bool]):
                 "files as the agent makes them, and there is no separate diff to review first.",
             )
             yield Static(f"[b]Agent:[/b] {safe_markup(self.agent, 80)}", classes="k")
-            yield Static(f"[b]Profile:[/b] {safe_markup(self.profile, 40)} (can edit files)",
-                         classes="k")
+            yield Static(
+                f"[b]Profile:[/b] {safe_markup(self.profile, 40)} (can edit files)", classes="k"
+            )
             yield Static(f"[b]Directory:[/b] {safe_markup(self.workspace, 200)}", classes="k")
             yield Static("\nContinue in place?")
             with Horizontal(id="buttons"):

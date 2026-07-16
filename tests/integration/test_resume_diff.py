@@ -23,8 +23,10 @@ def _project(tmp_path: Path, *, git: bool) -> Path:
     (project / "seed.txt").write_text("original line\n")
     (project / "todelete.txt").write_text("delete me\n")
     if git:
+
         def g(*a):
             subprocess.run(["git", *a], cwd=str(project), check=True, capture_output=True)
+
         g("init", "-q")
         g("config", "user.email", "t@t.com")
         g("config", "user.name", "t")
@@ -35,8 +37,10 @@ def _project(tmp_path: Path, *, git: bool) -> Path:
 
 def _oa(tmp_path: Path, project: Path) -> OpenAgentApp:
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     oa = OpenAgentApp(paths)
     oa.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
@@ -59,9 +63,9 @@ async def test_copy_run_and_resume_diff(tmp_path: Path, monkeypatch, git: bool):
     assert result.status == RunStatus.COMPLETED
 
     changed = set(result.files_changed)
-    assert "created1.txt" in changed   # created
-    assert "seed.txt" in changed       # modified
-    assert "todelete.txt" in changed   # deleted
+    assert "created1.txt" in changed  # created
+    assert "seed.txt" in changed  # modified
+    assert "todelete.txt" in changed  # deleted
     diff1 = oa.runs.output(run.id, "diff")
     assert "created in turn1" in diff1
     assert "turn1 append" in diff1
@@ -101,8 +105,9 @@ async def test_non_git_in_place_diff_reads_distinct_baseline(tmp_path: Path, mon
     oa = _oa(tmp_path, project)
     _wire(monkeypatch, tmp_path, "mutate", "mutate2")
 
-    run = oa.runs.create(agent_name="fake-coder", prompt="go", worktree="none",
-                         confirm_in_place=True)
+    run = oa.runs.create(
+        agent_name="fake-coder", prompt="go", worktree="none", confirm_in_place=True
+    )
     result = await oa.runs.execute(run)
     assert result.status == RunStatus.COMPLETED
     diff = oa.runs.output(run.id, "diff")

@@ -14,12 +14,19 @@ def _make_app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     oa = OpenAgentApp(paths)
-    oa.agents.create(name="codex-coder", title="Codex Coder", runtime_type=RuntimeType.CLI,
-                     cli="codex", tags=["coder"])
+    oa.agents.create(
+        name="codex-coder",
+        title="Codex Coder",
+        runtime_type=RuntimeType.CLI,
+        cli="codex",
+        tags=["coder"],
+    )
     return oa
 
 

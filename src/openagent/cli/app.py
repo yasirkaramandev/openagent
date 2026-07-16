@@ -8,6 +8,7 @@ from an environment variable.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import NoReturn
 
 import typer
@@ -19,14 +20,23 @@ from ..app import OpenAgentApp
 from ..core.events import NormalizedEvent
 from ..core.models import Protocol, RuntimeType, enum_value
 from ..core.permissions import profile_names
-from ..providers.factory import PRESETS, preset_names
+from ..providers.discovery import (
+    PROBE_NOT_FOUND,
+    PROBE_RATE_LIMITED,
+    PROBE_UNAUTHORIZED,
+    PROBE_VERIFIED,
+    filter_models,
+    looks_non_chat,
+)
+from ..providers.factory import PRESETS, get_preset, preset_names
 from ..services.agent_service import AgentError
 from ..services.provider_service import ProviderInUseError, ProviderValidationError
-from ..services.run_service import RunError
+from ..services.run_service import CancelOutcome, RunError
 from ..tui.markup import safe_line, safe_markup
 
 app = typer.Typer(
-    add_completion=False, no_args_is_help=False,
+    add_completion=False,
+    no_args_is_help=False,
     help="OpenAgent — local-first control plane for AI APIs, coding CLIs, and agents.",
 )
 provider_app = typer.Typer(help="Manage API provider connections.")
@@ -70,8 +80,10 @@ def init() -> None:
     console.print(f"  data:    {oa.paths.data_dir}")
     console.print(f"  db:      {oa.paths.db_path}")
     console.print(f"  project: {oa.paths.project_root}")
-    console.print("\nNext: [bold]openagent discover[/bold] to detect CLIs, "
-                  "or [bold]openagent provider add[/bold] to connect an API.")
+    console.print(
+        "\nNext: [bold]openagent discover[/bold] to detect CLIs, "
+        "or [bold]openagent provider add[/bold] to connect an API."
+    )
 
 
 @app.command("discover")
@@ -104,7 +116,14 @@ def add_agent(
     cli: str | None = typer.Option(None, "--cli", help="CLI type, e.g. codex/claude (CLI agent)."),
     tag: list[str] = typer.Option([], "--tag", help="Repeatable tag."),
     system_prompt: str = typer.Option("", "--system-prompt"),
-    profile: str = typer.Option("safe-edit", "--profile", help=f"One of: {', '.join(profile_names())}"),
+    profile: str = typer.Option(
+        "safe-edit", "--profile", help=f"One of: {', '.join(profile_names())}"
+    ),
+    allow_unverified_model: bool = typer.Option(
+        False,
+        "--allow-unverified-model",
+        help="Create the agent even though its model has no verified capability probe.",
+    ),
 ) -> None:
     """Add an agent (API or CLI). Shortcut for `agent add`."""
     oa = _app()
@@ -114,22 +133,74 @@ def add_agent(
             # ``None`` means "use the CLI's own default". This path used to silently drop --model,
             # so a CLI agent could never be created with a pinned model from the CLI (item 10).
             agent = oa.agents.create(
-                name=name, title=title, description=description, runtime_type=RuntimeType.CLI,
-                cli=cli, model=model, tags=tag, system_prompt=system_prompt,
+                name=name,
+                title=title,
+                description=description,
+                runtime_type=RuntimeType.CLI,
+                cli=cli,
+                model=model,
+                tags=tag,
+                system_prompt=system_prompt,
                 permission_profile=profile,
             )
         else:
             if not oa.providers.get(provider or ""):
-                _fail(f"provider {provider!r} not found. Add it first: openagent provider add {provider} --type <type>")
+                _fail(
+                    f"provider {provider!r} not found. Add it first: openagent provider add {provider} --type <type>"
+                )
+            _require_verified_model(oa, provider or "", model or "", allow_unverified_model)
             agent = oa.agents.create(
-                name=name, title=title, description=description, runtime_type=RuntimeType.API_AGENT,
-                provider=provider, model=model, tags=tag, system_prompt=system_prompt,
+                name=name,
+                title=title,
+                description=description,
+                runtime_type=RuntimeType.API_AGENT,
+                provider=provider,
+                model=model,
+                tags=tag,
+                system_prompt=system_prompt,
                 permission_profile=profile,
             )
     except AgentError as exc:
         _fail(str(exc))
-    console.print(f"[green]✓[/green] agent [bold]{safe_markup(agent.name)}[/bold] created; "
-                  "OPENAGENT.md updated")
+    console.print(
+        f"[green]✓[/green] agent [bold]{safe_markup(agent.name)}[/bold] created; "
+        "OPENAGENT.md updated"
+    )
+    if allow_unverified_model and not cli:
+        console.print(
+            "[yellow]⚠ this agent's model was NOT verified agent-compatible "
+            "(--allow-unverified-model). It may fail to operate OpenAgent tools.[/yellow]"
+        )
+
+
+def _require_verified_model(
+    oa: OpenAgentApp, provider: str, model: str, allow_unverified: bool
+) -> None:
+    """Refuse to create an agent on an unvalidated model from a **mixed catalog** (spec §17.5).
+
+    Scoped to providers whose catalog mixes model types (``catalog_is_mixed`` — NVIDIA Build): there,
+    a model id proves nothing, so creating an agent on an unprobed entry would produce an agent that
+    silently cannot run. Only a *cached* probe is consulted — an expensive provider call is never made
+    silently behind the user's back; the user is told the exact command to run.
+    """
+
+    if allow_unverified:
+        return
+    preset = get_preset(_provider_type(oa, provider))
+    if preset is None or not preset.catalog_is_mixed:
+        return
+    probe = oa.providers.cached_probe(provider, model)
+    if probe is None:
+        _fail(
+            f"model {model!r} has not been validated; run:\n"
+            f"  openagent provider probe {provider} --model {model}\n"
+            "then re-run this command, or pass --allow-unverified-model to create it anyway."
+        )
+    if probe.category != PROBE_VERIFIED:
+        _fail(
+            f"model {model!r} is not verified agent-compatible ({probe.category}): {probe.message()}\n"
+            "Choose another model, or pass --allow-unverified-model to create it anyway."
+        )
 
 
 @app.command("list")
@@ -145,8 +216,13 @@ def runs(limit: int = typer.Option(20, "--limit")) -> None:
     table = Table("ID", "Agent", "Status", "Started", "Files")
     for run in oa.runs.list(limit):
         status = enum_value(run.status)
-        table.add_row(safe_line(run.id), safe_line(run.agent), safe_line(status),
-                      run.started_at.strftime("%m-%d %H:%M"), str(len(run.files_changed)))
+        table.add_row(
+            safe_line(run.id),
+            safe_line(run.agent),
+            safe_line(status),
+            run.started_at.strftime("%m-%d %H:%M"),
+            str(len(run.files_changed)),
+        )
     console.print(table)
 
 
@@ -157,7 +233,9 @@ def run(
     worktree: str = typer.Option("auto", "--worktree", help="auto | none | copy"),
     profile: str | None = typer.Option(None, "--profile"),
     yes: bool = typer.Option(
-        False, "--yes", "-y",
+        False,
+        "--yes",
+        "-y",
         help="Approve high-risk operations non-interactively (records approval events).",
     ),
 ) -> None:
@@ -168,8 +246,13 @@ def run(
     oa = _app()
     oa.runs.recover_orphans()
     try:
-        run_obj = oa.runs.create(agent_name=name, prompt=prompt, worktree=worktree,
-                                 permission_profile=profile, confirm_in_place=yes)
+        run_obj = oa.runs.create(
+            agent_name=name,
+            prompt=prompt,
+            worktree=worktree,
+            permission_profile=profile,
+            confirm_in_place=yes,
+        )
     except RunError as exc:
         _fail(str(exc))
     console.print(f"[dim]run {run_obj.id} starting…[/dim]")
@@ -187,7 +270,9 @@ def run(
 @app.command()
 def output(
     id: str = typer.Option(..., "--id", help="Run id."),
-    format: str = typer.Option("md", "--format", help="md|json|diff|logs|events|handoff|status|tests"),
+    format: str = typer.Option(
+        "md", "--format", help="md|json|diff|logs|events|handoff|status|tests"
+    ),
 ) -> None:
     """Print a run artifact (spec §32)."""
     oa = _app()
@@ -217,16 +302,40 @@ def message(
 
 
 @app.command()
-def resume(id: str = typer.Option(..., "--id"), prompt: str = typer.Option("continue", "--prompt", "-p")) -> None:
+def resume(
+    id: str = typer.Option(..., "--id"), prompt: str = typer.Option("continue", "--prompt", "-p")
+) -> None:
     """Resume a run (spec §32)."""
     message(id=id, prompt=prompt)
 
 
 @app.command()
 def cancel(id: str = typer.Option(..., "--id")) -> None:
-    """Cancel a running run (spec §32)."""
-    _run(_app().runs.cancel(id))
-    console.print(f"[yellow]cancelled[/yellow] {id}")
+    """Cancel a running run (spec §32, §3.3).
+
+    Reports exactly what happened and never claims a false success: a run that was already finished,
+    or an orphaned run whose recorded process is gone/reused, is reported as such (non-zero exit for
+    the cases where nothing was stopped).
+    """
+    outcome = _run(_app().runs.cancel(id))
+    safe_id = safe_markup(id)
+    if outcome is CancelOutcome.TERMINATED:
+        console.print(f"[yellow]cancelled[/yellow] {safe_id} — process tree terminated")
+    elif outcome is CancelOutcome.SIGNALLED:
+        console.print(
+            f"[yellow]cancelling[/yellow] {safe_id} — the active turn was signalled to stop"
+        )
+    elif outcome is CancelOutcome.ALREADY_TERMINAL:
+        console.print(f"[dim]{safe_id} has already finished; nothing to cancel[/dim]")
+    elif outcome is CancelOutcome.NOT_FOUND:
+        _fail(f"run {id!r} not found")
+    elif outcome is CancelOutcome.IDENTITY_MISMATCH:
+        _fail(
+            f"{id}: the recorded process is gone or its PID was reused; refused to terminate an "
+            "unrelated process. The run was left untouched."
+        )
+    elif outcome is CancelOutcome.NOT_CANCELLABLE:
+        _fail(f"{id}: orphaned run has no safely identifiable live process to cancel.")
 
 
 @app.command()
@@ -239,8 +348,10 @@ def doctor(json_out: bool = typer.Option(False, "--json")) -> None:
         return
     marks = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
     for check in checks:
-        console.print(f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
-                      + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else ""))
+        console.print(
+            f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
+            + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else "")
+        )
 
 
 @app.command("mcp")
@@ -256,12 +367,18 @@ def mcp(action: str = typer.Argument("serve")) -> None:
 def provider_add(
     name: str = typer.Argument(..., help="Connection name, e.g. deepseek-main."),
     type: str = typer.Option(..., "--type", help=f"Provider type: {', '.join(preset_names())}"),
-    protocol: str | None = typer.Option(None, "--protocol", help="openai-chat|openai-responses|anthropic-messages"),
+    protocol: str | None = typer.Option(
+        None, "--protocol", help="openai-chat|openai-responses|anthropic-messages"
+    ),
     base_url: str | None = typer.Option(None, "--base-url"),
     region: str | None = typer.Option(None, "--region"),
     workspace_id: str | None = typer.Option(None, "--workspace-id"),
-    key_env: str | None = typer.Option(None, "--key-env", help="Reference an env var instead of storing a key."),
-    no_key: bool = typer.Option(False, "--no-key", help="Local provider needs no key (e.g. ollama)."),
+    key_env: str | None = typer.Option(
+        None, "--key-env", help="Reference an env var instead of storing a key."
+    ),
+    no_key: bool = typer.Option(
+        False, "--no-key", help="Local provider needs no key (e.g. ollama)."
+    ),
 ) -> None:
     """Register an API provider. The key is prompted with hidden input (never passed as an argument)."""
     oa = _app()
@@ -270,18 +387,32 @@ def provider_add(
     credential_source = "none" if no_key else ("env" if key_env else "keychain")
     api_key = None
     if credential_source == "keychain":
-        api_key = typer.prompt(f"API key for {name}", hide_input=True)
+        # Hidden prompt only — a key is NEVER accepted as a command argument (spec §30, §9), so it
+        # cannot land in shell history, `ps` output, or CI logs.
+        preset = get_preset(type)
+        label = preset.credential_label if preset and preset.credential_label else "API key"
+        if preset and preset.credential_hint:
+            console.print(f"[dim]{safe_markup(preset.credential_hint)}[/dim]")
+        api_key = typer.prompt(f"{label} for {name}", hide_input=True)
     proto = Protocol(protocol) if protocol else None
     try:
         provider = oa.providers.add(
-            name=name, provider_type=type, protocol=proto, base_url=base_url,
-            api_key=api_key, key_env=key_env, credential_source=credential_source,
-            region=region, workspace_id=workspace_id,
+            name=name,
+            provider_type=type,
+            protocol=proto,
+            base_url=base_url,
+            api_key=api_key,
+            key_env=key_env,
+            credential_source=credential_source,
+            region=region,
+            workspace_id=workspace_id,
         )
     except ProviderValidationError as exc:
         _fail(str(exc))
-    console.print(f"[green]✓[/green] provider [bold]{safe_markup(name)}[/bold] added "
-                  f"({safe_markup(provider.provider_type)}, {safe_markup(provider.protocol.value)})")
+    console.print(
+        f"[green]✓[/green] provider [bold]{safe_markup(name)}[/bold] added "
+        f"({safe_markup(provider.provider_type)}, {safe_markup(provider.protocol.value)})"
+    )
     console.print(f"  test it: [bold]openagent provider test {safe_markup(name)}[/bold]")
 
 
@@ -295,30 +426,172 @@ def provider_list(json_out: bool = typer.Option(False, "--json")) -> None:
     table = Table("Name", "Type", "Protocol", "Base URL", "Key")
     for p in providers:
         cred = p.credential.type if isinstance(p.credential.type, str) else p.credential.type.value
-        table.add_row(safe_line(p.name), safe_line(p.provider_type), safe_line(p.protocol.value),
-                      safe_line(p.base_url or "(preset)"), safe_line(cred))
+        table.add_row(
+            safe_line(p.name),
+            safe_line(p.provider_type),
+            safe_line(p.protocol.value),
+            safe_line(p.base_url or "(preset)"),
+            safe_line(cred),
+        )
     console.print(table)
 
 
 @provider_app.command("test")
-def provider_test(name: str = typer.Argument(...)) -> None:
+def provider_test(
+    name: str = typer.Argument(...),
+    model: str | None = typer.Option(
+        None, "--model", help="Also validate this model with a real capability probe."
+    ),
+) -> None:
+    """Check a provider connection (spec §18).
+
+    Without ``--model`` this only proves the **catalog is reachable** — it is deliberately NOT
+    reported as "authenticated" or "API key valid", because a catalog can be public and reaching it
+    proves nothing about the key or about any model's compatibility. Pass ``--model`` to run a real
+    probe.
+    """
     oa = _app()
+    if model:
+        _print_probe(name, model, json_out=False, refresh=True)
+        return
     result = _run(oa.providers.test(name))
-    if result.ok:
-        console.print(f"[green]✓[/green] {safe_markup(name)}: {safe_markup(result.detail)}")
-    else:
+    if not result.ok:
         _fail(f"{name}: {result.detail}")
+    console.print(
+        f"[green]✓[/green] {safe_markup(name)}: catalog reachable "
+        f"([dim]{safe_markup(result.detail)}[/dim])"
+    )
+    console.print("[yellow]The API key and model inference have not yet been validated.[/yellow]")
+    console.print(
+        f"  Validate them: [bold]openagent provider probe {safe_markup(name)} "
+        "--model <publisher/model>[/bold]"
+    )
 
 
 @provider_app.command("models")
-def provider_models(name: str = typer.Argument(...)) -> None:
+def provider_models(
+    name: str = typer.Argument(...),
+    search: str | None = typer.Option(
+        None, "--search", help="Filter by model id (local, no network)."
+    ),
+    owner: str | None = typer.Option(None, "--owner", help="Filter by publisher (owned_by)."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """List a provider's catalog models (spec §17.3).
+
+    A catalog entry is **not** a capability claim: mixed catalogs (NVIDIA Build) return chat,
+    embedding, rerank and vision models alike, so ``capabilities`` is always ``null`` here. Use
+    ``openagent provider probe`` to find out what a model can actually do.
+    """
     oa = _app()
-    models = _run(oa.providers.remote_models(name))
-    if not models:
-        console.print("[yellow]no models returned (provider may lack a /models endpoint)[/yellow]")
+    models = filter_models(_run(oa.providers.remote_models(name)), search=search, owner=owner)
+    if json_out:
+        # Emit verbatim: console.print_json would soft-wrap and corrupt machine-readable output.
+        typer.echo(
+            json.dumps(
+                {
+                    "provider": name,
+                    "models": [
+                        {"id": m.id, "owned_by": m.owned_by, "capabilities": None} for m in models
+                    ],
+                },
+                indent=2,
+            )
+        )
         return
+    if not models:
+        console.print(
+            "[yellow]no models returned (provider may lack a /models endpoint, or the "
+            "filters matched nothing)[/yellow]"
+        )
+        return
+    preset = get_preset(_provider_type(oa, name))
+    if preset is not None and preset.catalog_is_mixed:
+        console.print(
+            "[yellow]This catalog contains chat, embedding, reranking, vision and other model "
+            "types.\nA catalog entry is not automatically compatible with OpenAgent agents — "
+            "validate the model before creating an agent.[/yellow]\n"
+        )
+    table = Table("Model", "Publisher", "Note")
     for m in models:
-        console.print(f"  {safe_markup(m.id)}")
+        note = "may not be a chat model" if looks_non_chat(m.id) else ""
+        table.add_row(safe_line(m.id), safe_line(m.owned_by or "—"), note)
+    console.print(table)
+    console.print(
+        f"[dim]{len(models)} model(s). Capabilities are unknown until probed:[/dim] "
+        f"[bold]openagent provider probe {safe_markup(name)} --model <id>[/bold]"
+    )
+
+
+@provider_app.command("probe")
+def provider_probe(
+    name: str = typer.Argument(...),
+    model: str = typer.Option(..., "--model", help="Model id, e.g. publisher/model."),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    refresh: bool = typer.Option(False, "--refresh", help="Ignore any cached probe result."),
+) -> None:
+    """Really validate a model: text, streaming, and tool calling (spec §17.4).
+
+    This is the only thing that may be called validation. The API key is never printed, and a
+    capability is reported only when it was actually observed. Exits non-zero when the model is not
+    verified agent-compatible.
+    """
+    _print_probe(name, model, json_out=json_out, refresh=refresh)
+
+
+def _print_probe(name: str, model: str, *, json_out: bool, refresh: bool) -> None:
+    oa = _app()
+    try:
+        probe = _run(oa.providers.probe_model(name, model, refresh=refresh))
+    except ProviderValidationError as exc:
+        _fail(str(exc))
+    if json_out:
+        typer.echo(json.dumps({"provider": name, **probe.to_dict()}, indent=2))
+    else:
+        caps = probe.capabilities
+        mark = {
+            True: "[green]yes[/green]",
+            False: "[red]no[/red]",
+            None: "[yellow]unverified[/yellow]",
+        }
+        console.print(f"[bold]{safe_markup(name)}[/bold] · {safe_markup(model)}")
+        console.print(f"  text:         {mark[bool(caps.text)]}")
+        console.print(f"  streaming:    {mark[caps.streaming]}")
+        console.print(f"  tool calling: {mark[caps.tool_calling]}")
+        colour = "green" if probe.agent_compatible else "yellow"
+        console.print(f"  [{colour}]{safe_markup(probe.message())}[/{colour}]")
+        remedy = _probe_remedy(oa, name, probe.category)
+        if remedy:
+            console.print(f"  [dim]{safe_markup(remedy)}[/dim]")
+        if probe.detail:
+            console.print(f"  [dim]{safe_markup(probe.detail, 300)}[/dim]")
+    if not probe.agent_compatible:
+        raise typer.Exit(1)
+
+
+def _provider_type(oa: OpenAgentApp, name: str) -> str:
+    provider = oa.providers.get(name)
+    return provider.provider_type if provider else ""
+
+
+def _probe_remedy(oa: OpenAgentApp, name: str, category: str) -> str:
+    """Provider-specific next step for a failed probe (spec §18).
+
+    The probe's own verdict is provider-neutral (it is shared by every adapter); this adds the one
+    concrete action the user can take, using the preset's published URLs rather than a hardcoded
+    vendor string. Never includes the key or the request body.
+    """
+
+    preset = get_preset(_provider_type(oa, name))
+    if preset is None:
+        return ""
+    if category == PROBE_UNAUTHORIZED and preset.catalog_url:
+        return f"Generate or replace the key at {preset.catalog_url}"
+    if category == PROBE_NOT_FOUND:
+        return f"Refresh the catalog: openagent provider models {name}"
+    if category == PROBE_RATE_LIMITED:
+        return "Wait and retry, or check your quota with the provider."
+    return ""
 
 
 @provider_app.command("remove")
@@ -338,8 +611,12 @@ def provider_presets() -> None:
     """List built-in provider presets (spec §12–§24)."""
     table = Table("Type", "Label", "Protocol", "Needs key")
     for preset in PRESETS.values():
-        table.add_row(preset.provider_type, preset.label, preset.protocol.value,
-                      "yes" if preset.needs_key else "no")
+        table.add_row(
+            preset.provider_type,
+            preset.label,
+            preset.protocol.value,
+            "yes" if preset.needs_key else "no",
+        )
     console.print(table)
 
 
@@ -357,10 +634,25 @@ def agent_add(
     tag: list[str] = typer.Option([], "--tag"),
     system_prompt: str = typer.Option("", "--system-prompt"),
     profile: str = typer.Option("safe-edit", "--profile"),
+    allow_unverified_model: bool = typer.Option(
+        False,
+        "--allow-unverified-model",
+        help="Create the agent even though its model has no verified capability probe.",
+    ),
 ) -> None:
     """Add an agent (same as top-level `add`)."""
-    add_agent(name=name, title=title, description=description, provider=provider, model=model,
-              cli=cli, tag=tag, system_prompt=system_prompt, profile=profile)
+    add_agent(
+        name=name,
+        title=title,
+        description=description,
+        provider=provider,
+        model=model,
+        cli=cli,
+        tag=tag,
+        system_prompt=system_prompt,
+        profile=profile,
+        allow_unverified_model=allow_unverified_model,
+    )
 
 
 @agent_app.command("list")
@@ -397,8 +689,13 @@ def _print_agents(oa: OpenAgentApp, json_out: bool) -> None:
         rt = a.runtime
         rtype = rt.type if isinstance(rt.type, str) else rt.type.value
         runtime = f"{rt.cli}-cli" if rtype == "cli" else f"api:{rt.provider}"
-        table.add_row(safe_line(a.name), safe_line(a.title or "—"), safe_line(runtime),
-                      safe_line(", ".join(a.tags) or "—"), safe_line(a.permission_profile))
+        table.add_row(
+            safe_line(a.name),
+            safe_line(a.title or "—"),
+            safe_line(runtime),
+            safe_line(", ".join(a.tags) or "—"),
+            safe_line(a.permission_profile),
+        )
     console.print(table)
 
 

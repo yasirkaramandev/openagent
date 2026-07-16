@@ -18,31 +18,43 @@ def make_adapter() -> AnthropicMessagesAdapter:
 
 def req(stream: bool = False, tools=None) -> NormalizedModelRequest:
     return NormalizedModelRequest(
-        model="claude-x", system="be brief",
-        messages=[Message(role=Role.USER, content="hi")], tools=tools or [], stream=stream,
+        model="claude-x",
+        system="be brief",
+        messages=[Message(role=Role.USER, content="hi")],
+        tools=tools or [],
+        stream=stream,
     )
 
 
 async def test_text_response(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "msg_1", "content": [{"type": "text", "text": "hello"}],
-        "usage": {"input_tokens": 8, "output_tokens": 3},
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "msg_1",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 8, "output_tokens": 3},
+        }
+    )
     result = await collect(make_adapter().stream_response(req()))
     assert result.text == "hello"
     assert result.usage.input_tokens == 8
 
 
 async def test_tool_use_response(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "msg_2",
-        "content": [
-            {"type": "text", "text": "let me look"},
-            {"type": "tool_use", "id": "toolu_1", "name": "apply_patch",
-             "input": {"path": "a.py", "old_string": "x", "new_string": "y"}},
-        ],
-        "usage": {"input_tokens": 20, "output_tokens": 10},
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "msg_2",
+            "content": [
+                {"type": "text", "text": "let me look"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "apply_patch",
+                    "input": {"path": "a.py", "old_string": "x", "new_string": "y"},
+                },
+            ],
+            "usage": {"input_tokens": 20, "output_tokens": 10},
+        }
+    )
     result = await collect(make_adapter().stream_response(req(tools=[{"name": "apply_patch"}])))
     assert result.tool_calls[0].name == "apply_patch"
     assert result.tool_calls[0].arguments["path"] == "a.py"
@@ -53,7 +65,11 @@ async def test_streaming(httpx_mock: HTTPXMock):
         {"type": "message_start", "message": {"id": "msg_3", "usage": {"input_tokens": 5}}},
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
         {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi "}},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "there"}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "there"},
+        },
         {"type": "message_delta", "usage": {"output_tokens": 4}},
         {"type": "message_stop"},
     ]
@@ -72,6 +88,7 @@ async def test_auth_error(httpx_mock: HTTPXMock):
 
 
 # --------------------------------------------------------------------------- health (item 10)
+
 
 @pytest.mark.parametrize(
     ("status", "ok", "needle"),
@@ -95,11 +112,15 @@ async def test_connection_classifies_errors(httpx_mock: HTTPXMock, status, ok, n
 
 
 async def test_connection_reachable_on_success(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={
-        "id": "msg_1", "type": "message", "role": "assistant",
-        "content": [{"type": "text", "text": "ok"}],
-        "usage": {"input_tokens": 1, "output_tokens": 1},
-    })
+    httpx_mock.add_response(
+        json={
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
     result = await make_adapter().test_connection()
     assert result.ok is True
     assert result.detail == "reachable"
@@ -111,8 +132,14 @@ def test_raw_blocks_echo_hook_when_caller_sets_them():
     This does not exercise end-to-end MiniMax fidelity — the API loop does not populate raw_blocks
     yet (see Message.raw_blocks). It only pins the echo behavior for the day it is wired up.
     """
-    blocks = [{"type": "text", "text": "t"}, {"type": "tool_use", "id": "u1", "name": "f", "input": {}}]
-    msg = Message(role=Role.ASSISTANT, raw_blocks=blocks,
-                  tool_calls=[ToolCall(id="u1", name="f", arguments={})])
+    blocks = [
+        {"type": "text", "text": "t"},
+        {"type": "tool_use", "id": "u1", "name": "f", "input": {}},
+    ]
+    msg = Message(
+        role=Role.ASSISTANT,
+        raw_blocks=blocks,
+        tool_calls=[ToolCall(id="u1", name="f", arguments={})],
+    )
     out = _to_anthropic_messages([msg])
     assert out[0]["content"] == blocks

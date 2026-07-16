@@ -17,8 +17,12 @@ from tests.tui_helpers import select_option_values
 def _app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
-    paths = Paths(data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-                  db_path=tmp_path / "data" / "openagent.db", project_root=project)
+    paths = Paths(
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
+    )
     return OpenAgentApp(paths)
 
 

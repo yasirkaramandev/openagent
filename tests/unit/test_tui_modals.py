@@ -14,8 +14,12 @@ from openagent.tui.screens.modals import ApprovalModal, ConfirmModal, QuestionMo
 def _tui(tmp_path: Path) -> OpenAgentTUI:
     project = tmp_path / "proj"
     project.mkdir()
-    paths = Paths(data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-                  db_path=tmp_path / "data" / "openagent.db", project_root=project)
+    paths = Paths(
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
+    )
     return OpenAgentTUI(OpenAgentApp(paths))
 
 
@@ -23,8 +27,14 @@ async def test_approval_modal_shows_context_and_approves(tmp_path: Path):
     app = _tui(tmp_path)
     async with app.run_test() as pilot:
         result: dict = {}
-        request = ApprovalRequest(run_id="r", action="run_command", detail="rm -rf build",
-                                  command="rm -rf build", reason="recursive delete", workspace="/ws")
+        request = ApprovalRequest(
+            run_id="r",
+            action="run_command",
+            detail="rm -rf build",
+            command="rm -rf build",
+            reason="recursive delete",
+            workspace="/ws",
+        )
         app.push_screen(ApprovalModal(request), lambda v: result.setdefault("v", v))
         await pilot.pause()
         modal = app.screen
@@ -44,8 +54,13 @@ async def test_approval_modal_denies_with_key(tmp_path: Path):
     app = _tui(tmp_path)
     async with app.run_test() as pilot:
         result: dict = {}
-        request = ApprovalRequest(run_id="r", action="run_command", detail="curl evil",
-                                  command="curl evil", reason="network")
+        request = ApprovalRequest(
+            run_id="r",
+            action="run_command",
+            detail="curl evil",
+            command="curl evil",
+            reason="network",
+        )
         app.push_screen(ApprovalModal(request), lambda v: result.setdefault("v", v))
         await pilot.pause()
         await pilot.press("n")
@@ -63,6 +78,7 @@ async def test_question_modal_returns_typed_answer(tmp_path: Path):
         assert isinstance(modal, QuestionModal)
         assert "which port?" in "".join(str(w.render()) for w in modal.query("Static"))
         from textual.widgets import Input
+
         modal.query_one("#answer", Input).value = "8080"
         await pilot.click("#ok")
         await pilot.pause()
@@ -84,8 +100,9 @@ async def test_confirm_modal_roundtrip(tmp_path: Path):
     app = _tui(tmp_path)
     async with app.run_test() as pilot:
         result: dict = {}
-        app.push_screen(ConfirmModal("Delete it?", confirm_label="Delete"),
-                        lambda v: result.setdefault("v", v))
+        app.push_screen(
+            ConfirmModal("Delete it?", confirm_label="Delete"), lambda v: result.setdefault("v", v)
+        )
         await pilot.pause()
         await pilot.click("#ok")
         await pilot.pause()

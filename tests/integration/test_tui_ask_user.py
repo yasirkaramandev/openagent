@@ -45,8 +45,9 @@ class AskingAdapter:
             )
             yield NormalizedModelEvent(type=ModelEventType.DONE)
         else:
-            yield NormalizedModelEvent(type=ModelEventType.TEXT_DELTA,
-                                       text="Understood — proceeding with your answer.")
+            yield NormalizedModelEvent(
+                type=ModelEventType.TEXT_DELTA, text="Understood — proceeding with your answer."
+            )
             yield NormalizedModelEvent(type=ModelEventType.DONE)
 
 
@@ -54,14 +55,20 @@ class AskingAdapter:
 def oa(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
-    app = OpenAgentApp(Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
-    ))
-    app.providers.add(name="testco", provider_type="custom", base_url="https://api.test/v1",
-                      api_key="sk-x")
-    app.agents.create(name="asker", runtime_type=RuntimeType.API_AGENT,
-                      provider="testco", model="test-model")
+    app = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "data",
+            config_dir=tmp_path / "config",
+            db_path=tmp_path / "data" / "openagent.db",
+            project_root=project,
+        )
+    )
+    app.providers.add(
+        name="testco", provider_type="custom", base_url="https://api.test/v1", api_key="sk-x"
+    )
+    app.agents.create(
+        name="asker", runtime_type=RuntimeType.API_AGENT, provider="testco", model="test-model"
+    )
     return app
 
 
@@ -122,6 +129,7 @@ def _terminal_events(oa, run_id: str) -> list[str]:
 
 # --------------------------------------------------------------------------- happy path
 
+
 async def test_ask_user_modal_answer_reaches_model_and_completes(oa, adapter):
     from textual.widgets import Input
 
@@ -155,6 +163,7 @@ async def test_ask_user_modal_answer_reaches_model_and_completes(oa, adapter):
 
 # --------------------------------------------------------------------------- Esc / skip
 
+
 async def test_ask_user_escape_falls_back_and_completes(oa, adapter):
     app = OpenAgentTUI(oa)
     async with app.run_test(size=(120, 40)) as pilot:
@@ -170,6 +179,7 @@ async def test_ask_user_escape_falls_back_and_completes(oa, adapter):
 
 
 # --------------------------------------------------------------------------- blank answer
+
 
 async def test_ask_user_blank_answer_falls_back_and_completes(oa, adapter):
     from textual.widgets import Input
@@ -188,6 +198,7 @@ async def test_ask_user_blank_answer_falls_back_and_completes(oa, adapter):
 
 
 # ------------------------------------------------------ Ctrl+C while the question is open (item 9)
+
 
 async def test_ctrl_c_in_the_question_modal_cancels_the_whole_run(oa, adapter):
     """Ctrl+C in a QuestionModal must cancel the **run**, not merely skip the question (item 9).

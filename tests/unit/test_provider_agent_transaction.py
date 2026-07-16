@@ -22,8 +22,10 @@ def _app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     return OpenAgentApp(paths)
 
@@ -36,8 +38,13 @@ def _md_missing_agent(oa: OpenAgentApp, agent: str) -> bool:
 def test_happy_path_creates_both(tmp_path: Path) -> None:
     oa = _app(tmp_path)
     agent = oa.agents.create_with_new_provider(
-        provider_name="ds", provider_type="custom", base_url="https://api.test/v1",
-        key_env="DS_KEY", credential_source="env", model="m", name="ds-coder",
+        provider_name="ds",
+        provider_type="custom",
+        base_url="https://api.test/v1",
+        key_env="DS_KEY",
+        credential_source="env",
+        model="m",
+        name="ds-coder",
     )
     assert agent.name == "ds-coder"
     assert oa.providers.get("ds") is not None
@@ -49,8 +56,13 @@ def test_duplicate_agent_name_leaves_no_provider(tmp_path: Path) -> None:
     oa.agents.create(name="dup", runtime_type=RuntimeType.CLI, cli="codex")
     with pytest.raises(AgentError):
         oa.agents.create_with_new_provider(
-            provider_name="ds", provider_type="custom", base_url="https://api.test/v1",
-            key_env="DS_KEY", credential_source="env", model="m", name="dup",
+            provider_name="ds",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            key_env="DS_KEY",
+            credential_source="env",
+            model="m",
+            name="dup",
         )
     assert oa.providers.get("ds") is None
 
@@ -59,8 +71,13 @@ def test_agent_validation_failure_leaves_no_provider(tmp_path: Path) -> None:
     oa = _app(tmp_path)
     with pytest.raises(AgentError):
         oa.agents.create_with_new_provider(
-            provider_name="ds", provider_type="custom", base_url="https://api.test/v1",
-            key_env="DS_KEY", credential_source="env", model="", name="ds-coder",
+            provider_name="ds",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            key_env="DS_KEY",
+            credential_source="env",
+            model="",
+            name="ds-coder",
         )
     assert oa.providers.get("ds") is None
 
@@ -76,8 +93,13 @@ def test_openagent_md_write_failure_rolls_back_provider_and_agent(
     monkeypatch.setattr("openagent.services.agent_service.write_openagent_md", boom)
     with pytest.raises(OSError):
         oa.agents.create_with_new_provider(
-            provider_name="ds", provider_type="custom", base_url="https://api.test/v1",
-            key_env="DS_KEY", credential_source="env", model="m", name="ds-coder",
+            provider_name="ds",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            key_env="DS_KEY",
+            credential_source="env",
+            model="m",
+            name="ds-coder",
         )
     # Provider row rolled back, agent row rolled back.
     assert oa.providers.get("ds") is None
@@ -95,8 +117,13 @@ def test_keychain_write_failure_persists_nothing(
     monkeypatch.setattr(oa.credentials, "set_secret", boom)
     with pytest.raises(CredentialError):
         oa.agents.create_with_new_provider(
-            provider_name="ds", provider_type="custom", base_url="https://api.test/v1",
-            api_key="sk-secret", credential_source="keychain", model="m", name="ds-coder",
+            provider_name="ds",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="sk-secret",
+            credential_source="keychain",
+            model="m",
+            name="ds-coder",
         )
     assert oa.providers.get("ds") is None
     assert oa.agents.get("ds-coder") is None
@@ -113,8 +140,13 @@ def test_provider_repository_failure_persists_no_agent(
     monkeypatch.setattr(oa.repos.providers, "upsert", boom)
     with pytest.raises(RuntimeError):
         oa.agents.create_with_new_provider(
-            provider_name="ds", provider_type="custom", base_url="https://api.test/v1",
-            key_env="DS_KEY", credential_source="env", model="m", name="ds-coder",
+            provider_name="ds",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            key_env="DS_KEY",
+            credential_source="env",
+            model="m",
+            name="ds-coder",
         )
     assert oa.providers.get("ds") is None
     assert oa.agents.get("ds-coder") is None
@@ -124,8 +156,9 @@ def test_provider_repository_failure_persists_no_agent(
 
 
 def _ref(name: str) -> CredentialRef:
-    return CredentialRef(type=CredentialType.KEYCHAIN, service="openagent",
-                         account=f"provider/{name}")
+    return CredentialRef(
+        type=CredentialType.KEYCHAIN, service="openagent", account=f"provider/{name}"
+    )
 
 
 def test_failed_provider_write_restores_the_previous_secret_exactly(
@@ -149,8 +182,12 @@ def test_failed_provider_write_restores_the_previous_secret_exactly(
     monkeypatch.setattr(oa.repos.providers, "upsert", boom)
 
     with pytest.raises(RuntimeError, match="db is down"):
-        oa.providers.add(name="acme", provider_type="custom", base_url="https://api.test/v1",
-                         api_key="new-secret")
+        oa.providers.add(
+            name="acme",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="new-secret",
+        )
 
     assert oa.credentials.resolve(ref) == "old-secret"
     assert oa.providers.get("acme") is None
@@ -163,12 +200,17 @@ def test_failed_provider_write_removes_a_secret_that_did_not_exist(
     ref = _ref("acme")
     assert oa.credentials.resolve(ref) is None
 
-    monkeypatch.setattr(oa.repos.providers, "upsert",
-                        lambda _p: (_ for _ in ()).throw(RuntimeError("db is down")))
+    monkeypatch.setattr(
+        oa.repos.providers, "upsert", lambda _p: (_ for _ in ()).throw(RuntimeError("db is down"))
+    )
 
     with pytest.raises(RuntimeError):
-        oa.providers.add(name="acme", provider_type="custom", base_url="https://api.test/v1",
-                         api_key="new-secret")
+        oa.providers.add(
+            name="acme",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="new-secret",
+        )
 
     assert oa.credentials.resolve(ref) is None  # nothing orphaned in the keychain
 
@@ -182,14 +224,115 @@ def test_agent_transaction_rollback_restores_the_previous_secret(
     ref = _ref("acme")
     oa.credentials.set_secret(ref, "old-secret")
 
-    monkeypatch.setattr(oa.repos.agents, "upsert",
-                        lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")))
+    monkeypatch.setattr(
+        oa.repos.agents,
+        "upsert",
+        lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")),
+    )
 
     with pytest.raises(RuntimeError):
         oa.agents.create_with_new_provider(
-            provider_name="acme", provider_type="custom", base_url="https://api.test/v1",
-            api_key="new-secret", model="m", name="acme-coder",
+            provider_name="acme",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="new-secret",
+            model="m",
+            name="acme-coder",
         )
 
-    assert oa.credentials.resolve(ref) == "old-secret"   # the user's old key is intact
-    assert oa.providers.get("acme") is None              # …and the half-made provider is gone
+    assert oa.credentials.resolve(ref) == "old-secret"  # the user's old key is intact
+    assert oa.providers.get("acme") is None  # …and the half-made provider is gone
+
+
+# --------------------------------------------------------------------------- transaction-local rollback (§6)
+
+
+def test_successful_add_retains_no_rollback_secret_cache(tmp_path: Path) -> None:
+    """A successful ``provider add`` must not leave the previous key in a service-level cache (§6).
+
+    The old design kept a ``SecretRollback`` (previous key in plaintext) in ``ProviderService`` until
+    a rollback that, on success, never came — so the value lived for the whole process. There is now
+    no such cache at all: rollback state lives only on the transaction stack.
+    """
+
+    oa = _app(tmp_path)
+    oa.providers.add(
+        name="acme", provider_type="custom", base_url="https://api.test/v1", api_key="new-secret"
+    )
+    assert not hasattr(oa.providers, "_rollbacks")
+    assert oa.providers.get("acme") is not None
+
+
+def test_successful_provider_agent_transaction_clears_previous_secret(tmp_path: Path) -> None:
+    oa = _app(tmp_path)
+    ref = _ref("acme")
+    oa.credentials.set_secret(ref, "old-secret")  # a prior key exists under this account
+
+    oa.agents.create_with_new_provider(
+        provider_name="acme",
+        provider_type="custom",
+        base_url="https://api.test/v1",
+        api_key="new-secret",
+        model="m",
+        name="acme-coder",
+    )
+    # Success: the new key is stored and the previous value is retained nowhere in the service.
+    assert oa.credentials.resolve(ref) == "new-secret"
+    assert not hasattr(oa.providers, "_rollbacks")
+
+
+def test_new_key_with_no_previous_value_is_deleted_on_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no key existed before, a rolled-back transaction removes the one it wrote (no orphan)."""
+
+    oa = _app(tmp_path)
+    ref = _ref("acme")
+    assert oa.credentials.resolve(ref) is None
+    monkeypatch.setattr(
+        oa.repos.agents,
+        "upsert",
+        lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")),
+    )
+    with pytest.raises(RuntimeError):
+        oa.agents.create_with_new_provider(
+            provider_name="acme",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="brand-new",
+            model="m",
+            name="acme-coder",
+        )
+    assert oa.credentials.resolve(ref) is None
+    assert oa.providers.get("acme") is None
+
+
+def test_stale_rollback_cannot_affect_a_later_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rolled-back later transaction must not touch an earlier, unrelated provider's key (§6)."""
+
+    oa = _app(tmp_path)
+    # 1) A successful earlier add with its own key.
+    oa.providers.add(
+        name="alpha", provider_type="custom", base_url="https://api.test/v1", api_key="alpha-key"
+    )
+    # 2) A later, unrelated provider whose agent creation fails and rolls the provider back.
+    monkeypatch.setattr(
+        oa.repos.agents,
+        "upsert",
+        lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")),
+    )
+    with pytest.raises(RuntimeError):
+        oa.agents.create_with_new_provider(
+            provider_name="beta",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="beta-key",
+            model="m",
+            name="beta-coder",
+        )
+    # alpha's key is untouched by beta's rollback; alpha still exists, beta does not.
+    assert oa.credentials.resolve(_ref("alpha")) == "alpha-key"
+    assert oa.providers.get("alpha") is not None
+    assert oa.providers.get("beta") is None

@@ -4,6 +4,76 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] — 2026-07-16
+
+Orphan/resume hardening and NVIDIA Build integration.
+
+### Added
+- **NVIDIA Build provider** (`nvidia-build`) — the hosted NIM API catalog at
+  `https://integrate.api.nvidia.com/v1` over OpenAI Chat Completions, with the key taken from a
+  hidden prompt or an `NVIDIA_API_KEY` env-var reference (never `argv`). Hosted NVIDIA Build is kept
+  distinct from self-hosted NIM, which continues to use the `custom` preset.
+- **NVIDIA catalog discovery** — `openagent provider models` gains `--search`, `--owner` and `--json`;
+  `owned_by` is preserved so a mixed catalog can be filtered by publisher, locally and offline.
+  A catalog entry is never presented as agent-compatible (`capabilities` is always `null`).
+- **NVIDIA model capability probing** — a new `openagent provider probe` really exercises a model
+  (text, streaming, tool calling) with bounded requests and a strict timeout, claims only what it
+  observed, and classifies failures honestly (unauthorized / not found / incompatible / async /
+  rate limited). Results are cached per connection+model+base-URL+credential identity with a 24h TTL;
+  rotating the key invalidates a prior "verified". `openagent add` refuses an unvalidated
+  mixed-catalog model unless `--allow-unverified-model` is passed, which is loudly reported.
+- **NVIDIA TUI and CLI setup** — an NVIDIA Build card, a provider-aware Connection step (fixed
+  official endpoint/protocol, keychain recommended, `NVIDIA_API_KEY` pre-filled, no "no key" option,
+  key instructions, and an "Open NVIDIA Build" button using `webbrowser.open`), plus a searchable,
+  publisher-filtered catalog browser with a mixed-catalog warning and a "Validate Model & Key" probe.
+- **NVIDIA API key redaction** — an `nvapi-` pattern alongside the exact `register_secret()`
+  mechanism, so keys never reach CLI/TUI output, `events.jsonl`, `result.json`, `timeline.md`,
+  `logs.txt`, `changes.diff`, or exception text.
+
+### Fixed
+- **Orphaned live-process cancellation** — `cancel()` used to reject every terminal status, so an
+  `orphaned` run whose process was *still alive* could not be stopped — even though orphan recovery
+  told the user to run `openagent cancel --id <run-id>`. It now handles orphans before the terminal
+  short-circuit, re-verifies PID + create-time identity, and terminates the process tree; a
+  gone/reused/unverifiable PID is never killed. `cancel()` returns an explicit outcome
+  (`signalled` / `terminated` / `already_terminal` / `not_found` / `identity_mismatch` /
+  `not_cancellable`) and the CLI reports it with the right exit code instead of always printing
+  "cancelled".
+- **Resume lifecycle hardening** — a follow-up turn now obeys the same contract as the first run:
+  the turn's terminal event is buffered and written **last** (exactly one, keeping the backend's
+  richer data), and adapter build, backend stream, diff, every artifact write and DB persistence all
+  live inside one exception boundary, so no failure can leave a run "running" or report success over
+  a failed artifact write.
+- **Concurrent follow-up locking** — a per-run lock rejects a second follow-up with "a turn is
+  already running for this run" instead of silently overwriting the first turn's adapter and
+  cancellation registry.
+- **Artifact recovery consistency** — failure recovery now rewrites the *whole* bundle
+  (`status.json`, `result.json`, `timeline.md`, `output.md`, `handoff.md`, `tests.json`,
+  `changes.diff`, `logs.txt`) and marks it `artifacts_partial` with the failing stage. A terminal-event
+  append failure can no longer leave a stale "completed" `timeline.md` behind.
+- **Windows persisted PATH verification** — `setup.bat` now checks the PowerShell exit code when
+  writing the user PATH (a failed write fails the install), re-reads the registry to prove the tool
+  directory was persisted, and verifies a *fresh* CMD **and** PowerShell can run `openagent` using the
+  persisted PATH — instead of a test that injected the tool directory by hand and passed even when the
+  registry update had failed entirely.
+- **Transaction-local credential rollback** — the service-level rollback cache that kept the previous
+  keychain secret in plaintext for the process lifetime is gone. Rollback state now lives only on the
+  transaction stack and is wiped on commit, so a *successful* provider add retains nothing.
+- **Raw reasoning is never stored** — `reasoning_content` (NVIDIA and others) is treated as raw
+  chain-of-thought and never reaches an event, artifact, or the UI; only the numeric reasoning-token
+  count is normalized. An HTTP 202 (async invocation) is now an explicit failure rather than being
+  read as an empty success.
+
+### Changed
+- **Repository-wide formatter baseline** — `ruff format` is applied across the repo, the ruff version
+  is pinned, and `ruff format --check .` is now an enforced CI gate.
+- **Honest provider testing** — `openagent provider test` reports "catalog reachable" and states that
+  the key and model inference are *not* yet validated; it never claims "authenticated" or "API key
+  valid". Reaching `/models` proves neither.
+- **Skill accuracy** — the AI skill no longer says "orphaned = the process is gone". It explains that
+  `orphaned` means OpenAgent lost ownership and that the process may be gone, reused, unverifiable, or
+  still alive, teaches identity-verified cancellation, and documents the NVIDIA Build flow.
+
 ## [0.1.1] — 2026-07-15
 
 Runtime hardening, one-command cross-platform install, and an AI skill.

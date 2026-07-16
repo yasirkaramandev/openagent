@@ -22,10 +22,12 @@ the source — and it lands in ``events.jsonl``, ``status.json``, ``result.json`
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +55,24 @@ EventHook = Callable[[NormalizedEvent], None]
 
 _ACTIVE = {RunStatus.QUEUED, RunStatus.STARTING, RunStatus.RUNNING, RunStatus.WAITING_APPROVAL}
 _TERMINAL = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.ORPHANED}
+
+
+class CancelOutcome(str, Enum):
+    """The concrete result of a cancel request, so a caller never reports a false success (§3.3).
+
+    ``openagent cancel`` used to print "cancelled" unconditionally — even when the run had already
+    finished or nothing could be stopped. The service now returns exactly what happened and the CLI
+    prints (and exits) accordingly.
+    """
+
+    SIGNALLED = "signalled"  # an in-process loop/adapter was told to stop; it finalizes itself
+    TERMINATED = "terminated"  # a live process tree was identity-verified and killed
+    ALREADY_TERMINAL = "already_terminal"  # the run had already reached a terminal state
+    NOT_FOUND = "not_found"  # no such run
+    #: The recorded PID no longer maps to *our* process (gone/reused/unverifiable) — refused to kill.
+    IDENTITY_MISMATCH = "identity_mismatch"
+    #: An orphaned run with no safely identifiable live process (e.g. orphaned_pid_gone/reused).
+    NOT_CANCELLABLE = "not_cancellable"
 
 
 class RunError(RuntimeError):
@@ -93,12 +113,21 @@ class RunService:
         self._cancelled: set[str] = set()
         #: The live cancellation flag for each in-flight run — the API loop's stop signal (item 9).
         self.cancellations = CancellationRegistry()
+        #: One lock per run so a resume/follow-up turn cannot start while another is running for the
+        #: same run (§4.1). A second concurrent follow-up is rejected outright rather than silently
+        #: overwriting ``_cli_adapters[run.id]`` and the cancellation controller of the first.
+        self._resume_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ CRUD
 
     def create(
-        self, *, agent_name: str, prompt: str, worktree: str = "auto",
-        permission_profile: str | None = None, confirm_in_place: bool = False,
+        self,
+        *,
+        agent_name: str,
+        prompt: str,
+        worktree: str = "auto",
+        permission_profile: str | None = None,
+        confirm_in_place: bool = False,
     ) -> Run:
         agent = self.repos.agents.get(agent_name)
         if not agent:
@@ -113,8 +142,11 @@ class RunService:
                 "isolation; pass explicit confirmation to proceed"
             )
         run = Run(
-            id=_new_run_id(), agent=agent_name, prompt=prompt,
-            workspace=str(self.paths.project_root), permission_profile=profile,
+            id=_new_run_id(),
+            agent=agent_name,
+            prompt=prompt,
+            workspace=str(self.paths.project_root),
+            permission_profile=profile,
             worktree_strategy=worktree,
         )
         self.repos.runs.upsert(run)
@@ -129,7 +161,9 @@ class RunService:
     # ------------------------------------------------------------------ execution
 
     async def execute(
-        self, run: Run, on_event: EventHook | None = None,
+        self,
+        run: Run,
+        on_event: EventHook | None = None,
         approval_callback: ApprovalCallback | None = None,
         ask_user_callback: AskUserResolver | None = None,
     ) -> Run:
@@ -179,19 +213,32 @@ class RunService:
                     on_event(saved)
 
             def phase(new: RunPhase, **data: Any) -> None:
-                sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
-                                     data={"phase": new.value, **data}))
+                sink(
+                    NormalizedEvent(
+                        run_id=run.id,
+                        type=EventType.RUN_PHASE,
+                        source="openagent",
+                        data={"phase": new.value, **data},
+                    )
+                )
                 self.repos.runs.upsert(run)
 
             # The one and only run.started for this run — OpenAgent's, never a backend's (item 4).
             run.status = RunStatus.STARTING
             self.repos.runs.upsert(run)
-            sink(NormalizedEvent(
-                run_id=run.id, type=EventType.RUN_STARTED, source="openagent",
-                data={"agent": run.agent, "workspace": run.workspace,
-                      "permission_profile": run.permission_profile,
-                      "worktree_strategy": run.worktree_strategy},
-            ))
+            sink(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.RUN_STARTED,
+                    source="openagent",
+                    data={
+                        "agent": run.agent,
+                        "workspace": run.workspace,
+                        "permission_profile": run.permission_profile,
+                        "worktree_strategy": run.worktree_strategy,
+                    },
+                )
+            )
 
             workspace = None
             wt = WorktreeManager(self.paths.project_root, self.paths.worktrees_dir)
@@ -199,13 +246,21 @@ class RunService:
                 # ---- preflight: prove the agent can run before creating anything (item 7) --------
                 phase(RunPhase.PREFLIGHT)
                 report = await self.preflight.check(
-                    agent_name=run.agent, permission_profile=run.permission_profile,
+                    agent_name=run.agent,
+                    permission_profile=run.permission_profile,
                 )
-                sink(NormalizedEvent(
-                    run_id=run.id, type=EventType.LOG, source="openagent",
-                    data={"kind": "preflight", "ok": report.ok,
-                          "checks": [c.line() for c in report.checks]},
-                ))
+                sink(
+                    NormalizedEvent(
+                        run_id=run.id,
+                        type=EventType.LOG,
+                        source="openagent",
+                        data={
+                            "kind": "preflight",
+                            "ok": report.ok,
+                            "checks": [c.line() for c in report.checks],
+                        },
+                    )
+                )
                 for warning in report.warnings:
                     art.warnings.append(f"preflight: {warning.line()}")
                 if not report.ok:
@@ -229,11 +284,19 @@ class RunService:
                 self.repos.runs.upsert(run)
                 if workspace.lower_safety:
                     art.warnings.append(_lower_safety_warning(workspace))
-                sink(NormalizedEvent(
-                    run_id=run.id, type=EventType.WORKSPACE_PREPARED, source="openagent",
-                    data={"workspace": str(workspace.root), "strategy": workspace.strategy,
-                          "branch": workspace.branch, "in_place": workspace.in_place},
-                ))
+                sink(
+                    NormalizedEvent(
+                        run_id=run.id,
+                        type=EventType.WORKSPACE_PREPARED,
+                        source="openagent",
+                        data={
+                            "workspace": str(workspace.root),
+                            "strategy": workspace.strategy,
+                            "branch": workspace.branch,
+                            "in_place": workspace.in_place,
+                        },
+                    )
+                )
                 cancel.check()
 
                 # ---- backend ----------------------------------------------------------------
@@ -244,9 +307,18 @@ class RunService:
 
                 rtype = agent.runtime.type
                 if rtype is RuntimeType.API_AGENT or rtype == RuntimeType.API_AGENT.value:
-                    await self._run_api(run, agent, workspace.root, sink, art, state,
-                                        approval_callback, workspace.describe_for_agent(),
-                                        ask_user_callback, cancel)
+                    await self._run_api(
+                        run,
+                        agent,
+                        workspace.root,
+                        sink,
+                        art,
+                        state,
+                        approval_callback,
+                        workspace.describe_for_agent(),
+                        ask_user_callback,
+                        cancel,
+                    )
                 else:
                     await self._run_cli(run, agent, workspace.root, sink, state, run_dir)
             except RunCancelled as exc:
@@ -254,10 +326,14 @@ class RunService:
                 self._cancelled.add(run.id)
                 run.failure_type = "user_cancelled"
                 if state.get("emitted_terminal") is not True:
-                    sink(NormalizedEvent(
-                        run_id=run.id, type=EventType.RUN_CANCELLED, source="openagent",
-                        data={"reason": exc.reason, "phase": run.phase},
-                    ))
+                    sink(
+                        NormalizedEvent(
+                            run_id=run.id,
+                            type=EventType.RUN_CANCELLED,
+                            source="openagent",
+                            data={"reason": exc.reason, "phase": run.phase},
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001 - every runtime error becomes a persisted failure
                 self._fail(run, sink, state, exc)
             finally:
@@ -267,8 +343,14 @@ class RunService:
             # The ``finalizing`` phase and the diff happen BEFORE the single terminal event, which is
             # written LAST — so events[-1] is always the terminal event and the projection never
             # settles on "status: completed / phase: finalizing".
-            sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
-                                 data={"phase": RunPhase.FINALIZING.value}))
+            sink(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.RUN_PHASE,
+                    source="openagent",
+                    data={"phase": RunPhase.FINALIZING.value},
+                )
+            )
             if workspace is not None:
                 try:
                     # Collect diff + changed files from the workspace (git worktrees and copies).
@@ -283,9 +365,12 @@ class RunService:
                         run.failure_type = "finalization_failed"
                         state["pending_terminal"] = None  # the buffered success no longer holds
                         if not art.error:
-                            art.error = {"error_type": "finalization_failed",
-                                         "message": str(exc) or exc.__class__.__name__,
-                                         "phase": RunPhase.FINALIZING.value, "source": "openagent"}
+                            art.error = {
+                                "error_type": "finalization_failed",
+                                "message": str(exc) or exc.__class__.__name__,
+                                "phase": RunPhase.FINALIZING.value,
+                                "source": "openagent",
+                            }
 
             final = self._resolve_final(run, state)
             run.status = final
@@ -304,8 +389,11 @@ class RunService:
                 terminal_event = pending
             else:
                 terminal_event = NormalizedEvent(
-                    run_id=run.id, type=_terminal_event_type(final), source="openagent",
-                    data={"status": final.value} if final is RunStatus.COMPLETED
+                    run_id=run.id,
+                    type=_terminal_event_type(final),
+                    source="openagent",
+                    data={"status": final.value}
+                    if final is RunStatus.COMPLETED
                     else {"status": final.value, "error_type": run.failure_type},
                 )
             # Reflect the terminal outcome in the projection, write the artifact bundle (each file
@@ -336,8 +424,7 @@ class RunService:
         A run never stays running, and an artifact-write failure never looks like success. The first
         real error wins (item 5): a run already resolved to failed/cancelled keeps that terminal
         type; one heading for *completed* (or unresolved) is flipped to FAILED, because its result
-        could not be finished. The writers are recreated fresh here in case the originals never
-        existed, and every recovery step is suppressed so recording the failure cannot itself raise.
+        could not be finished.
         """
 
         prior = state.get("terminal")
@@ -345,31 +432,103 @@ class RunService:
         if final is RunStatus.FAILED:
             run.failure_type = run.failure_type or "artifact_write_failed"
             if not art.error:
-                art.error = {"error_type": run.failure_type,
-                             "message": str(exc) or exc.__class__.__name__,
-                             "phase": run.phase, "source": "openagent"}
+                art.error = {
+                    "error_type": run.failure_type,
+                    "message": str(exc) or exc.__class__.__name__,
+                    "phase": run.phase,
+                    "source": "openagent",
+                }
         run.status = final
         run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
         run.completed_at = _now()
         # The DB is the source of truth for status — persist the terminal state above all else.
         with contextlib.suppress(Exception):
             self.repos.runs.upsert(run)
-        # Best-effort audit: exactly one terminal event (only if the normal path never wrote one),
-        # then a minimal, explicitly-partial artifact set.
-        if not state.get("terminal_written"):
+        self._recover_artifacts(
+            run,
+            run_dir,
+            exc,
+            stage="finalize",
+            wrote_terminal=state.get("terminal_written", False),
+            art=art,
+        )
+        return run
+
+    def _recover_artifacts(
+        self,
+        run: Run,
+        run_dir: Path,
+        exc: Exception,
+        *,
+        stage: str,
+        wrote_terminal: bool,
+        art: RunArtifacts | None = None,
+        prompt: str | None = None,
+    ) -> None:
+        """Make the WHOLE artifact bundle consistent with a failed/cancelled run (§5), best-effort.
+
+        The old recovery only rewrote ``status.json`` + ``result.json`` and left ``timeline.md`` (and
+        ``output.md``/``handoff.md``/``tests.json``/``changes.diff``/``logs.txt``) claiming the run
+        had *completed*. Now every artifact is regenerated from the reconciled run + a fresh
+        projection replay, so none can still say "completed", and the bundle is stamped
+        ``artifacts_partial`` with the failing ``stage`` so a reader knows it was recovered. Each step
+        is individually suppressed — recording the failure must never itself raise, and one failing
+        write must not abort the rest.
+        """
+
+        final = run.status
+        is_cancelled = enum_value(final) == RunStatus.CANCELLED.value
+        art_failure = {"stage": stage, "message": str(exc) or exc.__class__.__name__}
+
+        # Exactly one terminal event, and only if the normal path never wrote one (item 1).
+        if not wrote_terminal:
             with contextlib.suppress(Exception):
                 EventLog(run_dir, index=self.repos.event_index).append(
                     NormalizedEvent(
-                        run_id=run.id, type=_terminal_event_type(final), source="openagent",
-                        data={"status": final.value, "error_type": run.failure_type},
+                        run_id=run.id,
+                        type=_terminal_event_type(final),
+                        source="openagent",
+                        data={"status": enum_value(final), "error_type": run.failure_type},
                     )
                 )
-                state["terminal_written"] = True
+
+        # Rebuild cumulative artifacts + projection from whatever is on disk (best-effort). A live
+        # ``art`` from execute() is preferred (it already carries this run's diff/summary/error).
+        bundle = art
+        if bundle is None:
+            try:
+                bundle, _ = self._rebuild_artifacts(run)
+            except Exception:  # noqa: BLE001 - the log may itself be unreadable
+                bundle = RunArtifacts()
+        if not bundle.error and not is_cancelled:
+            bundle.error = {
+                "error_type": run.failure_type or "artifact_write_failed",
+                "message": art_failure["message"],
+                "phase": run.phase,
+                "source": "openagent",
+            }
+        try:
+            projection: RunProjection | None = self.projection(run.id)
+        except Exception:  # noqa: BLE001
+            projection = None
+
         with contextlib.suppress(Exception):
             writer = ArtifactWriter(run_dir)
-            writer.write_status(run)
-            writer.write_results(run, art, None)
-        return run
+            steps: list[Callable[[], Any]] = [
+                lambda: writer.write_status(
+                    run, artifacts_partial=True, artifact_failure=art_failure
+                ),
+                lambda: writer.write_results(
+                    run, bundle, projection, artifacts_partial=True, artifact_failure=art_failure
+                ),
+            ]
+            if projection is not None:
+                steps.append(lambda: writer.write_timeline(run, projection))
+            if prompt is not None:
+                steps.append(lambda: writer.write_turn(run, prompt, bundle, None))
+            for step in steps:
+                with contextlib.suppress(Exception):
+                    step()
 
     def _fail(self, run: Run, sink: EventHook, state: dict, exc: Exception) -> None:
         """Persist a runtime exception as a real ``run.failed`` event (item 13).
@@ -384,11 +543,19 @@ class RunService:
         message = str(exc) or exc.__class__.__name__
         state["terminal"] = RunStatus.FAILED
         run.failure_type = error_type
-        sink(NormalizedEvent(
-            run_id=run.id, type=EventType.RUN_FAILED, source="openagent",
-            data={"error_type": error_type, "message": message, "phase": run.phase,
-                  "source": "openagent"},
-        ))
+        sink(
+            NormalizedEvent(
+                run_id=run.id,
+                type=EventType.RUN_FAILED,
+                source="openagent",
+                data={
+                    "error_type": error_type,
+                    "message": message,
+                    "phase": run.phase,
+                    "source": "openagent",
+                },
+            )
+        )
 
     def _resolve_final(self, run: Run, state: dict) -> RunStatus:
         """Never silently default an unknown terminal state to completed (spec §43)."""
@@ -405,15 +572,26 @@ class RunService:
         """Persist the run the moment a PID or session id arrives (spec §45 orphan/cancel/resume)."""
 
         etype = event.type if isinstance(event.type, str) else event.type.value
-        if etype in (EventType.RUN_STARTED.value, EventType.PROCESS_STARTED.value,
-                     EventType.SESSION_CREATED.value):
+        if etype in (
+            EventType.RUN_STARTED.value,
+            EventType.PROCESS_STARTED.value,
+            EventType.SESSION_CREATED.value,
+        ):
             self.repos.runs.upsert(run)
 
-    async def _run_api(self, run, agent, root: Path, sink, art, state,
-                       approval_callback: ApprovalCallback | None = None,
-                       workspace_note: str = "",
-                       ask_user_callback: AskUserResolver | None = None,
-                       cancel: RunCancellation | None = None) -> None:
+    async def _run_api(
+        self,
+        run,
+        agent,
+        root: Path,
+        sink,
+        art,
+        state,
+        approval_callback: ApprovalCallback | None = None,
+        workspace_note: str = "",
+        ask_user_callback: AskUserResolver | None = None,
+        cancel: RunCancellation | None = None,
+    ) -> None:
         provider = self.repos.providers.get_by_name(agent.runtime.provider or "")
         if not provider:
             raise RunError(f"provider {agent.runtime.provider!r} not found")
@@ -428,12 +606,17 @@ class RunService:
             sink(NormalizedEvent(run_id=run.id, type=etype, source="api-agent", data=data))
 
         ctx = ToolContext(
-            workspace_root=root, profile=profile,
+            workspace_root=root,
+            profile=profile,
             approval_gate=ApprovalGate(
                 auto_approve=not profile.require_approval_for_destructive,
-                callback=approval_callback, emit=tool_emit, run_id=run.id,
+                callback=approval_callback,
+                emit=tool_emit,
+                run_id=run.id,
             ),
-            run_id=run.id, emit=tool_emit, ask_user_callback=ask_user_callback,
+            run_id=run.id,
+            emit=tool_emit,
+            ask_user_callback=ask_user_callback,
             # A blocking command (run_command/run_tests) polls this so a Cancel kills its process
             # tree mid-run instead of waiting for it to finish (item 9.2).
             cancellation=cancel,
@@ -441,8 +624,14 @@ class RunService:
         executor = ToolExecutor(ctx)
         try:
             outcome = await run_api_agent(
-                run_id=run.id, agent=agent, prompt=run.prompt, adapter=adapter,
-                executor=executor, workspace_root=root, emit=sink, workspace_note=workspace_note,
+                run_id=run.id,
+                agent=agent,
+                prompt=run.prompt,
+                adapter=adapter,
+                executor=executor,
+                workspace_root=root,
+                emit=sink,
+                workspace_note=workspace_note,
                 cancellation=cancel,
             )
         finally:
@@ -460,19 +649,29 @@ class RunService:
         else:
             state["terminal"] = RunStatus.FAILED
             run.failure_type = outcome.error_type or "unknown"
-            sink(NormalizedEvent(
-                run_id=run.id, type=EventType.RUN_FAILED, source="api-agent",
-                data={"error_type": run.failure_type,
-                      "message": outcome.error_message or "the API agent did not complete",
-                      "phase": run.phase, "source": "api-agent"},
-            ))
+            sink(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.RUN_FAILED,
+                    source="api-agent",
+                    data={
+                        "error_type": run.failure_type,
+                        "message": outcome.error_message or "the API agent did not complete",
+                        "phase": run.phase,
+                        "source": "api-agent",
+                    },
+                )
+            )
 
-    async def _run_cli(self, run, agent: AgentProfile, root: Path, sink, state,
-                       run_dir: Path) -> None:
+    async def _run_cli(
+        self, run, agent: AgentProfile, root: Path, sink, state, run_dir: Path
+    ) -> None:
         adapter = build_cli_adapter(agent.runtime.cli or "")
         self._cli_adapters[run.id] = adapter
         request = CliRunRequest(
-            run_id=run.id, prompt=run.prompt, workspace=root,
+            run_id=run.id,
+            prompt=run.prompt,
+            workspace=root,
             permission_profile=run.permission_profile,
             # Scratch files a CLI needs (Codex's --output-last-message) belong to OpenAgent, not to
             # the user's project — keep them out of the workspace and out of the diff (item 6).
@@ -488,6 +687,15 @@ class RunService:
     # ------------------------------------------------------------------ resume / cancel
 
     async def resume(self, run_id: str, prompt: str, on_event: EventHook | None = None) -> Run:
+        """Take a follow-up turn on a CLI run under the **same** lifecycle contract as the first run.
+
+        Item 9.4/§4: a resume turn is not a second-class path. Exactly one resume runs per run at a
+        time (§4.1); the turn's terminal event is buffered and written **last** (§4.2); every step —
+        adapter build, backend stream, diff, all artifact writes, DB persistence — lives inside one
+        exception boundary so a failure anywhere yields a terminal failed/cancelled turn, never a
+        run left ``running`` and never a success reported over a failed artifact write (§4.3/§4.4).
+        """
+
         run = self.get(run_id)
         if not run:
             raise RunError(f"run {run_id!r} not found")
@@ -497,99 +705,223 @@ class RunService:
         if not run.provider_session_id:
             raise RunError("no session id recorded for this run")
 
+        # §4.1 Per-run lock. A second follow-up while one is running is rejected outright — never a
+        # silent overwrite of the first turn's adapter/cancellation registry. asyncio is single
+        # threaded and there is no await between the check and acquire, so this cannot race.
+        lock = self._resume_locks.setdefault(run.id, asyncio.Lock())
+        if lock.locked():
+            raise RunError("a turn is already running for this run")
+        async with lock:
+            return await self._resume_locked(run, agent, prompt, on_event)
+
+    async def _resume_locked(
+        self, run: Run, agent: AgentProfile, prompt: str, on_event: EventHook | None
+    ) -> Run:
+        session_id = run.provider_session_id
+        assert session_id is not None  # guaranteed by resume()'s guard, before the lock
         run_dir = self.paths.run_dir(run.id)
-        event_log = EventLog(run_dir, index=self.repos.event_index)
-        turn_state: dict[str, Any] = {"terminal": None}
         # Per-turn artifacts (item 18): captured live so turn_NNN.md holds only THIS turn's summary,
         # usage, and tests — the cumulative view is rebuilt separately for result.json.
         turn_art = RunArtifacts()
-        event_start = sum(1 for _ in event_log.read()) + 1  # 1-based index of this turn's first event
-
-        # Mark the run active again while resuming; append (never truncate) the event log.
-        run.status = RunStatus.RUNNING
-        run.turns += 1
-        run.completed_at = None
-        self.repos.runs.upsert(run)
-
-        def sink(event: NormalizedEvent) -> None:
-            saved = event_log.append(event)
-            _capture(saved, run=run, art=turn_art, state=turn_state)
-            self._persist_progress(saved, run)
-            if on_event is not None:
-                on_event(saved)
-
-        adapter = build_cli_adapter(agent.runtime.cli or "")
-        self._cli_adapters[run.id] = adapter
+        turn_state: dict[str, Any] = {"terminal": None}
         cancel = self.cancellations.create(run.id)
         cancel.bind()
+        adapter = build_cli_adapter(agent.runtime.cli or "")
+        self._cli_adapters[run.id] = adapter
         workspace_root = Path(run.worktree or run.workspace)
         request = CliRunRequest(
-            run_id=run.id, prompt=prompt, workspace=workspace_root,
-            permission_profile=run.permission_profile, session_id=run.provider_session_id,
-            artifacts_dir=run_dir, model=agent.runtime.model or None,
+            run_id=run.id,
+            prompt=prompt,
+            workspace=workspace_root,
+            permission_profile=run.permission_profile,
+            session_id=session_id,
+            artifacts_dir=run_dir,
+            model=agent.runtime.model or None,
         )
-        # The turn boundary: the console groups everything after this under "Turn N" (item 20).
-        sink(NormalizedEvent(run_id=run.id, type=EventType.SESSION_RESUMED, source="openagent",
-                             data={"session_id": run.provider_session_id, "turn": run.turns,
-                                   "prompt": prompt}))
-        sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_PHASE, source="openagent",
-                             data={"phase": RunPhase.RUNNING.value, "turn": run.turns}))
         try:
-            async for event in adapter.resume_run(run.provider_session_id, prompt, request):
-                sink(event)
-        except Exception as exc:  # noqa: BLE001 - a failed resume is a persisted failure (item 13)
-            error_type = getattr(exc, "error_type", None) or _classify_exception(exc)
-            turn_state["terminal"] = RunStatus.FAILED
-            run.failure_type = error_type
-            sink(NormalizedEvent(run_id=run.id, type=EventType.RUN_FAILED, source="openagent",
-                                 data={"error_type": error_type, "message": str(exc),
-                                       "phase": run.phase, "source": "openagent"}))
+            event_log = EventLog(run_dir, index=self.repos.event_index)
+            event_start = (
+                sum(1 for _ in event_log.read()) + 1
+            )  # 1-based index of the turn's first event
+
+            # Mark the run active again for this turn; a new turn starts with a clean failure slate.
+            run.status = RunStatus.RUNNING
+            run.turns += 1
+            run.completed_at = None
+            run.failure_type = None
+            self.repos.runs.upsert(run)
+
+            def sink(event: NormalizedEvent) -> None:
+                # Buffer the turn's terminal event (§4.2): it must be the LAST log entry for the turn,
+                # written only after finalization, so a diff/artifact failure can still invalidate a
+                # buffered "completed" before it is ever recorded.
+                if _is_terminal_event(event):
+                    _capture(event, turn_art, run, turn_state)
+                    turn_state["pending_terminal"] = event
+                    return
+                saved = event_log.append(event)
+                _capture(saved, turn_art, run, turn_state)
+                self._persist_progress(saved, run)
+                if on_event is not None:
+                    on_event(saved)
+
+            # The turn boundary: the console groups everything after this under "Turn N" (item 20).
+            sink(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.SESSION_RESUMED,
+                    source="openagent",
+                    data={"session_id": session_id, "turn": run.turns, "prompt": prompt},
+                )
+            )
+            sink(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.RUN_PHASE,
+                    source="openagent",
+                    data={"phase": RunPhase.RUNNING.value, "turn": run.turns},
+                )
+            )
+            try:
+                async for event in adapter.resume_run(session_id, prompt, request):
+                    sink(event)
+            except RunCancelled:
+                turn_state["terminal"] = RunStatus.CANCELLED
+                self._cancelled.add(run.id)
+                run.failure_type = "user_cancelled"
+                turn_state["pending_terminal"] = None  # synthesize a clean run.cancelled below
+            except Exception as exc:  # noqa: BLE001 - a failed resume is a persisted failure (item 13)
+                self._fail(
+                    run, sink, turn_state, exc
+                )  # buffers a run.failed as the pending terminal
+
+            # ---- finalize (items 1 + 9.4): finalizing phase + diff BEFORE the single terminal event.
+            sink(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.RUN_PHASE,
+                    source="openagent",
+                    data={"phase": RunPhase.FINALIZING.value},
+                )
+            )
+            self._finalize_resume(
+                run, prompt, turn_state, turn_art, event_start, event_log, on_event
+            )
+            return run
+        except Exception as exc:  # noqa: BLE001 - the outer lifecycle boundary (§4.3)
+            return self._finalize_resume_failure(run, run_dir, prompt, turn_state, exc)
         finally:
             self._cli_adapters.pop(run.id, None)
             self.cancellations.discard(run.id)
 
-        event_end = sum(1 for _ in event_log.read())
-        self._finalize_resume(run, prompt, turn_state, turn_art, (event_start, event_end))
-        return run
-
     def _finalize_resume(
-        self, run: Run, prompt: str, turn_state: dict, turn_art: RunArtifacts,
-        event_range: tuple[int, int],
+        self,
+        run: Run,
+        prompt: str,
+        turn_state: dict,
+        turn_art: RunArtifacts,
+        event_start: int,
+        event_log: EventLog,
+        on_event: EventHook | None,
     ) -> None:
-        """Rebuild cumulative artifacts from the full event log after a resume turn (spec §32)."""
+        """Resolve the turn, write **all** artifacts, then append the single terminal event last.
 
-        # Cumulative artifacts: replay the whole event log so earlier turns' work is preserved even
-        # if this turn failed (a failed resume must never erase prior successful artifacts).
+        Cumulative ``result.json``/``timeline.md`` are rebuilt from the whole event log so a failed
+        turn never erases prior successful work; ``turn_NNN.md`` is scoped to this turn. Ordering
+        mirrors :meth:`execute` exactly: artifacts are written *before* the terminal event, so a
+        failed artifact write is caught (by the outer boundary) before the log ever says "done".
+        """
+
         art, _ = self._rebuild_artifacts(run)
         projection = self.projection(run.id)
 
+        # diff/changed_files are inside the boundary (§4.3): a finalization failure is its own
+        # terminal state and invalidates an otherwise-completing turn (item 1) without masking an
+        # earlier failure/cancellation (item 5).
         wt = WorktreeManager(self.paths.project_root, self.paths.worktrees_dir)
         ws = self._reconstruct_workspace(run)
-        art.diff = wt.diff(ws)
-        art.files_changed = wt.changed_files(ws)
-        run.files_changed = art.files_changed
+        try:
+            art.diff = wt.diff(ws)
+            art.files_changed = wt.changed_files(ws)
+            run.files_changed = art.files_changed
+        except Exception as exc:  # noqa: BLE001 - a finalization failure is its own terminal state
+            if turn_state.get("terminal") in (None, RunStatus.COMPLETED):
+                turn_state["terminal"] = RunStatus.FAILED
+                run.failure_type = "finalization_failed"
+                turn_state["pending_terminal"] = None
+                if not turn_art.error:
+                    turn_art.error = {
+                        "error_type": "finalization_failed",
+                        "message": str(exc) or exc.__class__.__name__,
+                        "phase": RunPhase.FINALIZING.value,
+                        "source": "openagent",
+                    }
 
-        if run.id in self._cancelled or turn_state.get("terminal") is RunStatus.CANCELLED:
-            final = RunStatus.CANCELLED
-        elif turn_state.get("terminal") is None:
-            final = RunStatus.FAILED
-            run.failure_type = run.failure_type or "no_terminal_event"
-        else:
-            final = turn_state["terminal"]
+        final = self._resolve_final(run, turn_state)
         run.status = final
         run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
         run.completed_at = _now()
         if final is RunStatus.COMPLETED:
             run.failure_type = None  # a successful new turn clears a prior turn's failure (item 18)
+            if not turn_art.summary:
+                turn_art.summary = projection.final_message or "Turn completed."
         self.repos.runs.upsert(run)
+
+        pending = turn_state.get("pending_terminal")
+        if pending is not None and _status_of_terminal(pending) is final:
+            terminal_event = pending  # keep the backend's richer terminal data (§4.2)
+        else:
+            terminal_event = NormalizedEvent(
+                run_id=run.id,
+                type=_terminal_event_type(final),
+                source="openagent",
+                data={"status": final.value}
+                if final is RunStatus.COMPLETED
+                else {"status": final.value, "error_type": run.failure_type},
+            )
+        projection.apply(terminal_event)
 
         run_dir = self.paths.run_dir(run.id)
         writer = ArtifactWriter(run_dir)
-        # turn_NNN.md is scoped to this turn only; result.json is cumulative for the whole run.
-        writer.write_turn(run, prompt, turn_art, event_range)
+        # The terminal event will occupy the next slot; the turn range is inclusive through it.
+        event_end = sum(1 for _ in event_log.read()) + 1
+        writer.write_turn(run, prompt, turn_art, (event_start, event_end))
         writer.write_status(run)
         writer.write_results(run, art, projection)
         writer.write_timeline(run, projection)
+        saved = event_log.append(terminal_event)  # LAST log entry for the turn (item 1)
+        turn_state["terminal_written"] = True
+        if on_event is not None:
+            with contextlib.suppress(Exception):
+                on_event(saved)
+
+    def _finalize_resume_failure(
+        self, run: Run, run_dir: Path, prompt: str, turn_state: dict, exc: Exception
+    ) -> Run:
+        """Force a terminal state after a resume setup/finalize error (§4.3), best-effort throughout.
+
+        Same guarantee as :meth:`_finalize_failure`: the turn never stays running, an artifact-write
+        failure never looks like success, the first real error wins, and the whole recovered bundle
+        is made consistent and marked partial (§5)."""
+
+        prior = turn_state.get("terminal")
+        final = prior if prior in (RunStatus.CANCELLED, RunStatus.FAILED) else RunStatus.FAILED
+        if final is RunStatus.FAILED:
+            run.failure_type = run.failure_type or "artifact_write_failed"
+        run.status = final
+        run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
+        run.completed_at = _now()
+        with contextlib.suppress(Exception):
+            self.repos.runs.upsert(run)
+        self._recover_artifacts(
+            run,
+            run_dir,
+            exc,
+            stage="resume_finalize",
+            wrote_terminal=turn_state.get("terminal_written", False),
+            prompt=prompt,
+        )
+        return run
 
     # ------------------------------------------------------------------ replay
 
@@ -637,7 +969,9 @@ class RunService:
         state: dict[str, Any] = {"terminal": None}
         event_log = EventLog(self.paths.run_dir(run.id))
         usage_total: dict[str, Any] = {
-            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
             "reasoning_tokens": 0,
         }
         cost_total: float | None = None
@@ -647,11 +981,17 @@ class RunService:
             etype = event.type if isinstance(event.type, str) else event.type.value
             if etype == EventType.USAGE_UPDATED.value:
                 saw_usage = True
-                for key in ("input_tokens", "cached_input_tokens", "output_tokens",
-                            "reasoning_tokens"):
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                ):
                     usage_total[key] += int(event.data.get(key) or 0)
                 cost = event.data.get("provider_cost")
-                if cost is not None:  # cumulative cost across turns (turn1 + turn2 = total, item 12)
+                if (
+                    cost is not None
+                ):  # cumulative cost across turns (turn1 + turn2 = total, item 12)
                     cost_total = (cost_total or 0.0) + float(cost)
         # Cumulative usage across every turn (item 18) — overrides _capture's last-turn-only value.
         if saw_usage:
@@ -672,17 +1012,27 @@ class RunService:
         source = Path(run.source_path) if run.source_path else self.paths.project_root
         baseline_dir = Path(run.baseline_dir) if run.baseline_dir else None
         return Workspace(
-            run_id=run.id, root=root, source=source,
-            is_git=is_git_repo(root), strategy=run.worktree_strategy,
-            branch=run.branch, base_commit=run.base_commit,
-            is_copy=run.is_copy, in_place=run.in_place, baseline_dir=baseline_dir,
+            run_id=run.id,
+            root=root,
+            source=source,
+            is_git=is_git_repo(root),
+            strategy=run.worktree_strategy,
+            branch=run.branch,
+            base_commit=run.base_commit,
+            is_copy=run.is_copy,
+            in_place=run.in_place,
+            baseline_dir=baseline_dir,
         )
 
-    async def cancel(self, run_id: str, reason: str = "cancelled by user") -> None:
-        """Really stop a run — API and CLI alike (item 9). Idempotent.
+    async def cancel(self, run_id: str, reason: str = "cancelled by user") -> CancelOutcome:
+        """Really stop a run — API and CLI alike (item 9). Idempotent, and honest about the result.
 
-        Three paths, in order:
+        Paths, in order:
 
+        * **Orphaned run** — terminal in the DB, but item 9.5 may have left its process *alive and
+          unowned*. Handle it BEFORE the generic terminal short-circuit so the exact ``openagent
+          cancel --id`` command recover_orphans() suggests can actually stop that process — after a
+          PID + create-time identity check (§3.2). A reused/gone/unverifiable PID is never killed.
         * **API run in this process** — flip the run's :class:`RunCancellation`. The agent loop sees
           it at its next checkpoint, abandons the provider stream, stops running tools, and returns
           ``cancelled``; the executor then writes the single ``run.cancelled``. (Safe to call from a
@@ -690,13 +1040,19 @@ class RunService:
         * **CLI run in this process** — kill the process tree; the running executor finalizes.
         * **After a restart** — no live controller, so terminate by PID (identity-verified) and
           finalize the artifacts here.
+
+        Returns a :class:`CancelOutcome` so the CLI never prints a false "cancelled" (§3.3).
         """
 
         run = self.get(run_id)
         if not run:
-            return
+            return CancelOutcome.NOT_FOUND
+
+        if run.status is RunStatus.ORPHANED or _status_value(run) == RunStatus.ORPHANED.value:
+            return self._cancel_orphan(run, reason)
+
         if run.status in _TERMINAL or _status_value(run) in {s.value for s in _TERMINAL}:
-            return  # idempotent: already finished
+            return CancelOutcome.ALREADY_TERMINAL  # idempotent: already finished
         self._cancelled.add(run_id)
 
         # An in-process run (API or CLI) has a live cancellation flag: raise it first, so an API
@@ -707,24 +1063,92 @@ class RunService:
         if adapter is not None:
             # Same process: kill the tree; the running executor will finalize (emit run.cancelled).
             await adapter.cancel(run_id)
-            return
+            return CancelOutcome.TERMINATED
         if signalled:
-            return  # the API loop owns finalization — do not race it by writing a status here
+            # the API loop owns finalization — do not race it by writing a status here
+            return CancelOutcome.SIGNALLED
 
         # Cross-process / after restart: terminate by PID with identity verification, then finalize.
-        terminate_pid_tree(run.pid, run.pid_started_at)
-        run_dir = self.paths.run_dir(run_id)
-        EventLog(run_dir, index=self.repos.event_index).append(
-            NormalizedEvent(run_id=run_id, type=EventType.RUN_CANCELLED, source="openagent",
-                            data={"reason": reason})
-        )
+        killed = terminate_pid_tree(run.pid, run.pid_started_at)
+        self._persist_cancelled(run, reason, "user_cancelled")
+        return CancelOutcome.TERMINATED if killed else CancelOutcome.IDENTITY_MISMATCH
+
+    def _cancel_orphan(self, run: Run, reason: str) -> CancelOutcome:
+        """Terminate the live process behind an ``orphaned_unattached_process`` run (§3.2).
+
+        Only this one orphan reason can have a still-running, identity-checkable process; every other
+        orphan reason (pid gone/reused/unknown) is, by definition, not safely killable. Even for the
+        right reason we re-verify PID + create-time identity *now* — the process may have exited or its
+        PID may have been reused since recovery — and never signal a kill we did not actually perform.
+        """
+
+        if run.failure_type != "orphaned_unattached_process":
+            return CancelOutcome.NOT_CANCELLABLE
+        status = run_process_status(run.pid, run.pid_started_at)
+        if status != PID_ALIVE:
+            # gone / reused / unverifiable — fail closed, touch nothing.
+            return CancelOutcome.IDENTITY_MISMATCH
+        killed = terminate_pid_tree(run.pid, run.pid_started_at)
+        if not killed:  # raced: exited or reused between the check above and the kill
+            return CancelOutcome.IDENTITY_MISMATCH
+        self._cancelled.add(run.id)
+        self._record_orphan_terminated(run)
+        self._persist_cancelled(run, reason, "orphaned_process_terminated_by_user")
+        return CancelOutcome.TERMINATED
+
+    def _persist_cancelled(self, run: Run, reason: str, failure_type: str) -> None:
+        """Append the single terminal ``run.cancelled`` (last), then persist status + artifact.
+
+        The audit/termination log (if any) is written before this, so ``run.cancelled`` stays the
+        final semantic event and the projection settles on ``cancelled`` (item 1).
+        """
+
+        run_dir = self.paths.run_dir(run.id)
+        if run_dir.exists():
+            with contextlib.suppress(OSError):
+                EventLog(run_dir, index=self.repos.event_index).append(
+                    NormalizedEvent(
+                        run_id=run.id,
+                        type=EventType.RUN_CANCELLED,
+                        source="openagent",
+                        data={"reason": reason},
+                    )
+                )
         run.status = RunStatus.CANCELLED
         run.phase = RunPhase.CANCELLED.value
         run.completed_at = _now()
-        run.failure_type = run.failure_type or "user_cancelled"
+        run.failure_type = failure_type
         self.repos.runs.upsert(run)
         if run_dir.exists():
-            ArtifactWriter(run_dir).write_status(run)
+            with contextlib.suppress(OSError):
+                ArtifactWriter(run_dir).write_status(run)
+
+    def _record_orphan_terminated(self, run: Run) -> None:
+        """Audit that the orphaned live process *was* terminated by the user (mirror of the note the
+        orphan recovery wrote saying it had been left running). Best-effort; ordered before
+        ``run.cancelled`` so that event stays last (§3.2)."""
+
+        run_dir = self.paths.run_dir(run.id)
+        if not run_dir.exists():
+            return
+        with contextlib.suppress(OSError):
+            EventLog(run_dir, index=self.repos.event_index).append(
+                NormalizedEvent(
+                    run_id=run.id,
+                    type=EventType.LOG,
+                    source="openagent",
+                    data={
+                        "kind": "orphan",
+                        "reason": "unattached_live_process",
+                        "pid": run.pid,
+                        "killed": True,
+                        "message": (
+                            f"pid {run.pid} passed a PID + create-time identity check and its "
+                            "process tree was terminated at the user's request."
+                        ),
+                    },
+                )
+            )
 
     # ------------------------------------------------------------------ maintenance
 
@@ -778,7 +1202,9 @@ class RunService:
         try:
             EventLog(run_dir, index=self.repos.event_index).append(
                 NormalizedEvent(
-                    run_id=run.id, type=EventType.LOG, source="openagent",
+                    run_id=run.id,
+                    type=EventType.LOG,
+                    source="openagent",
                     data={
                         "kind": "orphan",
                         "reason": "unattached_live_process",
@@ -799,9 +1225,14 @@ class RunService:
     def output(self, run_id: str, fmt: str = "md") -> str:
         run_dir = self.paths.run_dir(run_id)
         mapping = {
-            "md": "output.md", "json": "result.json", "diff": "changes.diff",
-            "logs": "logs.txt", "events": "events.jsonl", "handoff": "handoff.md",
-            "status": "status.json", "tests": "tests.json",
+            "md": "output.md",
+            "json": "result.json",
+            "diff": "changes.diff",
+            "logs": "logs.txt",
+            "events": "events.jsonl",
+            "handoff": "handoff.md",
+            "status": "status.json",
+            "tests": "tests.json",
         }
         name = mapping.get(fmt)
         if name is None:
@@ -831,9 +1262,13 @@ def _terminal_event_type(status: RunStatus) -> EventType:
     }.get(status, EventType.RUN_FAILED)
 
 
-_TERMINAL_EVENT_TYPES = frozenset({
-    EventType.RUN_COMPLETED.value, EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value,
-})
+_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.RUN_COMPLETED.value,
+        EventType.RUN_FAILED.value,
+        EventType.RUN_CANCELLED.value,
+    }
+)
 
 
 def _is_terminal_event(event: NormalizedEvent) -> bool:
@@ -899,11 +1334,16 @@ def _capture(event: NormalizedEvent, art: RunArtifacts | None, run: Run, state: 
     elif etype == EventType.TEST_COMPLETED.value:
         if art is not None:
             art.tests = TestSummary(
-                ran=True, passed=data.get("passed"), exit_code=data.get("exit_code"),
+                ran=True,
+                passed=data.get("passed"),
+                exit_code=data.get("exit_code"),
                 command=data.get("command", ""),
             )
-    elif etype in (EventType.FILE_CREATED.value, EventType.FILE_MODIFIED.value,
-                   EventType.FILE_DELETED.value):
+    elif etype in (
+        EventType.FILE_CREATED.value,
+        EventType.FILE_MODIFIED.value,
+        EventType.FILE_DELETED.value,
+    ):
         if art is not None:
             verb = etype.split(".")[1]
             art.changes.append(f"{verb} {data.get('path', '')}".strip())
@@ -915,8 +1355,10 @@ def _capture(event: NormalizedEvent, art: RunArtifacts | None, run: Run, state: 
                 art.log_lines.append(f"$ {data['command']} -> exit {data.get('exit_code')}")
     elif etype == EventType.USAGE_UPDATED.value:
         if art is not None:
-            art.usage = {k: data.get(k) for k in
-                         ("input_tokens", "cached_input_tokens", "output_tokens", "provider_cost")}
+            art.usage = {
+                k: data.get(k)
+                for k in ("input_tokens", "cached_input_tokens", "output_tokens", "provider_cost")
+            }
     elif etype == EventType.RUN_COMPLETED.value:
         state["terminal"] = RunStatus.COMPLETED
         state["emitted_terminal"] = True

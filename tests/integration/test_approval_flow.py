@@ -28,8 +28,22 @@ def _sse(*chunks: dict) -> bytes:
 
 
 def _tool_call_chunk(name: str, args: dict) -> dict:
-    return {"id": "c1", "choices": [{"delta": {"tool_calls": [
-        {"index": 0, "id": "t1", "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
+    return {
+        "id": "c1",
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "t1",
+                            "function": {"name": name, "arguments": json.dumps(args)},
+                        }
+                    ]
+                }
+            }
+        ],
+    }
 
 
 @pytest.fixture()
@@ -42,22 +56,35 @@ def app(tmp_path: Path) -> OpenAgentApp:
     (project / "target.txt").write_text("delete me\n")
     _git(["add", "-A"], project)
     _git(["commit", "-q", "-m", "init"], project)
-    paths = Paths(data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-                  db_path=tmp_path / "data" / "openagent.db", project_root=project)
+    paths = Paths(
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
+    )
     oa = OpenAgentApp(paths)
-    oa.providers.add(name="testco", provider_type="custom", base_url="https://api.test/v1",
-                     api_key="sk-x")
-    oa.agents.create(name="a", runtime_type=RuntimeType.API_AGENT, provider="testco",
-                     model="m", permission_profile="development")
+    oa.providers.add(
+        name="testco", provider_type="custom", base_url="https://api.test/v1", api_key="sk-x"
+    )
+    oa.agents.create(
+        name="a",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="testco",
+        model="m",
+        permission_profile="development",
+    )
     return oa
 
 
 def _script(httpx_mock: HTTPXMock) -> None:
-    httpx_mock.add_response(content=_sse(_tool_call_chunk("run_command", {"command": "rm -rf target.txt"})),
-                            headers={"content-type": "text/event-stream"})
-    httpx_mock.add_response(content=_sse(
-        {"id": "c2", "choices": [{"delta": {"content": "attempted the delete"}}]}),
-        headers={"content-type": "text/event-stream"})
+    httpx_mock.add_response(
+        content=_sse(_tool_call_chunk("run_command", {"command": "rm -rf target.txt"})),
+        headers={"content-type": "text/event-stream"},
+    )
+    httpx_mock.add_response(
+        content=_sse({"id": "c2", "choices": [{"delta": {"content": "attempted the delete"}}]}),
+        headers={"content-type": "text/event-stream"},
+    )
 
 
 async def test_denied_approval_blocks_command(app: OpenAgentApp, httpx_mock: HTTPXMock):

@@ -48,22 +48,34 @@ class DoctorService:
     async def run(self) -> list[Check]:
         checks: list[Check] = []
         checks.append(Check("OpenAgent configuration", OK, str(self.app.paths.config_dir)))
-        checks.append(Check(
-            "SQLite writable", OK if self.app.db.writable() else FAIL, str(self.app.paths.db_path)
-        ))
-        checks.append(Check(
-            "OS keychain available",
-            OK if keychain_available() else WARN,
-            "keychain backend present" if keychain_available() else "no usable keychain backend",
-        ))
+        checks.append(
+            Check(
+                "SQLite writable",
+                OK if self.app.db.writable() else FAIL,
+                str(self.app.paths.db_path),
+            )
+        )
+        checks.append(
+            Check(
+                "OS keychain available",
+                OK if keychain_available() else WARN,
+                "keychain backend present"
+                if keychain_available()
+                else "no usable keychain backend",
+            )
+        )
         git = shutil.which("git")
         checks.append(Check("Git installed", OK if git else FAIL, git or "git not found"))
         is_repo = is_git_repo(self.app.paths.project_root)
-        checks.append(Check(
-            "Current directory is a Git repository",
-            OK if is_repo else WARN,
-            "worktree isolation available" if is_repo else "non-git: runs use lower-safety copies",
-        ))
+        checks.append(
+            Check(
+                "Current directory is a Git repository",
+                OK if is_repo else WARN,
+                "worktree isolation available"
+                if is_repo
+                else "non-git: runs use lower-safety copies",
+            )
+        )
 
         checks.extend(await self._cli_checks())
         checks.extend(self._provider_checks())
@@ -85,15 +97,21 @@ class DoctorService:
             if not entry.installed:
                 checks.append(Check(f"{name} installed", WARN, "not found"))
                 continue
-            checks.append(Check(
-                f"{name} installed", OK,
-                entry.version or entry.executable or "detected",
-            ))
-            checks.append(Check(
-                f"{name} authentication",
-                OK if entry.authenticated else WARN,
-                entry.auth_detail or ("authenticated" if entry.authenticated else "not detected"),
-            ))
+            checks.append(
+                Check(
+                    f"{name} installed",
+                    OK,
+                    entry.version or entry.executable or "detected",
+                )
+            )
+            checks.append(
+                Check(
+                    f"{name} authentication",
+                    OK if entry.authenticated else WARN,
+                    entry.auth_detail
+                    or ("authenticated" if entry.authenticated else "not detected"),
+                )
+            )
             caps = (
                 f"structured output: {'yes' if entry.structured_events else 'no'}, "
                 f"resume: {'yes' if entry.resumable else 'no'}"
@@ -101,8 +119,13 @@ class DoctorService:
             )
             # An adapter validated against one version cannot claim "verified" on another (item 16).
             verified = entry.version_verified or not entry.validated_version
-            checks.append(Check(f"{name} adapter status", OK if verified else WARN,
-                                f"{entry.status_label}; {caps}"))
+            checks.append(
+                Check(
+                    f"{name} adapter status",
+                    OK if verified else WARN,
+                    f"{entry.status_label}; {caps}",
+                )
+            )
             if entry.type == "antigravity":
                 checks.append(self._antigravity_permission_check())
         return checks
@@ -115,14 +138,16 @@ class DoctorService:
         edit_ok, reason = antigravity_permission_status("safe-edit")
         if not edit_ok:
             return Check(
-                "antigravity permissions", OK,
+                "antigravity permissions",
+                OK,
                 "read-only (supported). Editing is experimental and OFF: a non-interactive "
                 "--print run can only edit with --dangerously-skip-permissions, which disables "
                 "Antigravity's own tool checks. Set OPENAGENT_ANTIGRAVITY_EXPERIMENTAL_EDIT=1 to "
                 "opt in.",
             )
         return Check(
-            "antigravity permissions", WARN,
+            "antigravity permissions",
+            WARN,
             f"editing ENABLED — Antigravity's native permission checks are bypassed ({reason})",
         )
 
@@ -130,7 +155,9 @@ class DoctorService:
         providers = self.app.repos.providers.list()
         if not providers:
             return [Check("Providers configured", WARN, "no API providers added yet")]
-        checks: list[Check] = [Check("Providers configured", OK, ", ".join(p.name for p in providers))]
+        checks: list[Check] = [
+            Check("Providers configured", OK, ", ".join(p.name for p in providers))
+        ]
         for p in providers:
             checks.append(self._provider_credential_check(p))
         return checks
@@ -174,8 +201,9 @@ class DoctorService:
             label = f"Agent: {agent.name}"
             if rtype == RuntimeType.API_AGENT.value:
                 if rt.provider not in provider_names:
-                    checks.append(Check(label, FAIL,
-                                        f"references missing provider {rt.provider!r}"))
+                    checks.append(
+                        Check(label, FAIL, f"references missing provider {rt.provider!r}")
+                    )
                 else:
                     checks.append(Check(label, OK, f"provider {rt.provider!r} present"))
             else:
@@ -192,12 +220,18 @@ class DoctorService:
         path = self.app.paths.openagent_md()
         agents = self.app.repos.agents.list()
         if not path.exists():
-            return Check("OPENAGENT.md synchronized", WARN if agents else OK,
-                         "not generated yet" if agents else "no agents to document")
+            return Check(
+                "OPENAGENT.md synchronized",
+                WARN if agents else OK,
+                "not generated yet" if agents else "no agents to document",
+            )
         expected = render_agents_block(agents).strip()
         synced = expected in path.read_text(encoding="utf-8")
-        return Check("OPENAGENT.md synchronized", OK if synced else WARN,
-                     "up to date" if synced else "stale; re-run `openagent add`/`remove`")
+        return Check(
+            "OPENAGENT.md synchronized",
+            OK if synced else WARN,
+            "up to date" if synced else "stale; re-run `openagent add`/`remove`",
+        )
 
 
 def overall_ok(checks: list[Check]) -> bool:

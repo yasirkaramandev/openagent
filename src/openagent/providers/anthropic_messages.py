@@ -60,7 +60,9 @@ class AnthropicMessagesAdapter:
 
     async def test_connection(self) -> HealthResult:
         request = NormalizedModelRequest(
-            model="probe", messages=[Message(role=Role.USER, content="ping")], max_tokens=1,
+            model="probe",
+            messages=[Message(role=Role.USER, content="ping")],
+            max_tokens=1,
             stream=False,
         )
         try:
@@ -77,8 +79,11 @@ class AnthropicMessagesAdapter:
         except TransportError:
             return []
         items = data.get("data", [])
-        return [RemoteModel(id=i["id"], display_name=i.get("display_name", i["id"]))
-                for i in items if i.get("id")]
+        return [
+            RemoteModel(id=i["id"], display_name=i.get("display_name", i["id"]))
+            for i in items
+            if i.get("id")
+        ]
 
     async def probe_model(self, model_id: str) -> ModelCapabilities:
         return await default_probe(self, model_id)
@@ -108,7 +113,9 @@ class AnthropicMessagesAdapter:
                     yield event
         except TransportError as exc:
             yield NormalizedModelEvent(
-                type=ModelEventType.ERROR, error_type=exc.error_type.value, error_message=exc.message
+                type=ModelEventType.ERROR,
+                error_type=exc.error_type.value,
+                error_message=exc.message,
             )
 
     async def _complete(self, payload: dict[str, Any]) -> AsyncIterator[NormalizedModelEvent]:
@@ -159,7 +166,9 @@ class AnthropicMessagesAdapter:
                     blocks.setdefault(idx, {"input_json": ""})
                     blocks[idx]["input_json"] += delta.get("partial_json", "")
             elif etype == "message_delta":
-                usage.output_tokens = (evt.get("usage") or {}).get("output_tokens", usage.output_tokens)
+                usage.output_tokens = (evt.get("usage") or {}).get(
+                    "output_tokens", usage.output_tokens
+                )
         for idx in sorted(blocks):
             block = blocks[idx]
             if block.get("type") == "tool_use":
@@ -208,7 +217,11 @@ def _to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": msg.tool_call_id, "content": msg.content}
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": msg.tool_call_id,
+                            "content": msg.content,
+                        }
                     ],
                 }
             )

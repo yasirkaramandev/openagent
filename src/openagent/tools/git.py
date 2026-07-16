@@ -13,8 +13,11 @@ from .base import ToolContext, ToolResult
 
 def _git(ctx: ToolContext, args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args], cwd=str(ctx.workspace_root),
-        capture_output=True, text=True, check=False,
+        ["git", *args],
+        cwd=str(ctx.workspace_root),
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 

@@ -34,30 +34,63 @@ def app(tmp_path: Path) -> OpenAgentApp:
     _git(["add", "-A"], project)
     _git(["commit", "-q", "-m", "init"], project)
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     return OpenAgentApp(paths)
 
 
-async def test_ask_user_answer_reaches_model_and_is_recorded(app: OpenAgentApp, httpx_mock: HTTPXMock):
-    app.providers.add(name="testco", provider_type="custom", base_url="https://api.test/v1",
-                      api_key="sk-x")
-    app.agents.create(name="asker", runtime_type=RuntimeType.API_AGENT,
-                      provider="testco", model="test-model", permission_profile="safe-edit")
+async def test_ask_user_answer_reaches_model_and_is_recorded(
+    app: OpenAgentApp, httpx_mock: HTTPXMock
+):
+    app.providers.add(
+        name="testco", provider_type="custom", base_url="https://api.test/v1", api_key="sk-x"
+    )
+    app.agents.create(
+        name="asker",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="testco",
+        model="test-model",
+        permission_profile="safe-edit",
+    )
 
     # Turn 1: the model calls ask_user. Turn 2: it produces a final answer, no tools.
-    httpx_mock.add_response(content=_sse(
-        {"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_q", "function": {
-                "name": "ask_user",
-                "arguments": json.dumps({"question": "which port should I use?"})}}]}}]},
-        {"id": "c1", "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
-    ), headers={"content-type": "text/event-stream"})
-    httpx_mock.add_response(content=_sse(
-        {"id": "c2", "choices": [{"delta": {"content": "Using port 8080 as instructed."}}]},
-        {"id": "c2", "usage": {"prompt_tokens": 12, "completion_tokens": 4}},
-    ), headers={"content-type": "text/event-stream"})
+    httpx_mock.add_response(
+        content=_sse(
+            {
+                "id": "c1",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_q",
+                                    "function": {
+                                        "name": "ask_user",
+                                        "arguments": json.dumps(
+                                            {"question": "which port should I use?"}
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+            },
+            {"id": "c1", "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+    httpx_mock.add_response(
+        content=_sse(
+            {"id": "c2", "choices": [{"delta": {"content": "Using port 8080 as instructed."}}]},
+            {"id": "c2", "usage": {"prompt_tokens": 12, "completion_tokens": 4}},
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
 
     asked: list[str] = []
 
@@ -82,21 +115,50 @@ async def test_ask_user_answer_reaches_model_and_is_recorded(app: OpenAgentApp, 
     assert "question.answered" in events
 
 
-async def test_ask_user_without_callback_uses_best_judgment(app: OpenAgentApp, httpx_mock: HTTPXMock):
-    app.providers.add(name="testco", provider_type="custom", base_url="https://api.test/v1",
-                      api_key="sk-x")
-    app.agents.create(name="asker", runtime_type=RuntimeType.API_AGENT,
-                      provider="testco", model="test-model", permission_profile="safe-edit")
+async def test_ask_user_without_callback_uses_best_judgment(
+    app: OpenAgentApp, httpx_mock: HTTPXMock
+):
+    app.providers.add(
+        name="testco", provider_type="custom", base_url="https://api.test/v1", api_key="sk-x"
+    )
+    app.agents.create(
+        name="asker",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="testco",
+        model="test-model",
+        permission_profile="safe-edit",
+    )
 
-    httpx_mock.add_response(content=_sse(
-        {"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_q", "function": {
-                "name": "ask_user",
-                "arguments": json.dumps({"question": "anything?"})}}]}}]},
-    ), headers={"content-type": "text/event-stream"})
-    httpx_mock.add_response(content=_sse(
-        {"id": "c2", "choices": [{"delta": {"content": "Proceeding with defaults."}}]},
-    ), headers={"content-type": "text/event-stream"})
+    httpx_mock.add_response(
+        content=_sse(
+            {
+                "id": "c1",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_q",
+                                    "function": {
+                                        "name": "ask_user",
+                                        "arguments": json.dumps({"question": "anything?"}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+            },
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+    httpx_mock.add_response(
+        content=_sse(
+            {"id": "c2", "choices": [{"delta": {"content": "Proceeding with defaults."}}]},
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
 
     run = app.runs.create(agent_name="asker", prompt="go", worktree="auto")
     # No ask_user_callback (non-interactive CLI mode): the run still completes via best-judgment.

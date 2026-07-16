@@ -32,31 +32,37 @@ class OpenAgentApp:
     @property
     def providers(self):
         from .services.provider_service import ProviderService
+
         return self._cached("providers", lambda: ProviderService(self))
 
     @property
     def models(self):
         from .services.model_service import ModelService
+
         return self._cached("models", lambda: ModelService(self))
 
     @property
     def agents(self):
         from .services.agent_service import AgentService
+
         return self._cached("agents", lambda: AgentService(self))
 
     @property
     def runs(self):
         from .services.run_service import RunService
+
         return self._cached("runs", lambda: RunService(self))
 
     @property
     def clis(self):
         from .services.discovery_service import DiscoveryService
+
         return self._cached("clis", lambda: DiscoveryService(self))
 
     @property
     def doctor(self):
         from .services.doctor_service import DoctorService
+
         return self._cached("doctor", lambda: DoctorService(self))
 
     def _cached(self, key: str, factory):

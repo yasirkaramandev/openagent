@@ -20,8 +20,12 @@ from openagent.config import Paths
 def app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
-    paths = Paths(data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-                  db_path=tmp_path / "data" / "openagent.db", project_root=project)
+    paths = Paths(
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
+    )
     return OpenAgentApp(paths)
 
 
@@ -81,7 +85,9 @@ def test_process_run_capture_roundtrip(tmp_path: Path):
     # A tiny, portable child process (no shell): print a marker.
     result = run_capture(
         [sys.executable, "-c", "print('smoke-ok')"],
-        cwd=tmp_path, env=minimal_environment(), timeout=30,
+        cwd=tmp_path,
+        env=minimal_environment(),
+        timeout=30,
     )
     assert result.returncode == 0
     assert "smoke-ok" in result.stdout
@@ -95,7 +101,9 @@ def test_run_capture_timeout_terminates(tmp_path: Path):
     with pytest.raises(subprocess.TimeoutExpired):
         run_capture(
             [sys.executable, "-c", "import time; time.sleep(30)"],
-            cwd=tmp_path, env=minimal_environment(), timeout=1,
+            cwd=tmp_path,
+            env=minimal_environment(),
+            timeout=1,
         )
 
 

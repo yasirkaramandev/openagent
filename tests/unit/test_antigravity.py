@@ -44,6 +44,7 @@ def _types(events) -> list[str]:
 
 # --------------------------------------------------------------------------- verified SUCCESS path
 
+
 def test_maps_real_success_fixture():
     events = map_antigravity_event(_real_result(), "run_1")
     types = _types(events)
@@ -63,8 +64,11 @@ def test_maps_real_success_fixture():
 
 
 def test_exactly_one_terminal_event_for_success():
-    terminals = [t for t in _types(map_antigravity_event(_real_result(), "r"))
-                 if t in ("run.completed", "run.failed", "run.cancelled")]
+    terminals = [
+        t
+        for t in _types(map_antigravity_event(_real_result(), "r"))
+        if t in ("run.completed", "run.failed", "run.cancelled")
+    ]
     assert terminals == ["run.completed"]
 
 
@@ -76,23 +80,38 @@ def test_thinking_tokens_normalized_to_reasoning_tokens():
     """
 
     obj = {
-        "conversation_id": "c", "status": "SUCCESS", "response": "done",
-        "usage": {"input_tokens": 10, "output_tokens": 5, "thinking_tokens": 42, "total_tokens": 57},
+        "conversation_id": "c",
+        "status": "SUCCESS",
+        "response": "done",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "thinking_tokens": 42,
+            "total_tokens": 57,
+        },
     }
     usage = next(e for e in map_antigravity_event(obj, "r") if _types([e]) == ["usage.updated"])
     assert usage.data["reasoning_tokens"] == 42
     assert usage.data["input_tokens"] == 10
     assert usage.data["output_tokens"] == 5
     # A missing thinking_tokens field normalizes to 0, never a KeyError.
-    no_think = {"status": "SUCCESS", "response": "x", "usage": {"input_tokens": 1, "output_tokens": 1}}
-    usage2 = next(e for e in map_antigravity_event(no_think, "r") if _types([e]) == ["usage.updated"])
+    no_think = {
+        "status": "SUCCESS",
+        "response": "x",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    usage2 = next(
+        e for e in map_antigravity_event(no_think, "r") if _types([e]) == ["usage.updated"]
+    )
     assert usage2.data["reasoning_tokens"] == 0
 
 
 def test_capabilities_do_not_advertise_editing_as_safe_and_verified():
     """Editing is experimental/opt-in, so capabilities must not present it as normal & safe (item 9)."""
 
-    default = asyncio.run(AntigravityAdapter(executable="agy", allow_experimental_edit=False).capabilities())
+    default = asyncio.run(
+        AntigravityAdapter(executable="agy", allow_experimental_edit=False).capabilities()
+    )
     assert default.experimental is True
     assert default.edits_files is False  # not enabled -> not advertised
     assert default.runs_commands is False
@@ -106,6 +125,7 @@ def test_capabilities_do_not_advertise_editing_as_safe_and_verified():
 
 
 # --------------------------------------------------------------------------- fail-closed statuses
+
 
 def test_cancelled_status_maps_to_cancelled():
     events = map_antigravity_event({"conversation_id": "c", "status": "CANCELLED"}, "r")
@@ -129,10 +149,13 @@ def test_missing_status_fails():
 
 # --------------------------------------------------------------------------- adapter args + registry
 
+
 def test_start_run_uses_print_json_flags(tmp_path: Path):
     adapter = AntigravityAdapter(executable="/usr/local/bin/agy", allow_experimental_edit=False)
     args = adapter._build_args(
-        CliRunRequest(run_id="r", prompt="do it", workspace=tmp_path, permission_profile="read-only"),
+        CliRunRequest(
+            run_id="r", prompt="do it", workspace=tmp_path, permission_profile="read-only"
+        ),
         "do it",
     )
     assert args[:5] == ["/usr/local/bin/agy", "--print", "do it", "--output-format", "json"]
@@ -144,8 +167,13 @@ def test_pinned_model_is_passed_to_agy(tmp_path: Path):
 
     adapter = AntigravityAdapter(executable="agy", allow_experimental_edit=False)
     args = adapter._build_args(
-        CliRunRequest(run_id="r", prompt="x", workspace=tmp_path, permission_profile="read-only",
-                      model="Gemini 3.5 Flash (Low)"),
+        CliRunRequest(
+            run_id="r",
+            prompt="x",
+            workspace=tmp_path,
+            permission_profile="read-only",
+            model="Gemini 3.5 Flash (Low)",
+        ),
         "x",
     )
     assert args[args.index("--model") + 1] == "Gemini 3.5 Flash (Low)"
@@ -169,8 +197,9 @@ def test_safe_edit_never_implies_native_permission_bypass(tmp_path: Path):
 
     with pytest.raises(AntigravityPermissionError):
         adapter._build_args(
-            CliRunRequest(run_id="r", prompt="x", workspace=tmp_path,
-                          permission_profile="safe-edit"),
+            CliRunRequest(
+                run_id="r", prompt="x", workspace=tmp_path, permission_profile="safe-edit"
+            ),
             "x",
         )
 
@@ -200,8 +229,9 @@ def test_experimental_opt_in_enables_editing(tmp_path: Path):
 def test_high_risk_profile_needs_its_own_opt_in(tmp_path: Path):
     """The experimental-edit opt-in is not enough for development/full-access — that needs its own."""
 
-    adapter = AntigravityAdapter(executable="agy", allow_experimental_edit=True,
-                                 allow_dangerous_bypass=False)
+    adapter = AntigravityAdapter(
+        executable="agy", allow_experimental_edit=True, allow_dangerous_bypass=False
+    )
     allowed, reason = adapter.permission_status("full-access")
     assert allowed is False
     assert "DANGEROUS_BYPASS" in reason
@@ -218,9 +248,11 @@ def test_permission_block_fails_the_run_rather_than_running_blind(tmp_path: Path
 
     async def _collect():
         return [
-            e async for e in adapter.start_run(
-                CliRunRequest(run_id="r", prompt="x", workspace=tmp_path,
-                              permission_profile="safe-edit")
+            e
+            async for e in adapter.start_run(
+                CliRunRequest(
+                    run_id="r", prompt="x", workspace=tmp_path, permission_profile="safe-edit"
+                )
             )
         ]
 
@@ -232,14 +264,18 @@ def test_permission_block_fails_the_run_rather_than_running_blind(tmp_path: Path
 def test_resume_passes_conversation_id(tmp_path: Path):
     adapter = AntigravityAdapter(executable="agy")
     args = adapter._build_args(
-        CliRunRequest(run_id="r", prompt="again", workspace=tmp_path, permission_profile="read-only"),
-        "again", conversation="conv-123",
+        CliRunRequest(
+            run_id="r", prompt="again", workspace=tmp_path, permission_profile="read-only"
+        ),
+        "again",
+        conversation="conv-123",
     )
     assert "--conversation" in args and "conv-123" in args
     assert args[args.index("--mode") + 1] == "plan"  # read-only -> plan mode, no edits
 
 
 # --------------------------------------------------------------------------- model discovery (Phase 4)
+
 
 def test_run_agy_models_parses_lines(monkeypatch):
     def _fake_run(args, **kw):
@@ -249,7 +285,8 @@ def test_run_agy_models_parses_lines(monkeypatch):
 
     monkeypatch.setattr(ag.subprocess, "run", _fake_run)
     assert ag._run_agy_models("/bin/agy") == [
-        "Gemini 3.5 Flash (Low)", "Claude Opus 4.6 (Thinking)"
+        "Gemini 3.5 Flash (Low)",
+        "Claude Opus 4.6 (Thinking)",
     ]
 
 
@@ -307,12 +344,11 @@ def test_not_installed_adapter_emits_single_failure(tmp_path: Path):
     events = []
 
     async def _collect():
-        async for e in adapter.start_run(
-            CliRunRequest(run_id="r", prompt="x", workspace=tmp_path)
-        ):
+        async for e in adapter.start_run(CliRunRequest(run_id="r", prompt="x", workspace=tmp_path)):
             events.append(e)
 
     import asyncio
+
     asyncio.run(_collect())
     assert _types(events) == ["run.failed"]
     assert events[0].data["error_type"] == "cli_not_found"
@@ -320,24 +356,25 @@ def test_not_installed_adapter_emits_single_failure(tmp_path: Path):
 
 # --------------------------------------------------------------- end-to-end through a fake agy binary
 
+
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX shebang fake executable")
 async def test_end_to_end_run_through_fake_agy(tmp_path: Path):
     """Drive the real adapter + run_managed_cli against a fake `agy` that prints the recorded result;
     exactly one terminal event (completed) must survive the finalizer."""
     fake = tmp_path / "agy"
     fake.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json\n"
-        f"print(json.dumps({_real_result()!r}))\n",
+        f"#!/usr/bin/env python3\nimport json\nprint(json.dumps({_real_result()!r}))\n",
         encoding="utf-8",
     )
     os.chmod(fake, 0o755)
 
     adapter = AntigravityAdapter(executable=str(fake))
     events = [
-        e async for e in adapter.start_run(
-            CliRunRequest(run_id="run_e2e", prompt="go", workspace=tmp_path,
-                          permission_profile="read-only")
+        e
+        async for e in adapter.start_run(
+            CliRunRequest(
+                run_id="run_e2e", prompt="go", workspace=tmp_path, permission_profile="read-only"
+            )
         )
     ]
     types = _types(events)

@@ -14,19 +14,28 @@ from openagent.core.events import EventType
 from openagent.runtimes.cli.base import CliRunRequest
 from tests.fakecli import FakeCliAdapter, write_fake_script
 
-TERMINALS = {EventType.RUN_COMPLETED.value, EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value}
+TERMINALS = {
+    EventType.RUN_COMPLETED.value,
+    EventType.RUN_FAILED.value,
+    EventType.RUN_CANCELLED.value,
+}
 
 
 async def _run(adapter: FakeCliAdapter, workspace: Path) -> list:
     events = []
-    async for event in adapter.start_run(CliRunRequest(run_id="run_t", prompt="go", workspace=workspace)):
+    async for event in adapter.start_run(
+        CliRunRequest(run_id="run_t", prompt="go", workspace=workspace)
+    ):
         events.append(event)
     return events
 
 
 def _terminals(events) -> list[str]:
-    return [e.type if isinstance(e.type, str) else e.type.value for e in events
-            if (e.type if isinstance(e.type, str) else e.type.value) in TERMINALS]
+    return [
+        e.type if isinstance(e.type, str) else e.type.value
+        for e in events
+        if (e.type if isinstance(e.type, str) else e.type.value) in TERMINALS
+    ]
 
 
 @pytest.fixture()
@@ -63,8 +72,11 @@ async def test_success_event_but_nonzero_exit_is_failed(script: Path, tmp_path: 
     # The stream claims success, but the process exits 1 — the exit code must win.
     events = await _run(FakeCliAdapter(script, mode="success_exit1"), tmp_path)
     assert _terminals(events) == [EventType.RUN_FAILED.value]
-    failed = next(e for e in events if (e.type if isinstance(e.type, str) else e.type.value)
-                  == EventType.RUN_FAILED.value)
+    failed = next(
+        e
+        for e in events
+        if (e.type if isinstance(e.type, str) else e.type.value) == EventType.RUN_FAILED.value
+    )
     assert failed.data.get("error_type") == "exit_code_mismatch"
 
 
@@ -72,8 +84,11 @@ async def test_completed_then_failed_is_conflict_failure(script: Path, tmp_path:
     # completed -> failed, exit 0: fail-closed — the later failure must win, not the earlier success.
     events = await _run(FakeCliAdapter(script, mode="double_terminal"), tmp_path)
     assert _terminals(events) == [EventType.RUN_FAILED.value]
-    failed = next(e for e in events if (e.type if isinstance(e.type, str) else e.type.value)
-                  == EventType.RUN_FAILED.value)
+    failed = next(
+        e
+        for e in events
+        if (e.type if isinstance(e.type, str) else e.type.value) == EventType.RUN_FAILED.value
+    )
     assert failed.data.get("error_type") == "terminal_conflict"
 
 
@@ -89,7 +104,16 @@ async def test_two_completions_collapse_to_one(script: Path, tmp_path: Path):
 
 
 async def test_exactly_one_terminal_event(script: Path, tmp_path: Path):
-    for mode in ("complete", "silent0", "fail1", "malformed", "usage_limit",
-                 "success_exit1", "double_terminal", "fail_then_complete", "double_complete"):
+    for mode in (
+        "complete",
+        "silent0",
+        "fail1",
+        "malformed",
+        "usage_limit",
+        "success_exit1",
+        "double_terminal",
+        "fail_then_complete",
+        "double_complete",
+    ):
         events = await _run(FakeCliAdapter(script, mode=mode), tmp_path)
         assert len(_terminals(events)) == 1, f"{mode} produced {_terminals(events)}"

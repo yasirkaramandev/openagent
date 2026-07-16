@@ -39,8 +39,11 @@ class ClaudeAdapter:
         if not self.executable:
             return None
         return CliInstallation(
-            id="cli_claude", type="claude", executable=self.executable,
-            version=detect_version(self.executable), adapter="claude-stream-json",
+            id="cli_claude",
+            type="claude",
+            executable=self.executable,
+            version=detect_version(self.executable),
+            adapter="claude-stream-json",
             authenticated=None,
         )
 
@@ -49,11 +52,16 @@ class ClaudeAdapter:
         legacy = Path.home() / ".claude.json"
         if cfg.exists() or legacy.exists():
             return AuthStatus(authenticated=True, detail="~/.claude credentials present")
-        return AuthStatus(authenticated=False, detail="run `claude` to sign in, or set ANTHROPIC_API_KEY")
+        return AuthStatus(
+            authenticated=False, detail="run `claude` to sign in, or set ANTHROPIC_API_KEY"
+        )
 
     async def capabilities(self) -> CliCapabilities:
         return CliCapabilities(
-            structured_events=True, resumable=True, edits_files=True, runs_commands=True,
+            structured_events=True,
+            resumable=True,
+            edits_files=True,
+            runs_commands=True,
         )
 
     # ------------------------------------------------------------------ running
@@ -70,8 +78,13 @@ class ClaudeAdapter:
     def _build_args(self, request: CliRunRequest, prompt: str | None = None) -> list[str]:
         profile = get_profile(request.permission_profile)
         args = [
-            self.executable or "claude", "-p", prompt if prompt is not None else request.prompt,
-            "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+            self.executable or "claude",
+            "-p",
+            prompt if prompt is not None else request.prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
         ]
         if request.model:
             args += ["--model", request.model]
@@ -88,7 +101,9 @@ class ClaudeAdapter:
     ) -> AsyncIterator[NormalizedEvent]:
         if not self.executable:
             yield NormalizedEvent(
-                run_id=request.run_id, type=EventType.RUN_FAILED, source=SOURCE,
+                run_id=request.run_id,
+                type=EventType.RUN_FAILED,
+                source=SOURCE,
                 data={"error_type": "cli_not_found", "message": "claude is not installed"},
             )
             return
@@ -153,8 +168,13 @@ def _map_assistant(message: dict[str, Any], ev) -> list[NormalizedEvent]:
         if btype == "text" and block.get("text"):
             events.append(ev(EventType.MESSAGE_COMPLETED, text=block["text"]))
         elif btype == "tool_use":
-            events.append(ev(EventType.TOOL_REQUESTED, tool=block.get("name", ""),
-                             tool_use_id=block.get("id")))
+            events.append(
+                ev(
+                    EventType.TOOL_REQUESTED,
+                    tool=block.get("name", ""),
+                    tool_use_id=block.get("id"),
+                )
+            )
     return events
 
 
@@ -169,11 +189,15 @@ def _map_stream_event(event: dict[str, Any], ev) -> list[NormalizedEvent]:
 def _map_result(obj: dict[str, Any], ev) -> list[NormalizedEvent]:
     usage = obj.get("usage") or {}
     # Normalize Claude's native ``total_cost_usd`` onto the single ``provider_cost`` field (item 12).
-    events = [ev(EventType.USAGE_UPDATED,
-                 input_tokens=usage.get("input_tokens", 0),
-                 cached_input_tokens=usage.get("cache_read_input_tokens", 0),
-                 output_tokens=usage.get("output_tokens", 0),
-                 provider_cost=obj.get("total_cost_usd"))]
+    events = [
+        ev(
+            EventType.USAGE_UPDATED,
+            input_tokens=usage.get("input_tokens", 0),
+            cached_input_tokens=usage.get("cache_read_input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            provider_cost=obj.get("total_cost_usd"),
+        )
+    ]
     events.append(_result_terminal(obj, ev))
     return events
 
@@ -200,24 +224,36 @@ def _result_terminal(obj: dict[str, Any], ev) -> NormalizedEvent:
     # Any explicit error signal wins — including a conflict (error subtype while is_error is False,
     # or is_error True while subtype claims success).
     if is_error is True or (isinstance(subtype, str) and subtype.startswith("error")):
-        return ev(EventType.RUN_FAILED, error_type="claude_error",
-                  message=(result if isinstance(result, str) and result else None)
-                  or f"claude reported {subtype or 'error'}")
+        return ev(
+            EventType.RUN_FAILED,
+            error_type="claude_error",
+            message=(result if isinstance(result, str) and result else None)
+            or f"claude reported {subtype or 'error'}",
+        )
 
     if subtype == "success":
         if result_ok:
             return ev(EventType.RUN_COMPLETED, result=result)
-        return ev(EventType.RUN_FAILED, error_type="malformed_result",
-                  message="claude reported success but no valid result string")
+        return ev(
+            EventType.RUN_FAILED,
+            error_type="malformed_result",
+            message="claude reported success but no valid result string",
+        )
     if is_error is False and subtype is None:
         if result_ok:
             return ev(EventType.RUN_COMPLETED, result=result)
-        return ev(EventType.RUN_FAILED, error_type="malformed_result",
-                  message="claude is_error=false but no valid result string")
+        return ev(
+            EventType.RUN_FAILED,
+            error_type="malformed_result",
+            message="claude is_error=false but no valid result string",
+        )
 
     # Neither an explicit success nor an explicit error: ambiguous/unknown -> fail closed.
-    return ev(EventType.RUN_FAILED, error_type="ambiguous_result",
-              message="claude result was ambiguous (no explicit success/is_error)")
+    return ev(
+        EventType.RUN_FAILED,
+        error_type="ambiguous_result",
+        message="claude result was ambiguous (no explicit success/is_error)",
+    )
 
 
 def _content_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:

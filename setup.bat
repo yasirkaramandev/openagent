@@ -99,9 +99,22 @@ rem uv's own mechanism for future shells...
 "!UV!" tool update-shell >nul 2>&1
 rem ...plus an idempotent, case-insensitive user-PATH update via the .NET API. NOT setx: setx
 rem truncates long PATH values and can corrupt them. This never needs administrator rights and
-rem never touches the system PATH.
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$d='%TOOL_BIN%'; $p=[Environment]::GetEnvironmentVariable('Path','User'); if($null -eq $p){$p=''}; $parts=@($p -split ';' ^| Where-Object {$_ -ne ''}); if(-not ($parts -contains $d)){ $np=(@($d)+$parts) -join ';'; [Environment]::SetEnvironmentVariable('Path',$np,'User'); Write-Host '[openagent-setup]       added to user PATH' } else { Write-Host '[openagent-setup]       already on user PATH' }"
+rem never touches the system PATH. The PowerShell script wraps the write in try/catch and exits
+rem non-zero on failure, and the exit code is REQUIRED to be checked (§7.1): a PATH write that fails
+rem must fail the install, not be silently ignored.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $d='%TOOL_BIN%'; $p=[Environment]::GetEnvironmentVariable('Path','User'); if($null -eq $p){$p=''}; $parts=@($p -split ';' | Where-Object {$_ -ne ''}); $has=$parts | Where-Object { [string]::Equals($_.TrimEnd('\'), $d.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) }; if(-not $has){ $np=(@($d)+$parts) -join ';'; [Environment]::SetEnvironmentVariable('Path',$np,'User'); Write-Host '[openagent-setup]       added to user PATH' } else { Write-Host '[openagent-setup]       already on user PATH' } } catch { Write-Error $_; exit 1 }"
+if errorlevel 1 (
+    call :die "path" "failed to write the user PATH via PowerShell" "Check PowerShell execution policy / registry access, then re-run setup.bat."
+    goto :eof
+)
+
+rem Independently re-read the persisted User PATH from the registry and PROVE the tool dir is there
+rem (§7.2). Without this, a failed/partial registry write would go unnoticed until a fresh shell.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$toolBin='%TOOL_BIN%'; $userPath=[Environment]::GetEnvironmentVariable('Path','User'); $parts=@($userPath -split ';' | Where-Object { $_ }); if(-not ($parts | Where-Object { [string]::Equals($_.TrimEnd('\'), $toolBin.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) })){ Write-Error 'OpenAgent tool directory was not persisted to the user PATH'; exit 1 }; Write-Host '[openagent-setup]       verified on persisted user PATH'"
+if errorlevel 1 (
+    call :die "path" "the tool directory was not persisted to the user PATH" "Re-run setup.bat; if it persists, add %TOOL_BIN% to your user PATH manually."
+    goto :eof
+)
 
 rem Make it work in THIS session too.
 set "PATH=%TOOL_BIN%;%PATH%"
@@ -119,10 +132,13 @@ if errorlevel 1 (
 ) else (
     echo [openagent-setup]       doctor: ok
 )
-rem Prove a *fresh* shell that inherits the new PATH finds openagent by name (§3.6).
-cmd /d /c "set PATH=%TOOL_BIN%;%PATH%&& openagent version"
+rem Prove a *fresh* shell finds openagent by name using the PERSISTED PATH (§7.3). This must NOT
+rem inject %TOOL_BIN% manually — that would pass even if the registry write had failed. Instead we
+rem reconstruct the environment a brand-new login shell gets (System PATH + User PATH, read straight
+rem from the registry) and run `openagent version` in a fresh CMD *and* a fresh PowerShell with it.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$m=[Environment]::GetEnvironmentVariable('Path','Machine'); $u=[Environment]::GetEnvironmentVariable('Path','User'); $env:Path=(@($m,$u) | Where-Object { $_ }) -join ';'; cmd /d /c 'openagent version'; if($LASTEXITCODE -ne 0){ Write-Error 'fresh CMD could not run openagent by name from the persisted PATH'; exit 1 }; & openagent version; if($LASTEXITCODE -ne 0){ Write-Error 'fresh PowerShell could not run openagent by name from the persisted PATH'; exit 1 }"
 if errorlevel 1 (
-    call :die "verify" "openagent is not runnable by name from a fresh shell" "Open a new terminal; if it persists, re-run setup.bat."
+    call :die "verify" "openagent is not runnable by name from a fresh shell using the persisted PATH" "Open a new terminal; if it persists, re-run setup.bat."
     goto :eof
 )
 

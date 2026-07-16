@@ -58,9 +58,7 @@ class CredentialStore:
         elif ref.type is CredentialType.SESSION:
             self._session[self._session_key(ref)] = secret
         else:
-            raise CredentialError(
-                f"cannot store secrets for credential type {ref.type.value!r}"
-            )
+            raise CredentialError(f"cannot store secrets for credential type {ref.type.value!r}")
 
     def delete_secret(self, ref: CredentialRef) -> None:
         if ref.type is CredentialType.KEYCHAIN and keyring is not None:
@@ -115,8 +113,11 @@ class CredentialStore:
         argv = list(ref.command)
         try:
             result = run_capture(
-                argv, cwd=Path.home(), env=minimal_environment(),
-                timeout=CRED_CMD_TIMEOUT_SECONDS, shell=False,
+                argv,
+                cwd=Path.home(),
+                env=minimal_environment(),
+                timeout=CRED_CMD_TIMEOUT_SECONDS,
+                shell=False,
                 max_output_bytes=CRED_CMD_MAX_OUTPUT_BYTES,
             )
         except OutputLimitExceeded as exc:
@@ -132,9 +133,7 @@ class CredentialStore:
             raise CredentialError(f"credential command could not run ({exc.strerror})") from exc
         if result.returncode != 0:
             # Deliberately omit stdout/stderr: a failing command may still have printed the secret.
-            raise CredentialError(
-                f"credential command failed with exit {result.returncode}"
-            )
+            raise CredentialError(f"credential command failed with exit {result.returncode}")
         secret = (result.stdout or "").strip()
         if not secret:
             raise CredentialError("credential command produced no output")

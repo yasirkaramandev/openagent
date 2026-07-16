@@ -11,7 +11,9 @@ from openagent.core.events import (
 
 def test_event_serializes_to_json_line():
     evt = NormalizedEvent(
-        run_id="run_1", type=EventType.COMMAND_STARTED, source="codex-cli",
+        run_id="run_1",
+        type=EventType.COMMAND_STARTED,
+        source="codex-cli",
         data={"command": "pytest", "cwd": "/workspace"},
     )
     line = evt.to_json_line()

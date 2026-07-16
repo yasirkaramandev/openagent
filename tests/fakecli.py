@@ -30,7 +30,7 @@ SOURCE = "fake-cli"
 # A fake `codex`-like binary. argv[1] selects behavior; it writes the files it claims to change so
 # a real worktree diff picks them up.
 FAKE_SCRIPT = textwrap.dedent(
-    '''
+    """
     import json, sys, time
 
     def emit(obj):
@@ -125,7 +125,7 @@ FAKE_SCRIPT = textwrap.dedent(
         emit({"type": "turn.started"})
         time.sleep(120)
         sys.exit(0)
-    '''
+    """
 )
 
 
@@ -148,17 +148,25 @@ def install_fake_cli(monkeypatch, adapter: FakeCliAdapter) -> FakeCliAdapter:
     fixture in ``conftest``.
     """
 
-    register_cli_adapter("fake", lambda executable=None: adapter, display_name="Fake CLI",
-                         status_label="Test fake (offline)")
-    monkeypatch.setattr("openagent.services.run_service.build_cli_adapter",
-                        lambda cli_type, executable=None: adapter)
+    register_cli_adapter(
+        "fake",
+        lambda executable=None: adapter,
+        display_name="Fake CLI",
+        status_label="Test fake (offline)",
+    )
+    monkeypatch.setattr(
+        "openagent.services.run_service.build_cli_adapter",
+        lambda cli_type, executable=None: adapter,
+    )
     return adapter
 
 
 class FakeCliAdapter:
     """Drives the fake script, mapping its output exactly like the real Codex adapter."""
 
-    def __init__(self, script: Path, *, mode: str = "complete", resume_mode: str = "resume") -> None:
+    def __init__(
+        self, script: Path, *, mode: str = "complete", resume_mode: str = "resume"
+    ) -> None:
         self.script = script
         self.mode = mode
         self.resume_mode = resume_mode
@@ -174,7 +182,9 @@ class FakeCliAdapter:
         return AuthStatus(authenticated=True, detail="fake")
 
     async def capabilities(self) -> CliCapabilities:
-        return CliCapabilities(structured_events=True, resumable=True, edits_files=True, runs_commands=True)
+        return CliCapabilities(
+            structured_events=True, resumable=True, edits_files=True, runs_commands=True
+        )
 
     def start_run(self, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]:
         return self._drive(request, self.mode)
@@ -187,7 +197,8 @@ class FakeCliAdapter:
     async def _drive(self, request: CliRunRequest, mode: str) -> AsyncIterator[NormalizedEvent]:
         proc = ManagedProcess(
             [sys.executable, str(self.script), mode],
-            cwd=request.workspace, env=minimal_environment(),
+            cwd=request.workspace,
+            env=minimal_environment(),
         )
         self._processes[request.run_id] = proc
         try:

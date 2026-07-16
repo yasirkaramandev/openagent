@@ -41,7 +41,7 @@ def test_codex_maps_command_and_files():
     types = _types(events)
     assert "command.started" in types
     assert "command.completed" in types
-    assert "file.created" in types   # kind "add"
+    assert "file.created" in types  # kind "add"
     assert "file.modified" in types  # kind "update"
     paths = {e.data.get("path") for e in events if e.type.startswith("file.")}
     assert "tests/test_ws.py" in paths and "main.py" in paths
@@ -68,7 +68,7 @@ def test_codex_reasoning_summary_is_surfaced():
     events = _events_from("codex_stream.jsonl", map_codex_event)
     summary = next(e for e in events if e.type == "reasoning.summary")
     assert summary.data["text"] == "**Checking the WSS client before editing**"
-    assert summary.data["item_id"] == "reason_1"       # addressable, so updates project onto it
+    assert summary.data["item_id"] == "reason_1"  # addressable, so updates project onto it
     assert summary.data["status"] == "completed"
 
 
@@ -91,17 +91,22 @@ def test_codex_undesignated_raw_fields_are_never_persisted():
     """
 
     events = map_codex_event(
-        {"type": "item.completed", "item": {
-            "id": "r2", "type": "reasoning", "text": "**Inspecting the parser**",
-            "encrypted_content": "gAAAAA-secret-reasoning-blob",
-            "raw_content": [{"type": "reasoning_text", "text": "step 1: I secretly think..."}],
-            "summary_parts": ["hidden deliberation"],
-        }},
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "r2",
+                "type": "reasoning",
+                "text": "**Inspecting the parser**",
+                "encrypted_content": "gAAAAA-secret-reasoning-blob",
+                "raw_content": [{"type": "reasoning_text", "text": "step 1: I secretly think..."}],
+                "summary_parts": ["hidden deliberation"],
+            },
+        },
         "run_1",
     )
     blob = json.dumps([e.model_dump() for e in events])
-    assert "**Inspecting the parser**" in blob          # the designated summary is kept
-    assert "gAAAAA-secret-reasoning-blob" not in blob   # …and nothing else is
+    assert "**Inspecting the parser**" in blob  # the designated summary is kept
+    assert "gAAAAA-secret-reasoning-blob" not in blob  # …and nothing else is
     assert "I secretly think" not in blob
     assert "hidden deliberation" not in blob
 
@@ -150,6 +155,7 @@ def test_claude_usage_and_cost():
 
 # ------------------------------------------------------- claude result success/failure (item 7)
 
+
 def _result_type(obj: dict) -> str:
     events = map_claude_event({"type": "result", **obj}, "run_1")
     terminals = [e.type for e in events if e.type in ("run.completed", "run.failed")]
@@ -158,13 +164,16 @@ def _result_type(obj: dict) -> str:
 
 
 def test_claude_result_success_subtype_completes():
-    assert _result_type({"subtype": "success", "result": "ok", "is_error": False}) == "run.completed"
+    assert (
+        _result_type({"subtype": "success", "result": "ok", "is_error": False}) == "run.completed"
+    )
 
 
 def test_claude_result_explicit_error_fails():
-    assert _result_type(
-        {"subtype": "error_during_execution", "is_error": True, "result": "boom"}
-    ) == "run.failed"
+    assert (
+        _result_type({"subtype": "error_during_execution", "is_error": True, "result": "boom"})
+        == "run.failed"
+    )
 
 
 def test_claude_result_missing_is_error_is_not_completed():
@@ -187,6 +196,7 @@ def test_claude_result_is_error_false_without_subtype_completes():
 
 # ----------------------------------------------- claude result: valid success envelope only (item 10)
 
+
 def test_claude_result_is_error_false_without_result_fails():
     # is_error=false but no result string at all -> fail closed.
     assert _result_type({"is_error": False}) == "run.failed"
@@ -203,9 +213,10 @@ def test_claude_result_conflicting_success_but_is_error_true_fails():
 
 
 def test_claude_result_conflicting_error_subtype_but_is_error_false_fails():
-    assert _result_type(
-        {"subtype": "error_during_execution", "is_error": False, "result": "ok"}
-    ) == "run.failed"
+    assert (
+        _result_type({"subtype": "error_during_execution", "is_error": False, "result": "ok"})
+        == "run.failed"
+    )
 
 
 def test_claude_result_empty_object_fails():
@@ -228,12 +239,20 @@ def test_codex_resume_puts_options_before_the_subcommand(tmp_path):
     from openagent.runtimes.cli.codex import CodexAdapter
 
     adapter = CodexAdapter(executable="/usr/local/bin/codex")
-    request = CliRunRequest(run_id="r", prompt="second turn", workspace=tmp_path,
-                            permission_profile="read-only", artifacts_dir=tmp_path)
+    request = CliRunRequest(
+        run_id="r",
+        prompt="second turn",
+        workspace=tmp_path,
+        permission_profile="read-only",
+        artifacts_dir=tmp_path,
+    )
     args = [
-        "/usr/local/bin/codex", "exec",
+        "/usr/local/bin/codex",
+        "exec",
         *adapter._common_args(request),
-        "resume", "sess-1", "second turn",
+        "resume",
+        "sess-1",
+        "second turn",
     ]
 
     resume_at = args.index("resume")
@@ -241,7 +260,7 @@ def test_codex_resume_puts_options_before_the_subcommand(tmp_path):
     assert args.index("--sandbox") < resume_at
     assert args.index("-o") < resume_at
     # …and the session id and prompt are positional arguments *after* it.
-    assert args[resume_at + 1:] == ["sess-1", "second turn"]
+    assert args[resume_at + 1 :] == ["sess-1", "second turn"]
 
 
 def test_codex_pins_the_model_when_the_agent_specifies_one(tmp_path):
@@ -251,14 +270,25 @@ def test_codex_pins_the_model_when_the_agent_specifies_one(tmp_path):
     from openagent.runtimes.cli.codex import CodexAdapter
 
     adapter = CodexAdapter(executable="codex")
-    pinned = adapter._common_args(CliRunRequest(
-        run_id="r", prompt="p", workspace=tmp_path, artifacts_dir=tmp_path, model="gpt-5.5",
-    ))
+    pinned = adapter._common_args(
+        CliRunRequest(
+            run_id="r",
+            prompt="p",
+            workspace=tmp_path,
+            artifacts_dir=tmp_path,
+            model="gpt-5.5",
+        )
+    )
     assert pinned[pinned.index("-m") + 1] == "gpt-5.5"
 
-    unpinned = adapter._common_args(CliRunRequest(
-        run_id="r", prompt="p", workspace=tmp_path, artifacts_dir=tmp_path,
-    ))
+    unpinned = adapter._common_args(
+        CliRunRequest(
+            run_id="r",
+            prompt="p",
+            workspace=tmp_path,
+            artifacts_dir=tmp_path,
+        )
+    )
     assert "-m" not in unpinned
 
 

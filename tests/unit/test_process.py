@@ -30,6 +30,7 @@ def test_minimal_env_injects_extra():
 
 # --------------------------------------------------------------------------- PID identity (item 11)
 
+
 @pytest.fixture()
 def live_process():
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

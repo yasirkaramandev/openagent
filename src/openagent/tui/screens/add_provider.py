@@ -108,8 +108,12 @@ class AddProviderScreen(Screen):
             "region": self.query_one("#region", Input).value.strip() or None,
             "workspace_id": self.query_one("#workspace_id", Input).value.strip() or None,
             "cred": cred,
-            "api_key": self.query_one("#api_key", Input).value or None if cred == "keychain" else None,
-            "key_env": self.query_one("#key_env", Input).value.strip() or None if cred == "env" else None,
+            "api_key": self.query_one("#api_key", Input).value or None
+            if cred == "keychain"
+            else None,
+            "key_env": self.query_one("#key_env", Input).value.strip() or None
+            if cred == "env"
+            else None,
         }
 
     def _status(self, message: str) -> None:
@@ -133,9 +137,13 @@ class AddProviderScreen(Screen):
     async def _do_test(self, p: dict) -> None:
         oa = self.app.oa  # type: ignore[attr-defined]
         result = await oa.providers.test_config(
-            provider_type=p["provider_type"], protocol=p["protocol"], base_url=p["base_url"],
-            region=p["region"], workspace_id=p["workspace_id"],
-            api_key=p["api_key"], key_env=p["key_env"],
+            provider_type=p["provider_type"],
+            protocol=p["protocol"],
+            base_url=p["base_url"],
+            region=p["region"],
+            workspace_id=p["workspace_id"],
+            api_key=p["api_key"],
+            key_env=p["key_env"],
         )
         if result.ok:
             self._status(f"[green]✓ connection ok[/green] — {result.detail}")
@@ -153,9 +161,15 @@ class AddProviderScreen(Screen):
             return
         try:
             oa.providers.add(
-                name=p["name"], provider_type=p["provider_type"], protocol=p["protocol"],
-                base_url=p["base_url"], region=p["region"], workspace_id=p["workspace_id"],
-                api_key=p["api_key"], key_env=p["key_env"], credential_source=p["cred"],
+                name=p["name"],
+                provider_type=p["provider_type"],
+                protocol=p["protocol"],
+                base_url=p["base_url"],
+                region=p["region"],
+                workspace_id=p["workspace_id"],
+                api_key=p["api_key"],
+                key_env=p["key_env"],
+                credential_source=p["cred"],
             )
         except ProviderValidationError as exc:
             self._status(f"[red]✗ {exc}[/red]")

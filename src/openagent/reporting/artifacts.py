@@ -35,8 +35,8 @@ from ..credentials.redaction import redact
 _IS_WINDOWS = sys.platform.startswith("win")
 
 #: Bounds on untrusted content in the artifact bundle (item 23).
-MAX_OUTPUT_CHARS = 4_000       # per command, in timeline.md
-MAX_TEXT_CHARS = 4_000         # per message / reasoning summary
+MAX_OUTPUT_CHARS = 4_000  # per command, in timeline.md
+MAX_TEXT_CHARS = 4_000  # per message / reasoning summary
 MAX_TIMELINE_COMMANDS = 200
 
 
@@ -48,8 +48,12 @@ class TestSummary:
     command: str = ""
 
     def to_dict(self) -> dict:
-        return {"ran": self.ran, "passed": self.passed, "exit_code": self.exit_code,
-                "command": self.command}
+        return {
+            "ran": self.ran,
+            "passed": self.passed,
+            "exit_code": self.exit_code,
+            "command": self.command,
+        }
 
 
 @dataclass
@@ -75,19 +79,28 @@ class ArtifactWriter:
 
     def write_request(self, run: Run) -> None:
         # The user prompt can itself contain a pasted secret — redact it (spec §30).
-        self._json("request.json", {
-            "run_id": run.id,
-            "agent": run.agent,
-            "prompt": redact(run.prompt),
-            "workspace": run.workspace,
-            "worktree": run.worktree,
-            "worktree_strategy": run.worktree_strategy,
-            "permission_profile": run.permission_profile,
-        })
+        self._json(
+            "request.json",
+            {
+                "run_id": run.id,
+                "agent": run.agent,
+                "prompt": redact(run.prompt),
+                "workspace": run.workspace,
+                "worktree": run.worktree,
+                "worktree_strategy": run.worktree_strategy,
+                "permission_profile": run.permission_profile,
+            },
+        )
 
-    def write_status(self, run: Run) -> None:
+    def write_status(
+        self,
+        run: Run,
+        *,
+        artifacts_partial: bool = False,
+        artifact_failure: dict | None = None,
+    ) -> None:
         status = enum_value(run.status)
-        self._json("status.json", {
+        data = {
             "run_id": run.id,
             "status": status,
             "turns": run.turns,
@@ -96,10 +109,18 @@ class ArtifactWriter:
             "exit_code": run.exit_code,
             "failure_type": redact(run.failure_type) if run.failure_type else None,
             "session_id": run.provider_session_id,
-        })
+        }
+        _mark_partial(data, artifacts_partial, artifact_failure)
+        self._json("status.json", data)
 
     def write_results(
-        self, run: Run, art: RunArtifacts, projection: RunProjection | None = None
+        self,
+        run: Run,
+        art: RunArtifacts,
+        projection: RunProjection | None = None,
+        *,
+        artifacts_partial: bool = False,
+        artifact_failure: dict | None = None,
     ) -> None:
         status = enum_value(run.status)
         # Scrub free text and the diff before anything hits disk (spec §30).
@@ -120,6 +141,7 @@ class ArtifactWriter:
             "failure_type": redact(run.failure_type) if run.failure_type else None,
         }
         result.update(_structured(projection))
+        _mark_partial(result, artifacts_partial, artifact_failure)
         self._json("result.json", result)
         self._json("tests.json", art.tests.to_dict())
         self._text("changes.diff", redact(art.diff))
@@ -133,7 +155,10 @@ class ArtifactWriter:
         self._text("timeline.md", redact(_render_timeline_md(run, projection)))
 
     def write_turn(
-        self, run: Run, prompt: str, art: RunArtifacts,
+        self,
+        run: Run,
+        prompt: str,
+        art: RunArtifacts,
         event_range: tuple[int, int] | None = None,
     ) -> None:
         """Record a resume turn as an explicit ``turn_NNN.md`` artifact (spec §32, item 18).
@@ -151,17 +176,29 @@ class ArtifactWriter:
         tests = art.tests
         tests_line = (
             f"ran `{tests.command}` → {'passed' if tests.passed else 'failed'} "
-            f"(exit {tests.exit_code})" if tests.ran else "no tests run this turn"
+            f"(exit {tests.exit_code})"
+            if tests.ran
+            else "no tests run this turn"
         )
         events_line = (
             f"events {event_range[0]}–{event_range[1]}" if event_range else "(range unavailable)"
         )
         lines = [
-            f"# Turn {run.turns} — {run.id}", "",
-            f"- Status: {status}", f"- Usage: {usage_line}", f"- Tests: {tests_line}",
-            f"- Events: {events_line}", "",
-            "## Prompt", "", redact(prompt), "",
-            "## Summary", "", redact(art.summary) or "(no summary)", "",
+            f"# Turn {run.turns} — {run.id}",
+            "",
+            f"- Status: {status}",
+            f"- Usage: {usage_line}",
+            f"- Tests: {tests_line}",
+            f"- Events: {events_line}",
+            "",
+            "## Prompt",
+            "",
+            redact(prompt),
+            "",
+            "## Summary",
+            "",
+            redact(art.summary) or "(no summary)",
+            "",
         ]
         self._text(f"turn_{run.turns:03d}.md", "\n".join(lines))
 
@@ -185,6 +222,24 @@ class ArtifactWriter:
         _secure_file(path)
 
 
+def _mark_partial(data: dict, artifacts_partial: bool, artifact_failure: dict | None) -> None:
+    """Stamp an explicit partial-bundle marker onto status/result (§5).
+
+    When failure recovery could not regenerate every artifact from a consistent, completed run, the
+    bundle is flagged so a downstream reader (TUI, CLI, another agent) knows it is recovered/partial
+    rather than a clean result — and which stage failed.
+    """
+
+    if not artifacts_partial:
+        return
+    data["artifacts_partial"] = True
+    if artifact_failure:
+        data["artifact_failure"] = {
+            "stage": str(artifact_failure.get("stage", "")),
+            "message": redact(str(artifact_failure.get("message", ""))),
+        }
+
+
 def _secure_file(path: Path) -> None:
     if not _IS_WINDOWS:
         try:
@@ -204,14 +259,24 @@ def _secure_dir(path: Path) -> None:
 def _render_output_md(run: Run, art: RunArtifacts) -> str:
     status = enum_value(run.status)
     lines = ["# Run Result", "", "## Summary", "", art.summary or "(no summary)", ""]
-    lines += ["## Status", "", f"- Status: {status}", f"- Agent: {run.agent}", f"- Turns: {run.turns}", ""]
+    lines += [
+        "## Status",
+        "",
+        f"- Status: {status}",
+        f"- Agent: {run.agent}",
+        f"- Turns: {run.turns}",
+        "",
+    ]
     if status != "completed" and (art.error or run.failure_type):
         # Why it failed, in the artifact a human opens first (item 13).
         error = art.error
-        lines += ["## Failure", "",
-                  f"- Type: {error.get('error_type') or run.failure_type}",
-                  f"- Phase: {error.get('phase') or run.phase}",
-                  f"- Source: {error.get('source') or 'openagent'}"]
+        lines += [
+            "## Failure",
+            "",
+            f"- Type: {error.get('error_type') or run.failure_type}",
+            f"- Phase: {error.get('phase') or run.phase}",
+            f"- Source: {error.get('source') or 'openagent'}",
+        ]
         if error.get("message"):
             lines.append(f"- Message: {str(error['message'])[:MAX_TEXT_CHARS]}")
         lines.append("")
@@ -247,19 +312,35 @@ def _structured(projection: RunProjection | None) -> dict:
     # ``turns`` stays the integer count (it means the same thing in status.json); the per-turn
     # structure lives under ``turn_details`` so the two never collide.
     if projection is None:
-        return {"reasoning_summaries": [], "plan": [], "commands": [], "web_searches": [],
-                "files": [], "turn_details": []}
+        return {
+            "reasoning_summaries": [],
+            "plan": [],
+            "commands": [],
+            "web_searches": [],
+            "files": [],
+            "turn_details": [],
+        }
     return {
         "reasoning_summaries": [
-            {"item_id": i.item_id, "source": i.source, "turn": i.turn,
-             "text": i.text[:MAX_TEXT_CHARS]}
-            for i in projection.reasoning if i.text
+            {
+                "item_id": i.item_id,
+                "source": i.source,
+                "turn": i.turn,
+                "text": i.text[:MAX_TEXT_CHARS],
+            }
+            for i in projection.reasoning
+            if i.text
         ],
         "plan": [p.to_dict() for p in projection.plan],
         "commands": [
-            {"item_id": i.item_id, "command": i.command, "status": i.status,
-             "exit_code": i.exit_code, "turn": i.turn,
-             "output": i.output[:MAX_OUTPUT_CHARS]}
+            {
+                "item_id": i.item_id,
+                "command": i.command,
+                "status": i.status,
+                "exit_code": i.exit_code,
+                "turn": i.turn,
+                "output": i.output[:MAX_OUTPUT_CHARS],
+            }
             for i in projection.commands[:MAX_TIMELINE_COMMANDS]
         ],
         "web_searches": [
@@ -267,12 +348,15 @@ def _structured(projection: RunProjection | None) -> dict:
             for i in projection.web_searches
         ],
         "files": [
-            {"path": i.path, "change": i.change, "status": i.status}
-            for i in projection.files
+            {"path": i.path, "change": i.change, "status": i.status} for i in projection.files
         ],
         "turn_details": [
-            {"number": t.number, "prompt": t.prompt[:MAX_TEXT_CHARS], "status": t.status,
-             "started_at": t.started_at}
+            {
+                "number": t.number,
+                "prompt": t.prompt[:MAX_TEXT_CHARS],
+                "status": t.status,
+                "started_at": t.started_at,
+            }
             for t in sorted(projection.turns.values(), key=lambda t: t.number)
         ],
     }
@@ -281,7 +365,8 @@ def _structured(projection: RunProjection | None) -> dict:
 def _render_timeline_md(run: Run, projection: RunProjection) -> str:
     status = enum_value(run.status)
     lines = [
-        f"# Timeline — {run.id}", "",
+        f"# Timeline — {run.id}",
+        "",
         f"- Agent: {run.agent}",
         f"- Status: {status} (phase: {run.phase})",
         f"- Turns: {run.turns}",
@@ -319,11 +404,15 @@ def _render_timeline_md(run: Run, projection: RunProjection) -> str:
         lines.append("")
     if projection.error:
         err = projection.error
-        lines += ["## Failure", "",
-                  f"- Type: {err.get('error_type')}",
-                  f"- Phase: {err.get('phase') or '(unknown)'}",
-                  f"- Source: {err.get('source')}",
-                  f"- Message: {str(err.get('message'))[:MAX_TEXT_CHARS]}", ""]
+        lines += [
+            "## Failure",
+            "",
+            f"- Type: {err.get('error_type')}",
+            f"- Phase: {err.get('phase') or '(unknown)'}",
+            f"- Source: {err.get('source')}",
+            f"- Message: {str(err.get('message'))[:MAX_TEXT_CHARS]}",
+            "",
+        ]
     final = projection.final_message
     if final:
         lines += ["## Final response", "", final[:MAX_TEXT_CHARS], ""]
@@ -361,13 +450,24 @@ def _timeline_entry(item) -> list[str]:
 def _render_handoff_md(run: Run, art: RunArtifacts) -> str:
     status = enum_value(run.status)
     lines = [
-        f"# Handoff — {run.id}", "",
-        f"Agent `{run.agent}` finished with status **{status}** after {run.turns} turn(s).", "",
-        "## What was done", "", art.summary or "(no summary)", "",
-        "## Files changed", "",
+        f"# Handoff — {run.id}",
+        "",
+        f"Agent `{run.agent}` finished with status **{status}** after {run.turns} turn(s).",
+        "",
+        "## What was done",
+        "",
+        art.summary or "(no summary)",
+        "",
+        "## Files changed",
+        "",
     ]
     lines += [f"- {f}" for f in art.files_changed] or ["- (none)"]
-    lines += ["", "## Next steps", "",
-              "- Review `changes.diff` and apply/merge/discard the worktree.",
-              f"- Resume with `openagent message --id {run.id} -p \"...\"` if supported.", ""]
+    lines += [
+        "",
+        "## Next steps",
+        "",
+        "- Review `changes.diff` and apply/merge/discard the worktree.",
+        f'- Resume with `openagent message --id {run.id} -p "..."` if supported.',
+        "",
+    ]
     return "\n".join(lines)

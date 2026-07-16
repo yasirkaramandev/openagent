@@ -44,8 +44,13 @@ def _run(ctx: ToolContext, command: str, timeout: int) -> subprocess.CompletedPr
     argv: list[str] | str = command if policy.needs_shell else list(policy.argv)
     try:
         return run_capture(
-            argv, cwd=ctx.workspace_root, env=env, timeout=timeout, shell=policy.needs_shell,
-            max_output_bytes=_MAX_OUTPUT_BYTES, cancellation=ctx.cancellation,
+            argv,
+            cwd=ctx.workspace_root,
+            env=env,
+            timeout=timeout,
+            shell=policy.needs_shell,
+            max_output_bytes=_MAX_OUTPUT_BYTES,
+            cancellation=ctx.cancellation,
         )
     except subprocess.TimeoutExpired as exc:
         raise ToolError(f"command timed out after {timeout}s") from exc
@@ -64,18 +69,25 @@ def run_command(ctx: ToolContext, command: str, timeout: int = _DEFAULT_TIMEOUT)
     if ctx.emit:
         ctx.emit("command.completed", {"command": command, "exit_code": proc.returncode})
     ok = proc.returncode == 0
-    return ToolResult(ok=ok, content=output, data={"exit_code": proc.returncode, "command": command})
+    return ToolResult(
+        ok=ok, content=output, data={"exit_code": proc.returncode, "command": command}
+    )
 
 
-def run_tests(ctx: ToolContext, command: str = "pytest -q", timeout: int = _DEFAULT_TIMEOUT) -> ToolResult:
+def run_tests(
+    ctx: ToolContext, command: str = "pytest -q", timeout: int = _DEFAULT_TIMEOUT
+) -> ToolResult:
     if not ctx.profile.can_run_commands:
         raise ToolError("this permission profile does not allow running commands")
     proc = _run(ctx, command, timeout)
     output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT_BYTES]
     passed = proc.returncode == 0
     if ctx.emit:
-        ctx.emit("test.completed", {"command": command, "passed": passed, "exit_code": proc.returncode})
+        ctx.emit(
+            "test.completed", {"command": command, "passed": passed, "exit_code": proc.returncode}
+        )
     return ToolResult(
-        ok=passed, content=output,
+        ok=passed,
+        content=output,
         data={"exit_code": proc.returncode, "passed": passed, "command": command},
     )

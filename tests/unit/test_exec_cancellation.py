@@ -28,8 +28,10 @@ from openagent.tools.exec import _MAX_OUTPUT_BYTES, run_command
 
 def _ctx(root: Path, *, cancellation: RunCancellation | None = None) -> ToolContext:
     return ToolContext(
-        workspace_root=root, profile=get_profile(DEVELOPMENT),
-        approval_gate=ApprovalGate(auto_approve=True), run_id="run_x",
+        workspace_root=root,
+        profile=get_profile(DEVELOPMENT),
+        approval_gate=ApprovalGate(auto_approve=True),
+        run_id="run_x",
         cancellation=cancellation,
     )
 

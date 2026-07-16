@@ -45,55 +45,82 @@ _BOOL = {"type": "boolean"}
 
 ALL_TOOLS: dict[str, Tool] = {
     "list_files": Tool(
-        "list_files", "List files under a directory (workspace-relative).",
-        _obj({"path": _STR, "depth": _INT}, []), fs.list_files,
+        "list_files",
+        "List files under a directory (workspace-relative).",
+        _obj({"path": _STR, "depth": _INT}, []),
+        fs.list_files,
     ),
     "read_file": Tool(
-        "read_file", "Read a UTF-8 text file (workspace-relative path).",
-        _obj({"path": _STR}, ["path"]), fs.read_file,
+        "read_file",
+        "Read a UTF-8 text file (workspace-relative path).",
+        _obj({"path": _STR}, ["path"]),
+        fs.read_file,
     ),
     "search_files": Tool(
-        "search_files", "Find files by glob pattern (e.g. '*.py').",
-        _obj({"pattern": _STR}, ["pattern"]), fs.search_files,
+        "search_files",
+        "Find files by glob pattern (e.g. '*.py').",
+        _obj({"pattern": _STR}, ["pattern"]),
+        fs.search_files,
     ),
     "search_text": Tool(
-        "search_text", "Search file contents for a substring; optional glob filter.",
-        _obj({"query": _STR, "glob": _STR}, ["query"]), fs.search_text,
+        "search_text",
+        "Search file contents for a substring; optional glob filter.",
+        _obj({"query": _STR, "glob": _STR}, ["query"]),
+        fs.search_text,
     ),
     "write_file": Tool(
-        "write_file", "Write/overwrite a file with full content. Prefer apply_patch for edits.",
-        _obj({"path": _STR, "content": _STR}, ["path", "content"]), fs.write_file,
+        "write_file",
+        "Write/overwrite a file with full content. Prefer apply_patch for edits.",
+        _obj({"path": _STR, "content": _STR}, ["path", "content"]),
+        fs.write_file,
     ),
     "apply_patch": Tool(
         "apply_patch",
         "Replace a unique old_string with new_string in a file (targeted, reviewable edit).",
-        _obj({"path": _STR, "old_string": _STR, "new_string": _STR, "replace_all": _BOOL},
-             ["path", "old_string", "new_string"]),
+        _obj(
+            {"path": _STR, "old_string": _STR, "new_string": _STR, "replace_all": _BOOL},
+            ["path", "old_string", "new_string"],
+        ),
         fs.apply_patch,
     ),
     "run_command": Tool(
-        "run_command", "Run a shell command in the workspace (screened by the command policy).",
-        _obj({"command": _STR, "timeout": _INT}, ["command"]), exec_tools.run_command,
+        "run_command",
+        "Run a shell command in the workspace (screened by the command policy).",
+        _obj({"command": _STR, "timeout": _INT}, ["command"]),
+        exec_tools.run_command,
     ),
     "run_tests": Tool(
-        "run_tests", "Run the test suite (default: 'pytest -q').",
-        _obj({"command": _STR, "timeout": _INT}, []), exec_tools.run_tests,
+        "run_tests",
+        "Run the test suite (default: 'pytest -q').",
+        _obj({"command": _STR, "timeout": _INT}, []),
+        exec_tools.run_tests,
     ),
     "git_status": Tool("git_status", "Show git status (short).", _obj({}, []), git.git_status),
     "git_diff": Tool(
-        "git_diff", "Show the git diff, optionally for one path.",
-        _obj({"path": _STR}, []), git.git_diff,
+        "git_diff",
+        "Show the git diff, optionally for one path.",
+        _obj({"path": _STR}, []),
+        git.git_diff,
     ),
     "ask_user": Tool(
-        "ask_user", "Ask the user a clarifying question.",
-        _obj({"question": _STR}, ["question"]), control.ask_user,
+        "ask_user",
+        "Ask the user a clarifying question.",
+        _obj({"question": _STR}, ["question"]),
+        control.ask_user,
     ),
     "update_plan": Tool(
         "update_plan",
         "Publish your current plan as a checklist the user can watch. Call it once you have a plan, "
         "and again as you complete steps. Send the whole checklist each time.",
-        _obj({"items": {"type": "array", "items": _obj({"text": _STR, "completed": _BOOL},
-                                                       ["text"])}}, ["items"]),
+        _obj(
+            {
+                "items": {
+                    "type": "array",
+                    "items": _obj({"text": _STR, "completed": _BOOL}, ["text"]),
+                }
+            },
+            ["items"],
+        ),
         control.update_plan,
     ),
     "report_progress": Tool(
@@ -104,8 +131,10 @@ ALL_TOOLS: dict[str, Tool] = {
         control.report_progress,
     ),
     "finish_task": Tool(
-        "finish_task", "Finish the task with a short summary of what was done.",
-        _obj({"summary": _STR}, ["summary"]), control.finish_task,
+        "finish_task",
+        "Finish the task with a short summary of what was done.",
+        _obj({"summary": _STR}, ["summary"]),
+        control.finish_task,
     ),
 }
 

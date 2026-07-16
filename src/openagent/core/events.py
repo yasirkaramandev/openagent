@@ -112,23 +112,25 @@ class RunPhase(str, Enum):
 
 
 #: Event types that describe one addressable item (projected by ``(source, item_id)``).
-ITEM_EVENT_TYPES = frozenset({
-    EventType.REASONING_SUMMARY.value,
-    EventType.PROGRESS_UPDATED.value,
-    EventType.PLAN_UPDATED.value,
-    EventType.COMMAND_STARTED.value,
-    EventType.COMMAND_OUTPUT.value,
-    EventType.COMMAND_COMPLETED.value,
-    EventType.WEB_SEARCH_STARTED.value,
-    EventType.WEB_SEARCH_COMPLETED.value,
-    EventType.FILE_CREATED.value,
-    EventType.FILE_MODIFIED.value,
-    EventType.FILE_DELETED.value,
-    EventType.TOOL_STARTED.value,
-    EventType.TOOL_COMPLETED.value,
-    EventType.TOOL_FAILED.value,
-    EventType.MESSAGE_COMPLETED.value,
-})
+ITEM_EVENT_TYPES = frozenset(
+    {
+        EventType.REASONING_SUMMARY.value,
+        EventType.PROGRESS_UPDATED.value,
+        EventType.PLAN_UPDATED.value,
+        EventType.COMMAND_STARTED.value,
+        EventType.COMMAND_OUTPUT.value,
+        EventType.COMMAND_COMPLETED.value,
+        EventType.WEB_SEARCH_STARTED.value,
+        EventType.WEB_SEARCH_COMPLETED.value,
+        EventType.FILE_CREATED.value,
+        EventType.FILE_MODIFIED.value,
+        EventType.FILE_DELETED.value,
+        EventType.TOOL_STARTED.value,
+        EventType.TOOL_COMPLETED.value,
+        EventType.TOOL_FAILED.value,
+        EventType.MESSAGE_COMPLETED.value,
+    }
+)
 
 
 def new_event_id() -> str:

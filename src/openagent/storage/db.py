@@ -31,13 +31,15 @@ SCHEMA_VERSION = 1
 metadata = MetaData()
 
 schema_meta = Table(
-    "schema_meta", metadata,
+    "schema_meta",
+    metadata,
     Column("key", String, primary_key=True),
     Column("value", String, nullable=False),
 )
 
 provider_connections = Table(
-    "provider_connections", metadata,
+    "provider_connections",
+    metadata,
     Column("id", String, primary_key=True),
     Column("name", String, unique=True, nullable=False),
     Column("provider_type", String, nullable=False),
@@ -46,7 +48,8 @@ provider_connections = Table(
 )
 
 models = Table(
-    "models", metadata,
+    "models",
+    metadata,
     Column("id", String, primary_key=True),
     Column("provider_connection", String, nullable=False),
     Column("remote_model_id", String, nullable=False),
@@ -54,7 +57,8 @@ models = Table(
 )
 
 agents = Table(
-    "agents", metadata,
+    "agents",
+    metadata,
     Column("name", String, primary_key=True),
     Column("title", String, nullable=False, default=""),
     Column("runtime_type", String, nullable=False),
@@ -62,7 +66,8 @@ agents = Table(
 )
 
 cli_installations = Table(
-    "cli_installations", metadata,
+    "cli_installations",
+    metadata,
     Column("id", String, primary_key=True),
     Column("type", String, nullable=False),
     Column("executable", String, nullable=False),
@@ -70,7 +75,8 @@ cli_installations = Table(
 )
 
 runs = Table(
-    "runs", metadata,
+    "runs",
+    metadata,
     Column("id", String, primary_key=True),
     Column("agent", String, nullable=False),
     Column("status", String, nullable=False),
@@ -85,7 +91,8 @@ runs = Table(
 )
 
 sessions = Table(
-    "sessions", metadata,
+    "sessions",
+    metadata,
     Column("openagent_session_id", String, primary_key=True),
     Column("runtime", String, nullable=False),
     Column("provider_session_id", String),
@@ -93,7 +100,8 @@ sessions = Table(
 )
 
 events = Table(
-    "events", metadata,
+    "events",
+    metadata,
     Column("id", String, primary_key=True),
     Column("run_id", String, nullable=False, index=True),
     Column("seq", Integer, nullable=False),
@@ -103,7 +111,8 @@ events = Table(
 )
 
 usage_records = Table(
-    "usage_records", metadata,
+    "usage_records",
+    metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("run_id", String, nullable=False, index=True),
     Column("timestamp", String, nullable=False),
@@ -123,7 +132,9 @@ class Database:
         engine = create_engine(
             f"sqlite:///{db_path}",
             future=True,
-            json_serializer=lambda obj: obj if isinstance(obj, str) else __import__("json").dumps(obj),
+            json_serializer=lambda obj: (
+                obj if isinstance(obj, str) else __import__("json").dumps(obj)
+            ),
         )
         db = cls(engine)
         db.migrate()
@@ -145,9 +156,7 @@ class Database:
                 select(schema_meta.c.value).where(schema_meta.c.key == "version")
             ).first()
             if row is None:
-                conn.execute(
-                    insert(schema_meta).values(key="version", value=str(SCHEMA_VERSION))
-                )
+                conn.execute(insert(schema_meta).values(key="version", value=str(SCHEMA_VERSION)))
             elif int(row[0]) < SCHEMA_VERSION:  # pragma: no cover - no v2 yet
                 conn.execute(
                     update(schema_meta)
@@ -161,9 +170,7 @@ class Database:
         try:
             with self.engine.begin() as conn:
                 conn.execute(
-                    insert(schema_meta)
-                    .prefix_with("OR REPLACE")
-                    .values(key="_probe", value="1")
+                    insert(schema_meta).prefix_with("OR REPLACE").values(key="_probe", value="1")
                 )
             return True
         except Exception:  # pragma: no cover - environment dependent

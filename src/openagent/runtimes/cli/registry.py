@@ -70,7 +70,10 @@ def build_cli_adapter(cli_type: str, executable: str | None = None) -> CliAdapte
 
 
 def register_cli_adapter(
-    cli_type: str, builder: Any, *, display_name: str | None = None,
+    cli_type: str,
+    builder: Any,
+    *,
+    display_name: str | None = None,
     status_label: str | None = None,
 ) -> None:
     """Add a CLI adapter to the registry at runtime.
@@ -153,7 +156,10 @@ async def discover_cli_models(cli_type: str, executable: str | None = None) -> C
     method = str(getattr(adapter, "model_discovery_method", "") or "")
     if lister is None:
         return CliModelDiscovery(
-            cli_type, False, [], "",
+            cli_type,
+            False,
+            [],
+            "",
             f"automatic model discovery is unavailable for {cli_display_name(cli_type)}; "
             "type a model id manually, or leave it blank to use the CLI's own default",
         )
@@ -190,25 +196,29 @@ async def cli_registry_entries() -> list[CliRegistryEntry]:
         verified = install.version_verified if install else False
         label = cli_status_label(cli_type)
         if install is not None and install.validated_version and not verified:
-            label = (f"Installed but current version unverified "
-                     f"(validated against {install.validated_version}, "
-                     f"detected {install.version or 'unknown'})")
-        entries.append(CliRegistryEntry(
-            type=cli_type,
-            display_name=cli_display_name(cli_type),
-            executable=executable,
-            version=install.version if install else None,
-            installed=install is not None,
-            authenticated=authenticated,
-            auth_detail=auth_detail,
-            adapter=install.adapter if install else cli_type,
-            structured_events=caps.structured_events,
-            resumable=caps.resumable,
-            experimental=caps.experimental,
-            status_label=label,
-            validated_version=install.validated_version if install else None,
-            version_verified=verified,
-        ))
+            label = (
+                f"Installed but current version unverified "
+                f"(validated against {install.validated_version}, "
+                f"detected {install.version or 'unknown'})"
+            )
+        entries.append(
+            CliRegistryEntry(
+                type=cli_type,
+                display_name=cli_display_name(cli_type),
+                executable=executable,
+                version=install.version if install else None,
+                installed=install is not None,
+                authenticated=authenticated,
+                auth_detail=auth_detail,
+                adapter=install.adapter if install else cli_type,
+                structured_events=caps.structured_events,
+                resumable=caps.resumable,
+                experimental=caps.experimental,
+                status_label=label,
+                validated_version=install.validated_version if install else None,
+                version_verified=verified,
+            )
+        )
     return entries
 
 

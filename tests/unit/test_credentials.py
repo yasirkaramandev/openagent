@@ -69,6 +69,7 @@ def test_keychain_resolve_survives_backend_failure(monkeypatch):
 
 # --------------------------------------------------------------------------- external command (item 9)
 
+
 def test_external_command_credential_succeeds():
     store = CredentialStore()
     assert store.resolve(_cmd_ref("print('cmd-secret')")) == "cmd-secret"

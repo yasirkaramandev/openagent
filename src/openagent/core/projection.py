@@ -84,8 +84,12 @@ class Item:
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "item_id": self.item_id, "source": self.source, "kind": self.kind,
-            "status": self.status, "turn": self.turn, "timestamp": self.timestamp,
+            "item_id": self.item_id,
+            "source": self.source,
+            "kind": self.kind,
+            "status": self.status,
+            "turn": self.turn,
+            "timestamp": self.timestamp,
         }
         for name in ("title", "text", "command", "output", "path", "change", "tool", "query"):
             value = getattr(self, name)
@@ -188,8 +192,11 @@ class RunProjection:
         for item in reversed(self.items):
             if item.status == ItemStatus.IN_PROGRESS.value:
                 return item.title or item.kind
-        if self.phase in (RunPhase.COMPLETED.value, RunPhase.FAILED.value,
-                          RunPhase.CANCELLED.value):
+        if self.phase in (
+            RunPhase.COMPLETED.value,
+            RunPhase.FAILED.value,
+            RunPhase.CANCELLED.value,
+        ):
             return self.phase
         last = self.items[-1] if self.items else None
         return (last.title or last.kind) if last else self.phase
@@ -290,11 +297,15 @@ class RunProjection:
                 self.usage[key] = int(self.usage.get(key, 0)) + int(data[key] or 0)
         cost = data.get("provider_cost")
         if cost is not None:
-            self.usage["provider_cost"] = float(self.usage.get("provider_cost") or 0.0) + float(cost)
+            self.usage["provider_cost"] = float(self.usage.get("provider_cost") or 0.0) + float(
+                cost
+            )
 
     def _on_tests(self, event: NormalizedEvent, data: dict) -> None:
         self.tests = {
-            "ran": True, "passed": data.get("passed"), "exit_code": data.get("exit_code"),
+            "ran": True,
+            "passed": data.get("passed"),
+            "exit_code": data.get("exit_code"),
             "command": data.get("command", ""),
         }
 
@@ -340,13 +351,17 @@ class RunProjection:
         raw = data.get("items") or []
         item.plan = [
             PlanItem(text=str(x.get("text") or ""), completed=bool(x.get("completed")))
-            for x in raw if isinstance(x, dict)
+            for x in raw
+            if isinstance(x, dict)
         ]
         done = sum(1 for p in item.plan if p.completed)
         item.title = f"Plan ({done}/{len(item.plan)})"
         if not data.get("status"):
-            item.status = (ItemStatus.COMPLETED.value if item.plan and done == len(item.plan)
-                           else ItemStatus.IN_PROGRESS.value)
+            item.status = (
+                ItemStatus.COMPLETED.value
+                if item.plan and done == len(item.plan)
+                else ItemStatus.IN_PROGRESS.value
+            )
 
     def _apply_command_started(self, item: Item, data: dict) -> None:
         item.command = str(data.get("command") or "")
@@ -379,8 +394,11 @@ class RunProjection:
         if output is not None:
             item.output = str(output)[-MAX_ITEM_OUTPUT_CHARS:]
         if not data.get("status"):
-            item.status = (ItemStatus.COMPLETED.value if item.exit_code in (0, None)
-                           else ItemStatus.FAILED.value)
+            item.status = (
+                ItemStatus.COMPLETED.value
+                if item.exit_code in (0, None)
+                else ItemStatus.FAILED.value
+            )
 
     def _apply_file(self, item: Item, data: dict) -> None:
         item.path = str(data.get("path") or "")

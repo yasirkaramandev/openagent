@@ -84,9 +84,14 @@ class AgentsScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("Agents  ([b]Enter[/b] details · [b]R[/b] run · [b]E[/b] edit · "
-                     "[b]Del[/b] remove · [b]A[/b] add · [b]/[/b] search)", classes="screen-title")
-        yield Input(placeholder="filter by name/title/tag…  (Enter to apply, Esc to clear)", id="search")
+        yield Static(
+            "Agents  ([b]Enter[/b] details · [b]R[/b] run · [b]E[/b] edit · "
+            "[b]Del[/b] remove · [b]A[/b] add · [b]/[/b] search)",
+            classes="screen-title",
+        )
+        yield Input(
+            placeholder="filter by name/title/tag…  (Enter to apply, Esc to clear)", id="search"
+        )
         with Horizontal(id="agents-body"):
             yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="details")
@@ -102,9 +107,13 @@ class AgentsScreen(Screen):
         agents = list(self.app.oa.agents.list())  # type: ignore[attr-defined]
         if self._filter:
             f = self._filter.lower()
-            agents = [a for a in agents
-                      if f in a.name.lower() or f in (a.title or "").lower()
-                      or any(f in t.lower() for t in a.tags)]
+            agents = [
+                a
+                for a in agents
+                if f in a.name.lower()
+                or f in (a.title or "").lower()
+                or any(f in t.lower() for t in a.tags)
+            ]
         return agents
 
     def reload(self) -> None:
@@ -113,8 +122,16 @@ class AgentsScreen(Screen):
         table.add_columns("Name", "Title", "Runtime", "Provider/CLI", "Model", "Tags", "Profile")
         for a in self._agents():
             model = a.runtime.model or "—" if _runtime_label(a) == "api" else "—"
-            table.add_row(a.name, a.title or "—", _runtime_label(a), _provider_or_cli(a),
-                          model, ", ".join(a.tags) or "—", a.permission_profile, key=a.name)
+            table.add_row(
+                a.name,
+                a.title or "—",
+                _runtime_label(a),
+                _provider_or_cli(a),
+                model,
+                ", ".join(a.tags) or "—",
+                a.permission_profile,
+                key=a.name,
+            )
         self._update_details()
 
     def _selected_name(self) -> str | None:
@@ -139,8 +156,11 @@ class AgentsScreen(Screen):
         rt = agent.runtime
         # Titles, descriptions, tags and system prompts are user-supplied: escape them before they
         # enter a markup-enabled widget (item 14).
-        binding = (f"CLI: {safe_markup(rt.cli, 40)}" if _runtime_label(agent) == "cli"
-                   else f"Provider: {safe_markup(rt.provider, 40)}\nModel: {safe_markup(rt.model, 60)}")
+        binding = (
+            f"CLI: {safe_markup(rt.cli, 40)}"
+            if _runtime_label(agent) == "cli"
+            else f"Provider: {safe_markup(rt.provider, 40)}\nModel: {safe_markup(rt.model, 60)}"
+        )
         panel.update(
             f"[b]{safe_markup(agent.title or agent.name, 80)}[/b]\n"
             f"[dim]{safe_markup(agent.name, 60)}[/dim]\n\n"
@@ -157,18 +177,21 @@ class AgentsScreen(Screen):
         name = self._selected_name()
         if name:
             from .agent_detail import AgentDetailScreen
+
             self.app.push_screen(AgentDetailScreen(name))
 
     def action_run(self) -> None:
         name = self._selected_name()
         if name:
             from .run_console import RunSetupScreen
+
             self.app.push_screen(RunSetupScreen(preselect=name))
 
     def action_edit(self) -> None:
         name = self._selected_name()
         if name:
             from .edit_agent import EditAgentScreen
+
             self.app.push_screen(EditAgentScreen(name), callback=lambda _=None: self.reload())
 
     def action_remove(self) -> None:
@@ -184,13 +207,16 @@ class AgentsScreen(Screen):
                 self.reload()
 
         self.app.push_screen(
-            ConfirmModal(f"Delete agent [b]{safe_markup(name, 60)}[/b]? This also updates OPENAGENT.md.",
-                         confirm_label="Delete"),
+            ConfirmModal(
+                f"Delete agent [b]{safe_markup(name, 60)}[/b]? This also updates OPENAGENT.md.",
+                confirm_label="Delete",
+            ),
             callback=done,
         )
 
     def action_add(self) -> None:
         from .add_agent import AddAgentScreen
+
         self.app.push_screen(AddAgentScreen())
 
     def action_search(self) -> None:
@@ -228,12 +254,21 @@ class ProvidersScreen(_TableScreen):
     def populate(self, table: DataTable) -> None:
         table.add_columns("Name", "Type", "Protocol", "Base URL", "Credential")
         for p in self.app.oa.providers.list():  # type: ignore[attr-defined]
-            cred = p.credential.type if isinstance(p.credential.type, str) else p.credential.type.value
-            table.add_row(p.name, p.provider_type, p.protocol.value, p.base_url or "(preset)", cred,
-                          key=p.name)
+            cred = (
+                p.credential.type if isinstance(p.credential.type, str) else p.credential.type.value
+            )
+            table.add_row(
+                p.name,
+                p.provider_type,
+                p.protocol.value,
+                p.base_url or "(preset)",
+                cred,
+                key=p.name,
+            )
 
     def action_add(self) -> None:
         from .add_provider import AddProviderScreen
+
         self.app.push_screen(AddProviderScreen(), callback=lambda _=None: self.reload())
 
     def action_remove(self) -> None:
@@ -253,8 +288,12 @@ class ProvidersScreen(_TableScreen):
                 self.notify(f"removed provider '{name}'")
                 self.reload()
 
-        self.app.push_screen(ConfirmModal(f"Remove provider [b]{safe_markup(name, 60)}[/b]?",
-                                          confirm_label="Remove"), callback=done)
+        self.app.push_screen(
+            ConfirmModal(
+                f"Remove provider [b]{safe_markup(name, 60)}[/b]?", confirm_label="Remove"
+            ),
+            callback=done,
+        )
 
     def action_test(self) -> None:
         """Test the selected provider's connection and report the result (item 15)."""
@@ -316,8 +355,9 @@ class RunsScreen(_TableScreen):
     ]
 
     def populate(self, table: DataTable) -> None:
-        table.add_columns("ID", "Agent", "Runtime", "Phase", "Status", "Elapsed", "Activity",
-                          "Files")
+        table.add_columns(
+            "ID", "Agent", "Runtime", "Phase", "Status", "Elapsed", "Activity", "Files"
+        )
         oa = self.app.oa  # type: ignore[attr-defined]
         for r in oa.runs.list(50):
             status = enum_value(r.status)
@@ -333,8 +373,17 @@ class RunsScreen(_TableScreen):
                 activity = live.projection.current_activity
             elif status in _ACTIVE_STATUSES:
                 activity = r.phase
-            table.add_row(r.id, r.agent, safe_line(runtime, 20), r.phase, status,
-                          _elapsed(r), safe_line(activity, 32), str(len(r.files_changed)), key=r.id)
+            table.add_row(
+                r.id,
+                r.agent,
+                safe_line(runtime, 20),
+                r.phase,
+                status,
+                _elapsed(r),
+                safe_line(activity, 32),
+                str(len(r.files_changed)),
+                key=r.id,
+            )
 
     def _selected_run(self) -> str | None:
         table = self.query_one("#table", DataTable)
@@ -356,6 +405,7 @@ class RunsScreen(_TableScreen):
         if not run_id:
             return
         from .run_console import RunConsoleScreen
+
         self.app.push_screen(RunConsoleScreen(run_id))
 
     def action_cancel_run(self) -> None:

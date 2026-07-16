@@ -33,7 +33,9 @@ Keeping the user informed:
   commentary."""
 
 #: Used only when the caller doesn't supply the real workspace description (item 17).
-_DEFAULT_WORKSPACE_NOTE = "You are working inside an isolated workspace; the user reviews your diff."
+_DEFAULT_WORKSPACE_NOTE = (
+    "You are working inside an isolated workspace; the user reviews your diff."
+)
 
 
 def build_system_prompt(agent: AgentProfile, workspace_note: str = "") -> str:

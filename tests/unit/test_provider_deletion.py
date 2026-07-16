@@ -16,19 +16,31 @@ def _app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     return OpenAgentApp(paths)
 
 
 def test_remove_refused_when_agent_uses_provider(tmp_path: Path) -> None:
     oa = _app(tmp_path)
-    oa.providers.add(name="deepseek-main", provider_type="deepseek", api_key="sk-x", store_key=False)
-    oa.agents.create(name="ds-coder", runtime_type=RuntimeType.API_AGENT,
-                     provider="deepseek-main", model="deepseek-chat")
-    oa.agents.create(name="backend-reviewer", runtime_type=RuntimeType.API_AGENT,
-                     provider="deepseek-main", model="deepseek-chat")
+    oa.providers.add(
+        name="deepseek-main", provider_type="deepseek", api_key="sk-x", store_key=False
+    )
+    oa.agents.create(
+        name="ds-coder",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="deepseek-main",
+        model="deepseek-chat",
+    )
+    oa.agents.create(
+        name="backend-reviewer",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="deepseek-main",
+        model="deepseek-chat",
+    )
 
     with pytest.raises(ProviderInUseError) as exc:
         oa.providers.remove("deepseek-main")
@@ -41,9 +53,15 @@ def test_remove_refused_when_agent_uses_provider(tmp_path: Path) -> None:
 
 def test_remove_succeeds_after_dependents_gone(tmp_path: Path) -> None:
     oa = _app(tmp_path)
-    oa.providers.add(name="deepseek-main", provider_type="deepseek", api_key="sk-x", store_key=False)
-    oa.agents.create(name="ds-coder", runtime_type=RuntimeType.API_AGENT,
-                     provider="deepseek-main", model="deepseek-chat")
+    oa.providers.add(
+        name="deepseek-main", provider_type="deepseek", api_key="sk-x", store_key=False
+    )
+    oa.agents.create(
+        name="ds-coder",
+        runtime_type=RuntimeType.API_AGENT,
+        provider="deepseek-main",
+        model="deepseek-chat",
+    )
     oa.agents.remove("ds-coder")
     assert oa.providers.remove("deepseek-main") is True
     assert oa.providers.get("deepseek-main") is None

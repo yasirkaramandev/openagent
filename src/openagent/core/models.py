@@ -101,12 +101,18 @@ class ModelCapabilities(BaseModel):
 
 
 class RemoteModel(BaseModel):
-    """A model as reported by a provider's ``/models`` endpoint (spec §25.1)."""
+    """A model as reported by a provider's ``/models`` endpoint (spec §25.1, §14.1).
+
+    ``owned_by`` (the publisher/owner the provider reports) is preserved for catalogs — like NVIDIA
+    Build — that mix many publishers and model types, so the UI can filter by publisher and a listed
+    entry is never silently assumed to be an agent-compatible chat model.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     id: str
     display_name: str | None = None
+    owned_by: str | None = None
     context_window: int | None = None
 
 

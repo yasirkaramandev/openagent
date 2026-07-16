@@ -58,11 +58,18 @@ def test_todo_updates_project_onto_one_plan_not_many():
 
 def test_plan_progress_is_visible_mid_run():
     projection = RunProjection("run_1")
-    projection.apply(_event(EventType.PLAN_UPDATED, item_id="p1", status="in_progress", items=[
-        {"text": "Inspect provider service", "completed": True},
-        {"text": "Update run console", "completed": False},
-        {"text": "Run tests", "completed": False},
-    ]))
+    projection.apply(
+        _event(
+            EventType.PLAN_UPDATED,
+            item_id="p1",
+            status="in_progress",
+            items=[
+                {"text": "Inspect provider service", "completed": True},
+                {"text": "Update run console", "completed": False},
+                {"text": "Run tests", "completed": False},
+            ],
+        )
+    )
     plan = projection.plan
     assert [p.completed for p in plan] == [True, False, False]
     assert projection.by_kind("plan")[0].title == "Plan (1/3)"
@@ -76,12 +83,22 @@ def test_aggregated_output_snapshots_replace_rather_than_accumulate():
 
     projection = RunProjection("run_1")
     projection.apply(_event(EventType.COMMAND_STARTED, item_id="c1", command="pytest -q"))
-    projection.apply(_event(EventType.COMMAND_OUTPUT, item_id="c1", output="line 1\n",
-                            snapshot=True))
-    projection.apply(_event(EventType.COMMAND_OUTPUT, item_id="c1", output="line 1\nline 2\n",
-                            snapshot=True))
-    projection.apply(_event(EventType.COMMAND_COMPLETED, item_id="c1", command="pytest -q",
-                            exit_code=0, output="line 1\nline 2\nline 3\n", snapshot=True))
+    projection.apply(
+        _event(EventType.COMMAND_OUTPUT, item_id="c1", output="line 1\n", snapshot=True)
+    )
+    projection.apply(
+        _event(EventType.COMMAND_OUTPUT, item_id="c1", output="line 1\nline 2\n", snapshot=True)
+    )
+    projection.apply(
+        _event(
+            EventType.COMMAND_COMPLETED,
+            item_id="c1",
+            command="pytest -q",
+            exit_code=0,
+            output="line 1\nline 2\nline 3\n",
+            snapshot=True,
+        )
+    )
 
     commands = projection.commands
     assert len(commands) == 1
@@ -100,8 +117,15 @@ def test_incremental_chunks_still_append():
 
 def test_failed_command_is_not_rendered_as_success():
     projection = RunProjection("run_1")
-    projection.apply(_event(EventType.COMMAND_COMPLETED, item_id="c1", command="pytest",
-                            exit_code=1, status=ItemStatus.FAILED.value))
+    projection.apply(
+        _event(
+            EventType.COMMAND_COMPLETED,
+            item_id="c1",
+            command="pytest",
+            exit_code=1,
+            status=ItemStatus.FAILED.value,
+        )
+    )
     assert projection.commands[0].failed is True
 
 
@@ -118,10 +142,22 @@ def test_reasoning_summary_is_projected_with_its_text():
 
 def test_reasoning_updates_replace_the_same_card():
     projection = RunProjection("run_1")
-    projection.apply(_event(EventType.REASONING_SUMMARY, item_id="r1",
-                            status="in_progress", text="Looking at the parser"))
-    projection.apply(_event(EventType.REASONING_SUMMARY, item_id="r1",
-                            status="completed", text="Looked at the parser; it is fine"))
+    projection.apply(
+        _event(
+            EventType.REASONING_SUMMARY,
+            item_id="r1",
+            status="in_progress",
+            text="Looking at the parser",
+        )
+    )
+    projection.apply(
+        _event(
+            EventType.REASONING_SUMMARY,
+            item_id="r1",
+            status="completed",
+            text="Looked at the parser; it is fine",
+        )
+    )
     assert len(projection.reasoning) == 1
     assert projection.reasoning[0].text == "Looked at the parser; it is fine"
     assert projection.reasoning[0].status == "completed"
@@ -140,10 +176,12 @@ def test_file_changes_keep_one_row_per_path():
 
 def test_usage_accumulates_reasoning_tokens():
     projection = RunProjection("run_1")
-    projection.apply(_event(EventType.USAGE_UPDATED, input_tokens=10, output_tokens=2,
-                            reasoning_tokens=5))
-    projection.apply(_event(EventType.USAGE_UPDATED, input_tokens=3, output_tokens=1,
-                            reasoning_tokens=4))
+    projection.apply(
+        _event(EventType.USAGE_UPDATED, input_tokens=10, output_tokens=2, reasoning_tokens=5)
+    )
+    projection.apply(
+        _event(EventType.USAGE_UPDATED, input_tokens=3, output_tokens=1, reasoning_tokens=4)
+    )
     assert projection.usage["input_tokens"] == 13
     assert projection.usage["reasoning_tokens"] == 9
 
@@ -169,10 +207,17 @@ def test_items_from_different_sources_do_not_collide():
     """The key is (source, item_id): two backends reusing 'item_0' are two different things."""
 
     projection = RunProjection("run_1")
-    projection.apply(_event(EventType.MESSAGE_COMPLETED, source="codex-cli", item_id="item_0",
-                            text="from codex"))
-    projection.apply(_event(EventType.MESSAGE_COMPLETED, source="api-agent", item_id="item_0",
-                            text="from the api agent"))
+    projection.apply(
+        _event(EventType.MESSAGE_COMPLETED, source="codex-cli", item_id="item_0", text="from codex")
+    )
+    projection.apply(
+        _event(
+            EventType.MESSAGE_COMPLETED,
+            source="api-agent",
+            item_id="item_0",
+            text="from the api agent",
+        )
+    )
     assert len(projection.messages) == 2
 
 
@@ -189,10 +234,14 @@ def test_a_backend_that_restarts_item_ids_each_turn_does_not_overwrite_turn_1():
 
     projection = RunProjection("run_1")
     projection.apply(_event(EventType.MESSAGE_COMPLETED, item_id="item_0", text="42"))
-    projection.apply(NormalizedEvent(
-        run_id="run_1", type=EventType.SESSION_RESUMED, source="openagent",
-        data={"turn": 2, "session_id": "th-1", "prompt": "double it"},
-    ))
+    projection.apply(
+        NormalizedEvent(
+            run_id="run_1",
+            type=EventType.SESSION_RESUMED,
+            source="openagent",
+            data={"turn": 2, "session_id": "th-1", "prompt": "double it"},
+        )
+    )
     projection.apply(_event(EventType.MESSAGE_COMPLETED, item_id="item_0", text="84"))
 
     messages = projection.messages
@@ -204,6 +253,7 @@ def test_a_backend_that_restarts_item_ids_each_turn_does_not_overwrite_turn_1():
 def test_within_one_turn_the_same_item_id_still_projects_onto_one_card():
     projection = RunProjection("run_1")
     projection.apply(_event(EventType.COMMAND_STARTED, item_id="item_2", command="pytest"))
-    projection.apply(_event(EventType.COMMAND_COMPLETED, item_id="item_2", command="pytest",
-                            exit_code=0))
+    projection.apply(
+        _event(EventType.COMMAND_COMPLETED, item_id="item_2", command="pytest", exit_code=0)
+    )
     assert len(projection.commands) == 1

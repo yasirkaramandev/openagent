@@ -133,16 +133,22 @@ class RunSetupScreen(Screen):
         with Horizontal(id="body"):
             with VerticalScroll(classes="col"):
                 yield Label("Agent")
-                yield Select(agents, prompt="select an agent", id="agent", allow_blank=True,
-                             **agent_kwargs)
+                yield Select(
+                    agents, prompt="select an agent", id="agent", allow_blank=True, **agent_kwargs
+                )
                 yield Label("Task")
                 yield Input(placeholder="describe the task", id="prompt")
                 yield Label("Workspace strategy")
-                yield Select([(s, s) for s in STRATEGIES], value="auto", id="worktree",
-                             allow_blank=False)
+                yield Select(
+                    [(s, s) for s in STRATEGIES], value="auto", id="worktree", allow_blank=False
+                )
                 yield Label("Permission profile")
-                yield Select([(p, p) for p in profile_names()], id="profile", allow_blank=True,
-                             prompt="(the agent's own profile)")
+                yield Select(
+                    [(p, p) for p in profile_names()],
+                    id="profile",
+                    allow_blank=True,
+                    prompt="(the agent's own profile)",
+                )
                 yield Label("Working directory")
                 yield Static(safe_markup(str(oa.paths.project_root)), id="cwd")
             with VerticalScroll(classes="col"):
@@ -181,9 +187,11 @@ class RunSetupScreen(Screen):
 
         rt = agent.runtime
         rtype = rt.type if isinstance(rt.type, str) else rt.type.value
-        lines = [f"[b]{safe_markup(agent.title or agent.name, 60)}[/b]",
-                 f"Agent: {safe_markup(agent.name, 60)}",
-                 f"Runtime: {'CLI' if rtype == 'cli' else 'API'}"]
+        lines = [
+            f"[b]{safe_markup(agent.title or agent.name, 60)}[/b]",
+            f"Agent: {safe_markup(agent.name, 60)}",
+            f"Runtime: {'CLI' if rtype == 'cli' else 'API'}",
+        ]
         if rtype == "cli":
             entry = self._entries.get(rt.cli or "")
             lines.append(f"CLI: {safe_markup(rt.cli, 40)}")
@@ -201,7 +209,11 @@ class RunSetupScreen(Screen):
             provider = oa.providers.get(rt.provider or "")
             lines += [
                 f"Provider: {safe_markup(rt.provider, 40)}"
-                + (f" ({safe_markup(provider.provider_type, 30)})" if provider else " [red](missing)[/red]"),
+                + (
+                    f" ({safe_markup(provider.provider_type, 30)})"
+                    if provider
+                    else " [red](missing)[/red]"
+                ),
                 f"Model: {safe_markup(rt.model or '(none)', 60)}",
             ]
         lines += [
@@ -234,7 +246,8 @@ class RunSetupScreen(Screen):
     async def _check(self, name: str):
         oa = self.app.oa  # type: ignore[attr-defined]
         report = await oa.runs.preflight.check(
-            agent_name=name, permission_profile=self._profile() or None,
+            agent_name=name,
+            permission_profile=self._profile() or None,
         )
         colour = {True: "green", False: "red"}
         lines = [
@@ -242,8 +255,11 @@ class RunSetupScreen(Screen):
             + (f": {safe_line(c.detail, 90)}" if c.detail else "")
             for c in report.checks
         ]
-        verdict = ("[green]Ready to run.[/green]" if report.ok
-                   else "[red]Not ready — fix the ✗ items above.[/red]")
+        verdict = (
+            "[green]Ready to run.[/green]"
+            if report.ok
+            else "[red]Not ready — fix the ✗ items above.[/red]"
+        )
         self.query_one("#preflight", Static).update("\n".join([*lines, "", verdict]))
         return report
 
@@ -260,8 +276,9 @@ class RunSetupScreen(Screen):
 
         report = await self._check(name)
         if not report.ok:
-            self.notify("readiness checks failed — the run was not started", severity="error",
-                        timeout=8)
+            self.notify(
+                "readiness checks failed — the run was not started", severity="error", timeout=8
+            )
             return
 
         oa = self.app.oa  # type: ignore[attr-defined]
@@ -270,16 +287,22 @@ class RunSetupScreen(Screen):
         confirmed = True
         if strategy == "none" and get_profile(profile_name).can_edit_files:
             # Explicit, informed confirmation — never inferred from the strategy alone (item 8).
-            modal = InPlaceConfirmModal(agent=name, workspace=str(oa.paths.project_root),
-                                        profile=profile_name)
+            modal = InPlaceConfirmModal(
+                agent=name, workspace=str(oa.paths.project_root), profile=profile_name
+            )
             confirmed = bool(await self.app.push_screen_wait(modal))  # type: ignore[arg-type]
         if not confirmed:
             self.notify("run cancelled — nothing was started")
             return
 
         try:
-            run = oa.runs.create(agent_name=name, prompt=prompt, worktree=strategy,
-                                 permission_profile=profile_name, confirm_in_place=confirmed)
+            run = oa.runs.create(
+                agent_name=name,
+                prompt=prompt,
+                worktree=strategy,
+                permission_profile=profile_name,
+                confirm_in_place=confirmed,
+            )
         except RunError as exc:
             self.notify(str(exc), severity="error", timeout=8)
             return
@@ -319,9 +342,16 @@ class RunConsoleScreen(Screen):
 
     #: (tab id, label). Short labels so all ten still fit/scroll at 80 columns.
     TABS = [
-        ("overview", "Overview"), ("reasoning", "Reasoning"), ("plan", "Plan"),
-        ("commands", "Commands"), ("files", "Files"), ("diff", "Diff"), ("tests", "Tests"),
-        ("messages", "Messages"), ("usage", "Usage"), ("raw", "Raw Events"),
+        ("overview", "Overview"),
+        ("reasoning", "Reasoning"),
+        ("plan", "Plan"),
+        ("commands", "Commands"),
+        ("files", "Files"),
+        ("diff", "Diff"),
+        ("tests", "Tests"),
+        ("messages", "Messages"),
+        ("usage", "Usage"),
+        ("raw", "Raw Events"),
     ]
 
     def __init__(self, run_id: str) -> None:
@@ -428,8 +458,9 @@ class RunConsoleScreen(Screen):
         status = enum_value(status)
         colour = {"completed": "green", "failed": "red", "cancelled": "yellow"}.get(status, "cyan")
         phase = p.phase or (run.phase if run else "")
-        elapsed = _elapsed(p.started_at or (run.started_at.isoformat() if run else ""),
-                           p.completed_at)
+        elapsed = _elapsed(
+            p.started_at or (run.started_at.isoformat() if run else ""), p.completed_at
+        )
         workspace = p.workspace or (run.worktree or run.workspace if run else "")
 
         self.query_one("#status", Static).update(
@@ -483,8 +514,10 @@ class RunConsoleScreen(Screen):
             blocks += [f"{_mark(i.status)} {safe_line(self._title(i), 60)}" for i in active[-5:]]
         if p.error:
             blocks.append("\n[b][red]Failure[/red][/b]")
-            blocks.append(f"[red]{safe_markup(p.error.get('error_type'), 40)}[/red]: "
-                          f"{safe_markup(p.error.get('message'), 400)}")
+            blocks.append(
+                f"[red]{safe_markup(p.error.get('error_type'), 40)}[/red]: "
+                f"{safe_markup(p.error.get('message'), 400)}"
+            )
             if p.error.get("phase"):
                 blocks.append(f"[dim]phase: {safe_markup(p.error.get('phase'), 30)}[/dim]")
         return "\n".join(blocks)
@@ -541,8 +574,10 @@ class RunConsoleScreen(Screen):
         for item in p.files:
             c = colour.get(item.change, "white")
             failed = " [red](patch failed)[/red]" if item.failed else ""
-            out.append(f"{_mark(item.status)} [{c}]{safe_line(item.change, 12)}[/{c}] "
-                       f"{safe_line(item.path, 80)}{failed}")
+            out.append(
+                f"{_mark(item.status)} [{c}]{safe_line(item.change, 12)}[/{c}] "
+                f"{safe_line(item.path, 80)}{failed}"
+            )
         return "\n".join(out)
 
     def _tests(self, p: RunProjection) -> str:
@@ -550,8 +585,10 @@ class RunConsoleScreen(Screen):
         if not tests.get("ran"):
             return "[dim]No tests were run.[/dim]"
         verdict = "[green]passed[/green]" if tests.get("passed") else "[red]failed[/red]"
-        return (f"Command: {safe_line(tests.get('command'), 90)}\n"
-                f"Result: {verdict} (exit {tests.get('exit_code')})")
+        return (
+            f"Command: {safe_line(tests.get('command'), 90)}\n"
+            f"Result: {verdict} (exit {tests.get('exit_code')})"
+        )
 
     def _messages(self, p: RunProjection) -> str:
         if not p.messages:
@@ -576,8 +613,10 @@ class RunConsoleScreen(Screen):
         if u.get("provider_cost") is not None:
             lines.append(f"Provider cost:    {u['provider_cost']}")
         lines.append("")
-        lines.append("[dim]Reasoning tokens are counted by the provider. Their content is never "
-                     "requested or stored.[/dim]")
+        lines.append(
+            "[dim]Reasoning tokens are counted by the provider. Their content is never "
+            "requested or stored.[/dim]"
+        )
         return "\n".join(lines)
 
     def _render_artifacts(self) -> None:
@@ -593,8 +632,10 @@ class RunConsoleScreen(Screen):
             lines = oa.runs.output(self.run_id, "events").splitlines()
         except RunError:
             lines = []
-        header = ("# Diagnostic output. Redaction already happened before these lines were written "
-                  "to disk.\n")
+        header = (
+            "# Diagnostic output. Redaction already happened before these lines were written "
+            "to disk.\n"
+        )
         raw.text = header + "\n".join(lines[-500:])
 
     def _render_actions(self) -> None:
@@ -649,6 +690,12 @@ class RunConsoleScreen(Screen):
         event.input.value = ""
         self.query_one("#followup-row").display = False
         self.app.resume_run(self.run_id, prompt)  # type: ignore[attr-defined]
+        # Disable follow-up the instant the worker starts (§4.1), rather than waiting for the next
+        # refresh tick to notice the run went active. The per-run lock in RunService is the real
+        # guarantee — a second follow-up is rejected outright — but the UI must not offer an action
+        # it knows will be refused. ``_render_actions`` re-evaluates once the turn reaches a terminal
+        # state and follow-up becomes available again.
+        self.query_one("#follow", Button).disabled = True
         self._live = self.app.live_run(self.run_id)  # type: ignore[attr-defined]
         if self._live is not None:
             self.projection = self._live.projection

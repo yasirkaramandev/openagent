@@ -61,15 +61,25 @@ def app(tmp_path: Path) -> OpenAgentApp:
     (project / "seed.txt").write_text("seed\n")
     _git(["add", "-A"], project)
     _git(["commit", "-q", "-m", "init"], project)
-    a = OpenAgentApp(Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
-    ))
+    a = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "data",
+            config_dir=tmp_path / "config",
+            db_path=tmp_path / "data" / "openagent.db",
+            project_root=project,
+        )
+    )
     # A provider with a stored key so preflight passes offline (no live call).
-    a.providers.add(name="testco", provider_type="custom", base_url="https://api.test/v1",
-                    api_key="sk-x", store_key=True)
-    a.agents.create(name="api-coder", runtime_type=RuntimeType.API_AGENT, provider="testco",
-                    model="m")
+    a.providers.add(
+        name="testco",
+        provider_type="custom",
+        base_url="https://api.test/v1",
+        api_key="sk-x",
+        store_key=True,
+    )
+    a.agents.create(
+        name="api-coder", runtime_type=RuntimeType.API_AGENT, provider="testco", model="m"
+    )
     return a
 
 
@@ -88,10 +98,14 @@ async def test_stalled_api_run_cancels_with_single_terminal_event(
     assert enum_value(result.status) == "cancelled"
     assert adapter.aclosed, "the stalled stream must be torn down on cancel"
 
-    events = [json.loads(line) for line in
-              (app.paths.run_dir(run.id) / "events.jsonl").read_text().splitlines() if line.strip()]
-    terminals = [e["type"] for e in events
-                 if e["type"] in ("run.completed", "run.failed", "run.cancelled")]
+    events = [
+        json.loads(line)
+        for line in (app.paths.run_dir(run.id) / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    terminals = [
+        e["type"] for e in events if e["type"] in ("run.completed", "run.failed", "run.cancelled")
+    ]
     assert terminals == ["run.cancelled"], f"expected one run.cancelled, got {terminals}"
     assert events[-1]["type"] == "run.cancelled", "the terminal event must be the last log entry"
     assert json.loads(app.runs.output(run.id, "status"))["status"] == "cancelled"

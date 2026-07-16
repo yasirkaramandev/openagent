@@ -30,7 +30,9 @@ class ProviderRepository:
     def upsert(self, provider: ProviderConnection) -> None:
         payload = provider.model_dump(mode="json")
         with self.db.engine.begin() as conn:
-            conn.execute(sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider.id))
+            conn.execute(
+                sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider.id)
+            )
             conn.execute(
                 insert(t.provider_connections).values(
                     id=provider.id,
@@ -44,7 +46,9 @@ class ProviderRepository:
     def get(self, provider_id: str) -> ProviderConnection | None:
         with self.db.engine.connect() as conn:
             row = conn.execute(
-                select(t.provider_connections.c.data).where(t.provider_connections.c.id == provider_id)
+                select(t.provider_connections.c.data).where(
+                    t.provider_connections.c.id == provider_id
+                )
             ).first()
         return ProviderConnection.model_validate(row[0]) if row else None
 
@@ -57,12 +61,16 @@ class ProviderRepository:
 
     def list(self) -> Sequence[ProviderConnection]:
         with self.db.engine.connect() as conn:
-            rows = conn.execute(select(t.provider_connections.c.data).order_by(t.provider_connections.c.name)).all()
+            rows = conn.execute(
+                select(t.provider_connections.c.data).order_by(t.provider_connections.c.name)
+            ).all()
         return [ProviderConnection.model_validate(r[0]) for r in rows]
 
     def delete(self, provider_id: str) -> None:
         with self.db.engine.begin() as conn:
-            conn.execute(sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider_id))
+            conn.execute(
+                sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider_id)
+            )
 
 
 class ModelRepository:
@@ -148,12 +156,16 @@ class CliRepository:
 
     def get(self, cli_id: str) -> CliInstallation | None:
         with self.db.engine.connect() as conn:
-            row = conn.execute(select(t.cli_installations.c.data).where(t.cli_installations.c.id == cli_id)).first()
+            row = conn.execute(
+                select(t.cli_installations.c.data).where(t.cli_installations.c.id == cli_id)
+            ).first()
         return CliInstallation.model_validate(row[0]) if row else None
 
     def list(self) -> Sequence[CliInstallation]:
         with self.db.engine.connect() as conn:
-            rows = conn.execute(select(t.cli_installations.c.data).order_by(t.cli_installations.c.id)).all()
+            rows = conn.execute(
+                select(t.cli_installations.c.data).order_by(t.cli_installations.c.id)
+            ).all()
         return [CliInstallation.model_validate(r[0]) for r in rows]
 
     def delete(self, cli_id: str) -> None:
@@ -210,7 +222,9 @@ class SessionRepository:
     def upsert(self, session: Session) -> None:
         with self.db.engine.begin() as conn:
             conn.execute(
-                sa_delete(t.sessions).where(t.sessions.c.openagent_session_id == session.openagent_session_id)
+                sa_delete(t.sessions).where(
+                    t.sessions.c.openagent_session_id == session.openagent_session_id
+                )
             )
             conn.execute(
                 insert(t.sessions).values(
@@ -242,11 +256,18 @@ class EventIndexRepository:
             ).first()
         return ((row[0] if row else 0) or 0) + 1
 
-    def add(self, event_id: str, run_id: str, seq: int, type_: str, timestamp: str, source: str) -> None:
+    def add(
+        self, event_id: str, run_id: str, seq: int, type_: str, timestamp: str, source: str
+    ) -> None:
         with self.db.engine.begin() as conn:
             conn.execute(
                 insert(t.events).values(
-                    id=event_id, run_id=run_id, seq=seq, type=type_, timestamp=timestamp, source=source
+                    id=event_id,
+                    run_id=run_id,
+                    seq=seq,
+                    type=type_,
+                    timestamp=timestamp,
+                    source=source,
                 )
             )
 

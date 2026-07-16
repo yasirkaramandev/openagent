@@ -11,7 +11,8 @@ from openagent.workspaces.worktree import Workspace
 
 def _agent() -> AgentProfile:
     return AgentProfile(
-        name="a", runtime=AgentRuntime(type=RuntimeType.API_AGENT, provider="p", model="m"),
+        name="a",
+        runtime=AgentRuntime(type=RuntimeType.API_AGENT, provider="p", model="m"),
     )
 
 

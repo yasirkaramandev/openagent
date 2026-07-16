@@ -25,12 +25,15 @@ def app(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
     project.mkdir()
     paths = Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
+        data_dir=tmp_path / "data",
+        config_dir=tmp_path / "config",
+        db_path=tmp_path / "data" / "openagent.db",
+        project_root=project,
     )
     oa = OpenAgentApp(paths)
-    oa.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake",
-                     permission_profile="safe-edit")
+    oa.agents.create(
+        name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake", permission_profile="safe-edit"
+    )
     return oa
 
 
@@ -93,8 +96,9 @@ async def test_cancel_is_idempotent(app: OpenAgentApp, fake):
     assert app.runs.get(run.id).status == RunStatus.CANCELLED
 
 
-async def test_completed_run_not_marked_cancelled(app: OpenAgentApp, tmp_path: Path,
-                                                  monkeypatch: pytest.MonkeyPatch):
+async def test_completed_run_not_marked_cancelled(
+    app: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     adapter = FakeCliAdapter(write_fake_script(tmp_path), mode="complete")
     install_fake_cli(monkeypatch, adapter)
     run = app.runs.create(agent_name="fake-coder", prompt="quick", worktree="auto")

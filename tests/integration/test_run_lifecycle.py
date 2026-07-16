@@ -35,10 +35,14 @@ def oa(tmp_path: Path) -> OpenAgentApp:
     (project / "seed.txt").write_text("seed\n")
     _git(["add", "-A"], project)
     _git(["commit", "-q", "-m", "init"], project)
-    app = OpenAgentApp(Paths(
-        data_dir=tmp_path / "data", config_dir=tmp_path / "config",
-        db_path=tmp_path / "data" / "openagent.db", project_root=project,
-    ))
+    app = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "data",
+            config_dir=tmp_path / "config",
+            db_path=tmp_path / "data" / "openagent.db",
+            project_root=project,
+        )
+    )
     app.agents.create(name="fake-coder", runtime_type=RuntimeType.CLI, cli="fake")
     return app
 
@@ -49,8 +53,9 @@ def use_fake(oa: OpenAgentApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def _events(oa: OpenAgentApp, run_id: str) -> list[dict]:
-    return [json.loads(line) for line in
-            oa.runs.output(run_id, "events").splitlines() if line.strip()]
+    return [
+        json.loads(line) for line in oa.runs.output(run_id, "events").splitlines() if line.strip()
+    ]
 
 
 def _types(events: list[dict]) -> list[str]:
@@ -88,8 +93,13 @@ async def test_phases_are_reported_in_order(oa: OpenAgentApp, use_fake):
     await oa.runs.execute(run)
 
     phases = [e["data"]["phase"] for e in _events(oa, run.id) if e["type"] == "run.phase"]
-    assert phases[:5] == ["preflight", "preparing_workspace", "starting_backend", "running",
-                          "finalizing"]
+    assert phases[:5] == [
+        "preflight",
+        "preparing_workspace",
+        "starting_backend",
+        "running",
+        "finalizing",
+    ]
     assert oa.runs.get(run.id).phase == "completed"
 
 
@@ -135,8 +145,9 @@ async def test_terminal_event_is_the_last_log_entry_when_failed(
 # --------------------------------------------------------------------------- preflight gates (item 7)
 
 
-async def test_preflight_failure_prevents_execution(oa: OpenAgentApp,
-                                                    monkeypatch: pytest.MonkeyPatch):
+async def test_preflight_failure_prevents_execution(
+    oa: OpenAgentApp, monkeypatch: pytest.MonkeyPatch
+):
     """A missing CLI blocks the run — and the failure is *recorded*, not just warned about."""
 
     # The agent points at "fake", which is not registered: preflight cannot resolve it.
@@ -171,18 +182,29 @@ async def test_preflight_failure_prevents_execution(oa: OpenAgentApp,
 
 
 async def test_api_agent_with_missing_credential_is_blocked(tmp_path: Path):
-    app = OpenAgentApp(Paths(
-        data_dir=tmp_path / "d", config_dir=tmp_path / "c",
-        db_path=tmp_path / "d" / "o.db", project_root=tmp_path,
-    ))
+    app = OpenAgentApp(
+        Paths(
+            data_dir=tmp_path / "d",
+            config_dir=tmp_path / "c",
+            db_path=tmp_path / "d" / "o.db",
+            project_root=tmp_path,
+        )
+    )
     # A provider whose keychain secret was never stored: locally unconfigured, so it cannot run.
-    app.providers.add(name="testco", provider_type="custom", base_url="https://api.test/v1",
-                      api_key="sk-x", store_key=False)
-    app.agents.create(name="api-coder", runtime_type=RuntimeType.API_AGENT,
-                      provider="testco", model="m")
+    app.providers.add(
+        name="testco",
+        provider_type="custom",
+        base_url="https://api.test/v1",
+        api_key="sk-x",
+        store_key=False,
+    )
+    app.agents.create(
+        name="api-coder", runtime_type=RuntimeType.API_AGENT, provider="testco", model="m"
+    )
 
-    run = app.runs.create(agent_name="api-coder", prompt="go", worktree="none",
-                          permission_profile="read-only")
+    run = app.runs.create(
+        agent_name="api-coder", prompt="go", worktree="none", permission_profile="read-only"
+    )
     result = await app.runs.execute(run)
 
     assert result.status.value == "failed"
@@ -197,15 +219,22 @@ def test_in_place_editing_run_requires_explicit_confirmation(oa: OpenAgentApp):
     """`worktree=none` + an editing profile must not start without explicit consent (item 8)."""
 
     with pytest.raises(RunError, match="confirmation"):
-        oa.runs.create(agent_name="fake-coder", prompt="go", worktree="none",
-                       permission_profile="safe-edit")
+        oa.runs.create(
+            agent_name="fake-coder", prompt="go", worktree="none", permission_profile="safe-edit"
+        )
 
     # Read-only in place is fine — nothing can be edited.
-    ok = oa.runs.create(agent_name="fake-coder", prompt="go", worktree="none",
-                        permission_profile="read-only")
+    ok = oa.runs.create(
+        agent_name="fake-coder", prompt="go", worktree="none", permission_profile="read-only"
+    )
     assert ok.worktree_strategy == "none"
 
     # …and with explicit confirmation the editing run is allowed.
-    confirmed = oa.runs.create(agent_name="fake-coder", prompt="go", worktree="none",
-                               permission_profile="safe-edit", confirm_in_place=True)
+    confirmed = oa.runs.create(
+        agent_name="fake-coder",
+        prompt="go",
+        worktree="none",
+        permission_profile="safe-edit",
+        confirm_in_place=True,
+    )
     assert confirmed.worktree_strategy == "none"

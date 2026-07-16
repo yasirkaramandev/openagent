@@ -109,9 +109,7 @@ class RunCancellation:
         work = asyncio.ensure_future(awaitable)
         waiter = asyncio.ensure_future(self.wait())
         try:
-            done, _ = await asyncio.wait(
-                {work, waiter}, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, _ = await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)
             if work in done:
                 return work.result()
             work.cancel()
