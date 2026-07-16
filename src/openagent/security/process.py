@@ -217,23 +217,24 @@ def run_process_status(
 def terminate_pid_tree(
     pid: int | None, expected_create_time: float | None = None, *, grace: float = 3.0
 ) -> bool:
-    """Terminate a run's process tree by PID, verifying identity first (spec §45).
+    """Terminate a run's process tree by PID **only** if its identity verifies (spec §45, §6).
 
-    Guards against killing an unrelated process after PID reuse: when ``expected_create_time`` is
-    given, the live process's start time must match it (via :func:`run_process_status`). Idempotent —
-    returns ``False`` when the process is already gone or fails the identity check.
+    Fails closed: a kill happens only when :func:`run_process_status` says ``PID_ALIVE`` — i.e. the
+    PID exists *and* its start time matches the one recorded for this run. Gone, reused, or
+    unverifiable all return ``False`` and touch nothing. Idempotent.
+
+    A missing ``expected_create_time`` is **not** a licence to kill. Until v0.1.3 this function had a
+    second, weaker branch: with no recorded create-time it merely checked that the PID existed and
+    then terminated it. PIDs are recycled aggressively, so any run whose create-time was never
+    captured could take out a completely unrelated process that happened to inherit its number — the
+    exact hazard the identity check exists to prevent, and one the docstring claimed was handled.
+    ``run_process_status`` already classifies that case as ``PID_UNKNOWN``; this now honours it.
     """
 
     if not pid:
         return False
-    if expected_create_time is not None:
-        if run_process_status(pid, expected_create_time) != PID_ALIVE:
-            return False  # gone, reused, or unverifiable — do not touch it
-    else:
-        try:
-            psutil.Process(pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return False
+    if run_process_status(pid, expected_create_time) != PID_ALIVE:
+        return False  # gone, reused, or unverifiable — do not touch it
     terminate_process_tree(pid, grace=grace)
     return True
 

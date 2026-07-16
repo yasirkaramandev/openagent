@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import subprocess
 
-from ..security.command_policy import Decision, evaluate
+from ..security.command_policy import Decision, Purpose, evaluate
 from ..security.process import OutputLimitExceeded, minimal_environment, run_capture
 from .base import ToolContext, ToolError, ToolResult
 
@@ -26,8 +26,18 @@ _MAX_OUTPUT_BYTES = 20_000
 _DEFAULT_TIMEOUT = 300
 
 
-def _run(ctx: ToolContext, command: str, timeout: int) -> subprocess.CompletedProcess[str]:
-    policy = evaluate(command, network_allowed=ctx.profile.network_allowed)
+def _run(
+    ctx: ToolContext, command: str, timeout: int, purpose: Purpose = Purpose.COMMAND
+) -> subprocess.CompletedProcess[str]:
+    # The policy needs the profile AND the workspace to decide: without them it cannot tell an
+    # unattended-safe inspection from an interpreter, or a workspace path from /etc/passwd (spec §2).
+    policy = evaluate(
+        command,
+        network_allowed=ctx.profile.network_allowed,
+        workspace_root=ctx.workspace_root,
+        profile=ctx.profile,
+        purpose=purpose,
+    )
     if policy.decision is Decision.DENY:
         raise ToolError(f"command denied by policy: {policy.reason}")
     if policy.decision is Decision.APPROVAL:
@@ -79,7 +89,10 @@ def run_tests(
 ) -> ToolResult:
     if not ctx.profile.can_run_commands:
         raise ToolError("this permission profile does not allow running commands")
-    proc = _run(ctx, command, timeout)
+    # Purpose.TEST opens the structured test/build runner list (spec §2.3) — and only that list.
+    # "Run the project's tests" genuinely executes project code, so it is an explicit, named
+    # capability rather than something a generic run_command can reach unattended.
+    proc = _run(ctx, command, timeout, purpose=Purpose.TEST)
     output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT_BYTES]
     passed = proc.returncode == 0
     if ctx.emit:

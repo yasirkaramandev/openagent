@@ -106,7 +106,11 @@ def test_shell_interpreter_requires_approval(tmp_path: Path):
 def test_offlist_executable_requires_approval(tmp_path: Path):
     res = evaluate("nmap -spt. localhost")
     assert res.decision is Decision.APPROVAL
-    assert "allowlist" in res.reason
+    # The reason must name the offending executable so the approval prompt is actionable. (It used
+    # to say "not on the executable allowlist"; since v0.1.3 the auto-allow set is a narrow
+    # read-only inspection list rather than a broad allowlist, so the wording changed — the
+    # decision, which is what matters, did not.)
+    assert "nmap" in res.reason
 
 
 def test_shell_operators_require_approval():

@@ -1069,9 +1069,16 @@ class RunService:
             return CancelOutcome.SIGNALLED
 
         # Cross-process / after restart: terminate by PID with identity verification, then finalize.
+        # Order matters (§6). This used to persist ``cancelled`` *unconditionally* and only then
+        # report identity_mismatch — so a cancel that killed nothing still wrote run.cancelled,
+        # flipped the DB and rewrote status.json, while the real process (if any) kept running. A
+        # cancellation that did not happen must leave no trace: refuse first, record only on success.
         killed = terminate_pid_tree(run.pid, run.pid_started_at)
+        if not killed:
+            self._cancelled.discard(run_id)  # nothing was stopped; do not poison a later resolve
+            return CancelOutcome.IDENTITY_MISMATCH
         self._persist_cancelled(run, reason, "user_cancelled")
-        return CancelOutcome.TERMINATED if killed else CancelOutcome.IDENTITY_MISMATCH
+        return CancelOutcome.TERMINATED
 
     def _cancel_orphan(self, run: Run, reason: str) -> CancelOutcome:
         """Terminate the live process behind an ``orphaned_unattached_process`` run (§3.2).
