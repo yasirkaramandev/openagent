@@ -22,6 +22,7 @@ executes in an isolated **Git worktree**, an isolated **directory copy** (non-gi
 .openagent/runs/run_01ABC/
 ├── request.json   status.json   events.jsonl   output.md
 ├── result.json    logs.txt      changes.diff   tests.json   handoff.md
+└── timeline.md    integrity.json
 ```
 
 ## Status
@@ -43,10 +44,10 @@ capture), **Offline contract tested** (mocked transport), **Experimental**, **Un
 | **Antigravity (`agy`)** | **Verified live (read-only)**: the `--print --output-format json` envelope and `--conversation` resume were captured from `agy v1.1.0`, and re-exercised live on `agy v1.1.1` through OpenAgent in the [multi-agent demo](docs/multi-agent-weather-demo.md) (real runs, terminal states, `reasoning_tokens` from `thinking_tokens`). Model discovery is live via `agy models`. **Editing is experimental and off by default** — see [Antigravity permissions](#antigravity-permissions). Output is a single final JSON object, so events are **coarse** (final text + usage + status), never per-file/per-command. |
 | **Claude Code** | **Fixture validated** — the `stream-json` mapping and invocation are ready, but `claude` is not installed on this machine, so nothing here has been run against a live CLI. |
 | API agents (OpenAI Chat/Responses, Anthropic, OpenAI-compatible) | **Offline contract tested** end to end (mocked HTTP): tool loop, progress tools, cancellation, worktree diff, artifacts, redaction. **Not live-verified** against a paid key. Presets for DeepSeek/Qwen/Kimi/GLM/MiniMax/OpenRouter/Mistral/Together/Fireworks/Ollama/LM Studio share the compatible adapters and are **not individually live-verified**. |
-| **Run Console** (live reasoning/plan/commands/files/diff/tests/usage/raw events) | Pilot-tested on Textual 8.2.8 at 80×24, 100×30 and 120×40; the live-run, leave-and-reopen, cancel and resume paths are driven end to end with a real subprocess. The Codex side of it is the live verification above. |
+| **Run Console** (live reasoning/plan/commands/files/diff/tests/usage/raw events) | Pilot-tested on Textual 8.2.8 at 120×40, 100×30, 80×24, 70×20, 60×18, 50×14 and 40×12, including focus visibility, page/home/end, mouse wheel, resize, fixed actions, long modals and explicit follow-output behavior. |
 | TUI Add-Agent **wizard** | Pilot-tested with **real keyboard input** (Space selects, Enter advances): CLI and API paths, masked key cleared on every transition, connections filtered to the provider family, credentials validated on the connection step, `max_steps` bounded. **Model discovery** per backend — API providers via their models endpoint, Antigravity via `agy models`; CLIs that can't list models (Codex/Claude) fall back honestly to a manual id or the CLI's own default. |
 | Security (minimal env, command allowlist, worktree/copy/in-place isolation, redaction, process-tree cancel, PID-identity recovery, sandboxed credential commands, streaming output bound, exact keychain rollback) | Unit + integration tested (see `tests/`). |
-| **OS-level sandbox** | **Unsupported.** OpenAgent isolates by *workspace* (git worktree / copy), not by kernel sandbox. A CLI backend may bring its own (Codex `--sandbox`), and OpenAgent maps profiles onto it — but OpenAgent itself does not sandbox processes. |
+| **Execution isolation** | `host-restricted` is a policy/approval boundary, **not** an OS sandbox. The opt-in `container-sandbox` gives API-agent tool commands a no-network, read-only-root Docker/Podman container with tmpfs workspace/resource limits and no host mount. Long-lived CLI adapters are currently refused under this backend rather than silently falling back to the host. |
 | **Gemini** | **Not part of v0.1.** |
 
 Everything except the live-CLI/live-API rows runs in the **offline test suite in CI**
@@ -78,6 +79,14 @@ openagent
 git clone https://github.com/yasirkaramandev/openagent.git
 cd openagent
 setup.bat
+```
+
+Or from PowerShell:
+
+```powershell
+git clone https://github.com/yasirkaramandev/openagent.git
+cd openagent
+.\setup.ps1
 ```
 
 After it finishes:
@@ -116,6 +125,8 @@ git pull
 setup.bat
 ```
 
+PowerShell users can run `git pull; .\setup.ps1` instead.
+
 ### Developer install (contributors only)
 
 This is **not** the end-user install. To hack on OpenAgent itself, use a manual editable environment
@@ -136,8 +147,8 @@ python -m pip install -e ".[dev]"
   new shells. The installer also prints the exact executable path it linked.
 - **`permission denied` running setup.sh** — run it as `bash setup.sh` (no execute bit needed), or
   `chmod +x setup.sh` first.
-- **Windows execution/path issue** — run `setup.bat` from CMD, or `.\setup.bat` from PowerShell; paths
-  with spaces are handled.
+- **Windows execution/path issue** — run `setup.bat` from CMD, `.\setup.bat` from PowerShell, or use
+  the native `.\setup.ps1`; paths with spaces are handled.
 - **A different `openagent` is already on PATH** — the installer detects and reports the existing
   command, and prints the path of the one it just installed.
 - **`doctor` warns about missing Codex/Claude/agy** — those are **optional** CLIs; their absence is a
@@ -173,6 +184,47 @@ openagent output --id <run-id> --format diff
 openagent message --id <run-id> -p "now add a test"
 openagent cancel --id <run-id>
 ```
+
+An unverified model override always needs an auditable reason:
+
+```bash
+openagent add --name experimental --provider deepseek-main --model <model-id> \
+  --allow-unverified-model --model-override-reason "manual compatibility review"
+```
+
+### v0.1.3 integrity and isolation boundaries
+
+- **Project scope:** `.openagent/project.json` gives a project a stable UUID. Run listing, replay,
+  output, cancel, resume and orphan recovery default to the active project; cross-project operations
+  need explicit `--all-projects`. Use `openagent project list` and `openagent project relocate` for
+  moved or missing roots.
+- **Authoritative events:** full event bodies and sequence allocation live in SQLite in one write
+  transaction. `events.jsonl` is an atomic export, not the source of truth. `openagent events repair`
+  regenerates it; Doctor reports gaps, duplicates, terminal-count errors and DB/export mismatches.
+- **Migrations:** revisions are immutable and forward-only. Upgrades use `BEGIN IMMEDIATE`, create an
+  online SQLite backup, then run integrity, foreign-key and critical row-count checks. Unknown
+  revisions fail closed and an interrupted revision never advances the recorded version.
+- **Model probes:** verification is keyed by provider/model/endpoint/protocol/opaque credential
+  revision/probe version and expires after 24 hours. Catalog membership is not capability evidence;
+  expiry, key rotation or provider changes invalidate the verdict.
+- **Execution backends:** `host-restricted` blocks automatic interpreter/general-shell execution and
+  approval-gates unsafe paths/operators, but it is not a kernel sandbox. `container-sandbox`
+  requires an explicitly named, already-local Linux image with `/bin/sh` and Docker or Podman. It
+  never pulls/builds, mounts a host path or falls back to the host; it rejects `--worktree none` and
+  applies network `none`, read-only root, dropped capabilities, no-new-privileges, 2 CPU, 2 GiB
+  memory/swap, 256 PID, 1 GiB workspace and 256 MiB `/tmp` limits. In v0.1.3 this backend is for
+  API-agent tool commands; long-lived CLI adapters are refused under it.
+- **Git/index integrity:** diff/status reads use NUL-delimited porcelain without mutating the user's
+  index. Cleanup only removes worktrees/branches carrying OpenAgent ownership metadata. Optional
+  agent commits require a clean OpenAgent-created worktree; in-place user changes are never
+  committed. `openagent revert --id <run-id>` creates a revert commit.
+- **Orphans and reruns:** cancelled/orphaned runs are terminal and never resume under the same ID.
+  `openagent rerun --id <run-id>` allocates a new run. Cross-process cancellation changes state only
+  after PID/create-time/executable/command identity proves the process tree terminated.
+- **Secrets and TUI:** exact secrets are run-scoped and reference-counted; display sanitization is
+  control removal → redaction → byte limit → single-line normalization → markup escaping. Password
+  widgets are wiped on source/provider changes, success, failure, cancellation, unmount and worker
+  termination. Responsive screens keep a scroll body and fixed actions down to 40×12.
 
 ## NVIDIA Build
 
@@ -230,7 +282,8 @@ openagent provider probe nvidia-build --model <publisher/model> --json
 key is valid. Pass `--model <id>` to make it run a real probe.
 
 **Create an agent and run it.** Creating an agent on an unvalidated catalog model is refused — pass
-`--allow-unverified-model` to override explicitly (the agent is then flagged as unverified):
+`--allow-unverified-model` plus `--model-override-reason` to override explicitly (the agent is then
+flagged as overridden, never Verified):
 
 ```bash
 openagent add \
@@ -245,6 +298,9 @@ openagent run --name nvidia-coder --worktree auto \
 openagent output --id <run-id> --format json
 openagent output --id <run-id> --format events
 ```
+
+If you intentionally skip/override validation, add both
+`--allow-unverified-model --model-override-reason "…"` to the `openagent add` command.
 
 > The model id above is an example. Catalogs rotate — list the catalog and probe a current model
 > rather than trusting a hardcoded id.
@@ -328,14 +384,15 @@ Runtimes:       API agent loop (own tools)   │   CLI adapters (codex, claude, 
                         │
 Workspace:      git worktree · permission profiles · command policy · secret redaction
                         │
-Storage:        SQLite (index) · events.jsonl (source of truth) · projection · artifacts
+Storage:        SQLite (authoritative events + sequence) · JSONL export · projection · artifacts
 ```
 
 Every run emits exactly one `run.started` (OpenAgent's — a backend process coming up is a separate
 `process.started`), then `run.phase` transitions
 (`preflight → preparing_workspace → starting_backend → running → finalizing`), then exactly one
-terminal event per turn. `events.jsonl` is append-only; readers *project* it into current state keyed
-by `(source, turn, item_id)`, which is what makes a run reopenable and what stops an updated plan
+terminal event per turn. SQLite is authoritative; an atomic `events.jsonl` export mirrors it. Readers
+*project* the database stream into current state keyed by `(source, turn, item_id)`, which is what
+makes a run reopenable and what stops an updated plan
 from becoming five plans.
 
 * **Providers vs. Agents.** A *provider* is an API account (no prompt, no role). An *agent* binds a
@@ -343,12 +400,12 @@ from becoming five plans.
   stored once.
 * **Dynamic models.** Model IDs are never hardcoded — OpenAgent discovers them and probes
   capabilities per model.
-* **Safety first (policy-level, not an OS sandbox).** Every file-changing run happens in an isolated
+* **Safety first, with explicit boundaries.** Every file-changing run happens in an isolated
   worktree/copy, so your real project is untouched until you apply. Commands run in a minimal
   environment (no inherited secrets) behind an executable **allowlist** with approval gating; secrets
   are redacted from every artifact — including the prompt and the diff — and never passed as command
-  arguments. v0.1 does **not** add a kernel-level network/filesystem sandbox around subprocesses —
-  see [SECURITY.md](SECURITY.md) for the exact boundary.
+  arguments. `host-restricted` remains a policy layer; the opt-in container backend provides an OS
+  boundary for API-agent tool commands. See [SECURITY.md](SECURITY.md) for the exact boundary.
 
 ## Permission profiles
 
@@ -416,7 +473,8 @@ artifact (prompt and diff included).
 The same checks run in [GitHub Actions](.github/workflows/ci.yml) on every push and pull request:
 `ruff` + `mypy` + the full offline `pytest` suite on Ubuntu (Python 3.10 / 3.11 / 3.12), a package
 build, and a clean-venv wheel-install + entrypoint check, plus cross-platform smoke jobs on macOS and
-Windows. The offline suite requires **no API keys and no installed CLIs** — CLI runs are exercised
+Windows, real Unix/Windows installers, a v0.1.2 wheel/DB upgrade-and-backup-restore job, and a real
+Docker sandbox job. The offline suite requires **no API keys and no installed CLIs** — CLI runs are exercised
 with a real-subprocess fake, and providers with mocked HTTP.
 
 ## License

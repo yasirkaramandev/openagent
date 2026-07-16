@@ -5,14 +5,15 @@ guardrails it enforces, and how to report issues.
 
 ## Threat model & scope (read this first)
 
-v0.1 enforces its guardrails at the **policy / approval layer** and through **workspace copies**, not
-through an OS-level sandbox. Concretely:
+The default `host-restricted` backend enforces guardrails at the **policy / approval layer** and
+through workspace isolation; it is not an OS sandbox. An explicitly selected `container-sandbox`
+adds a Docker/Podman boundary for structured API-agent tool commands. Concretely:
 
-- There is **no OS-level network namespace or firewall**. A "no-network" profile does not block
+- Under `host-restricted` there is **no OS-level network namespace or firewall**. A "no-network" profile does not block
   sockets at the kernel level — it routes network-*oriented* commands (`curl`, `pip install`,
   `git clone`, …) through **approval**. Once a command is approved, or if an agent runs an
   allowlisted binary that happens to open a socket, nothing at the OS level prevents that.
-- There is **no OS-level filesystem sandbox** (no chroot/jail/seccomp) around child commands.
+- Under `host-restricted` there is **no OS-level filesystem sandbox** around child commands.
   OpenAgent's *own* filesystem tools (`read_file`, `write_file`, `apply_patch`, …) validate every
   path to stay inside the workspace and reject traversal/symlink escapes — but that validation does
   **not** extend to subprocess commands. A shell command runs with its working directory set to the
@@ -23,8 +24,14 @@ through an OS-level sandbox. Concretely:
   sandbox/permission flags (e.g. Codex `--sandbox`). Any real OS sandboxing there is provided and
   enforced by the CLI, not by OpenAgent.
 
-If you need hard OS-level isolation in v0.1, run OpenAgent inside a container or VM. Real
-cross-platform sandboxing is tracked for a later milestone.
+`container-sandbox` is opt-in and fail-closed: Docker is preferred then Podman, the user must name an
+already-local Linux image containing `/bin/sh`, and OpenAgent never pulls, builds or falls back to
+the host. It rejects in-place workspaces, copies only no-follow regular files into a quota-limited
+`/workspace` tmpfs, mounts no host path, disables network, uses a read-only root filesystem, drops
+all capabilities, enables no-new-privileges, and limits the container to 2 CPU, 2 GiB memory/swap,
+256 PIDs, 1 GiB workspace and 256 MiB `/tmp`. In v0.1.3 long-lived streaming CLI adapters are
+refused under this backend; use it for API-agent tool execution or run OpenAgent itself in a
+separately managed container/VM.
 
 ## Credentials
 
@@ -34,6 +41,9 @@ cross-platform sandboxing is tracked for a later milestone.
   as command-line arguments.
 - For CLI subprocesses, a run's credential is injected **only into the child process environment**;
   the parent process environment is not used to carry provider keys.
+- Provider/keychain/agent/`OPENAGENT.md` changes use a secret-free compensating-operation journal.
+  Startup completes or compensates interrupted operations; a provider secret is never irreversibly
+  deleted before its database transaction is durable.
 
 ## Secret redaction
 
@@ -42,8 +52,11 @@ Every string written to a run artifact passes through a redactor before it hits 
 `logs.txt`, `output.md`, `handoff.md`, and **`changes.diff`** (a diff can easily contain a pasted
 secret). The redactor masks common secret shapes (`sk-…`, `Bearer …`, `Authorization: …`,
 `*_API_KEY=…`, GitHub tokens) and also scrubs **exact key values registered at runtime** — required
-for provider keys whose format has no recognizable prefix. Run artifacts are written with owner-only
-permissions where the platform supports it.
+for provider keys whose format has no recognizable prefix. Exact secrets are scoped to a run/call,
+thread-safe and reference-counted. Display text is processed in the fixed order control removal →
+redaction → byte limit → single-line normalization → markup escaping. Password widgets are wiped on
+success, failure, cancellation, source/provider change, worker termination, unmount and shutdown.
+Run artifacts are written with owner-only permissions where the platform supports it.
 
 ## Workspace isolation
 
@@ -57,10 +70,11 @@ Three explicit strategies (`--worktree`):
 - **`none`** — runs directly in your project directory; file-editing agents require **explicit
   confirmation** (`-y`) because there is no isolation.
 
-OpenAgent's own filesystem tool paths are validated to stay inside the workspace (path-traversal /
-symlink escapes are rejected). **This does not apply to subprocess commands** — an allowlisted or
-approved command runs with its cwd set to the workspace but is not otherwise confined, so isolation
-of your real project comes from the worktree/copy, not from blocking the command.
+OpenAgent's own filesystem/copy/diff/artifact paths go through one no-follow walker with file/type,
+count, byte, deadline and cancellation budgets; symlinks, junctions, FIFOs, sockets and devices are
+not traversed. **This does not confine host subprocesses** — an approved command runs with its cwd
+set to the workspace but is not otherwise confined, so isolation of your real project comes from
+the worktree/copy, not from blocking the command.
 
 ## Command policy
 
@@ -69,8 +83,10 @@ keys, `GITHUB_TOKEN`, AWS keys, `DATABASE_URL`, etc. cannot leak into a child) a
 and a structured argument list. The **primary boundary is an executable allowlist**, not a regex
 denylist:
 
-- **Allowed** — only known-safe executables (language runtimes/package managers, build/test/lint
-  tools, a git subset, common read/inspect utilities).
+- **Allowed automatically** — only narrow, structured operations. `run_tests` accepts exact argv
+  shapes for pytest, `python -m pytest`, npm/pnpm/yarn, cargo, go and dotnet tests. A chain,
+  redirection or second executable loses test authority. General interpreters/shells/Git/file
+  utilities are never automatically trusted merely because of their executable name.
 - **Requires approval** — any executable *not* on the allowlist, shell interpreters (`sh`, `bash`…),
   shell-operator commands (pipes/redirects/subshells), destructive verbs (`rm -rf`, `git reset
   --hard`, `git clean`, disk-level ops), and **network-oriented commands** under a no-network
@@ -86,12 +102,25 @@ non-interactive run **denies** high-risk operations by default and never silentl
 
 ## Process management
 
-CLI subprocesses run with a minimal environment. Cancelling a run terminates the **entire process
-tree** (graceful `SIGTERM` → force `SIGKILL`); the target PID's start time is verified first so a
-reused PID can never cause an unrelated process to be killed. Timeouts also terminate the whole tree.
-PIDs and session ids are persisted the moment they arrive, so a run can be cancelled or recovered
-after a restart; if OpenAgent exits unexpectedly, orphaned runs are detected and marked on the next
-launch.
+CLI subprocesses run with a minimal environment. A process identity contains PID, creation time,
+resolved executable and command identity. Cancelling terminates the **entire process tree**
+(graceful terminate → survivor kill → second verification); only a verified `terminated` result may
+change cross-process run state. Identity mismatch/unknown, access denied, termination failure and
+remaining survivors are explicit outcomes. Cancelled/orphaned runs are terminal; rerun creates a new
+ID. Startup orphan recovery is project-scoped and uses compare-and-set so racing processes produce
+one transition/terminal event.
+
+## Storage, Git, and output integrity
+
+- SQLite stores complete event JSON and allocates `(run_id, seq)` in the same write transaction.
+  JSONL is an atomic export; Doctor checks continuity, duplicates, terminal counts and export drift.
+- Immutable forward-only migrations use `BEGIN IMMEDIATE`, SQLite online backup, integrity/FK checks
+  and critical row-count verification. Unknown revisions and interrupted upgrades fail closed.
+- Git status/diff parsing is NUL-delimited and never stages, resets or otherwise mutates the user's
+  index. Cleanup requires OpenAgent ownership metadata. Optional commits are limited to clean,
+  OpenAgent-created worktrees; in-place user changes are never committed.
+- Untrusted model/tool/event/CLI/provider/diff/projection surfaces have central byte/count limits.
+  Limit handling is explicit (`truncated=true` or `output_limit_exceeded`), never silent.
 
 ## Reasoning privacy
 

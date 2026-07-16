@@ -228,7 +228,8 @@ def _require_verified_model(
     if probe.category != PROBE_VERIFIED:
         _fail(
             f"model {model!r} is not verified agent-compatible ({probe.category}): {probe.message()}\n"
-            "Choose another model, or pass --allow-unverified-model to create it anyway."
+            "Choose another model, or pass --allow-unverified-model with "
+            "--model-override-reason to create it anyway."
         )
 
 

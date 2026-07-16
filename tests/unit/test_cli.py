@@ -156,6 +156,22 @@ def test_runs_empty():
     assert result.exit_code == 0
 
 
+def test_machine_readable_list_outputs_are_json_roundtrippable():
+    import json
+
+    commands = (
+        ["runs", "--json"],
+        ["provider", "list", "--json"],
+        ["agent", "list", "--json"],
+        ["doctor", "--json"],
+        ["project", "list", "--json"],
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, f"{command}: {result.stdout} {result.stderr}"
+        json.loads(result.stdout)
+
+
 # --------------------------------------------------------------------------- CLI agent --model (item 10)
 
 

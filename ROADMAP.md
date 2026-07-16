@@ -7,8 +7,8 @@ of real usage data.
 ## v0.1 — Working core ✅
 
 - `openagent` TUI + `openagent` CLI (init, add, agent/provider management, run, output, doctor)
-- SQLite storage, OS-keychain credentials, run IDs, `events.jsonl`, `output.md`, `result.json`,
-  `timeline.md`
+- SQLite-authoritative events/projects/migrations, OS-keychain credentials, run IDs, atomic JSONL
+  export, `output.md`, `result.json`, `timeline.md`, and artifact integrity hashes
 - **Live Run Console**: readiness preflight, then reasoning summaries, plan, commands, files, diff,
   tests, messages, usage and raw events — closable and reopenable without stopping the run
 - Isolated git worktrees + permission profiles; explicit confirmation before editing in place
@@ -23,7 +23,8 @@ of real usage data.
 
 ### Known limits in v0.1
 
-- **No OS-level sandbox.** Isolation is by workspace (worktree/copy) and by policy, not by kernel.
+- `host-restricted` is not an OS sandbox. The opt-in container backend currently isolates structured
+  API-agent tool commands; long-lived CLI-adapter container execution remains a known limit.
 - **API agents are not live-verified** — offline contract tests only.
 - **Claude Code is fixture-only** — not run against an installed `claude`.
 - **Antigravity editing is experimental** and requires an explicit opt-in; its `--print` output is a

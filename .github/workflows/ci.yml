@@ -99,10 +99,107 @@ jobs:
           tests/unit/test_tui_add_agent.py
           tests/unit/test_tui_provider.py
           tests/unit/test_tui_modals.py
+          tests/unit/test_tui_live_retention.py
+          tests/unit/test_tui_responsive.py
           tests/unit/test_markup_safety.py
           tests/unit/test_projection.py
           tests/integration/test_tui_run.py
           tests/integration/test_tui_ask_user.py
+
+  container-sandbox:
+    name: container-sandbox (real Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      # CI explicitly provisions the local image. The OpenAgent backend itself is then tested with
+      # pulls/builds disabled and receives only this already-present image name.
+      - name: Provision local Linux sandbox image
+        run: docker build -t openagent-sandbox-ci tests/fixtures/container
+
+      - name: Exercise no-network tmpfs sandbox through the real service backend
+        env:
+          OPENAGENT_REAL_CONTAINER: "1"
+          OPENAGENT_CONTAINER_RUNTIME: docker
+          OPENAGENT_CONTAINER_IMAGE: openagent-sandbox-ci
+        run: pytest -q -m container tests/integration/test_container_sandbox_real.py
+
+  wheel-lifecycle:
+    name: wheel fresh + v0.1.2 upgrade/backup restore
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build current and tagged v0.1.2 wheels
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir "$RUNNER_TEMP/current-dist"
+          mkdir -p "$RUNNER_TEMP/v012-src" "$RUNNER_TEMP/v012-dist"
+          git archive v0.1.2 | tar -x -C "$RUNNER_TEMP/v012-src"
+          python -m build "$RUNNER_TEMP/v012-src" --outdir "$RUNNER_TEMP/v012-dist"
+
+      - name: Fresh current-wheel install in a sandbox HOME
+        run: |
+          python -m venv "$RUNNER_TEMP/fresh"
+          "$RUNNER_TEMP/fresh/bin/pip" install "$RUNNER_TEMP"/current-dist/*.whl
+          mkdir -p "$RUNNER_TEMP/fresh-home" "$RUNNER_TEMP/fresh-data" "$RUNNER_TEMP/fresh-config"
+          HOME="$RUNNER_TEMP/fresh-home" OPENAGENT_DATA_DIR="$RUNNER_TEMP/fresh-data" \
+            OPENAGENT_CONFIG_DIR="$RUNNER_TEMP/fresh-config" \
+            "$RUNNER_TEMP/fresh/bin/openagent" version
+
+      - name: Create a real v0.1.2 DB, upgrade it, and reopen its online backup copy
+        run: |
+          python -m venv "$RUNNER_TEMP/upgrade"
+          "$RUNNER_TEMP/upgrade/bin/pip" install "$RUNNER_TEMP"/v012-dist/*.whl
+          mkdir -p "$RUNNER_TEMP/upgrade-home" "$RUNNER_TEMP/upgrade-data" \
+            "$RUNNER_TEMP/upgrade-config" "$RUNNER_TEMP/legacy-project"
+          export HOME="$RUNNER_TEMP/upgrade-home"
+          export OPENAGENT_DATA_DIR="$RUNNER_TEMP/upgrade-data"
+          export OPENAGENT_CONFIG_DIR="$RUNNER_TEMP/upgrade-config"
+          export LEGACY_PROJECT="$RUNNER_TEMP/legacy-project"
+          "$RUNNER_TEMP/upgrade/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          from openagent.app import OpenAgentApp
+          from openagent.core.models import RuntimeType
+          app = OpenAgentApp.create(Path(os.environ["LEGACY_PROJECT"]))
+          app.agents.create(name="legacy-agent", runtime_type=RuntimeType.CLI, cli="codex")
+          PY
+          "$RUNNER_TEMP/upgrade/bin/pip" install --upgrade --force-reinstall \
+            "$RUNNER_TEMP"/current-dist/*.whl
+          "$RUNNER_TEMP/upgrade/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          from openagent.app import OpenAgentApp
+          app = OpenAgentApp.create(Path(os.environ["LEGACY_PROJECT"]))
+          assert app.agents.get("legacy-agent") is not None
+          PY
+          backup=$(find "$RUNNER_TEMP/upgrade-data" -name '*.bak' -print -quit)
+          test -n "$backup"
+          cp "$backup" "$RUNNER_TEMP/restored.db"
+          RESTORED_DB="$RUNNER_TEMP/restored.db" "$RUNNER_TEMP/upgrade/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          from openagent.storage.db import Database
+          from openagent.storage.migrations import LATEST_VERSION, current_version
+          db = Database.open(Path(os.environ["RESTORED_DB"]))
+          with db.engine.begin() as conn:
+              assert current_version(conn) == LATEST_VERSION
+              assert conn.exec_driver_sql("SELECT COUNT(*) FROM agents").scalar() == 1
+          PY
 
   # Cross-platform smoke: install, build, entrypoint, and the platform-sensitive smoke tests
   # (path handling, process management, keyring fallback, TUI import/startup).
@@ -270,3 +367,42 @@ jobs:
           set "UV_TOOL_BIN_DIR=%RUNNER_TEMP%\uv2\bin"
           call "%DEST%\setup.bat" || exit /b 1
           "%RUNNER_TEMP%\uv2\bin\openagent.exe" version || exit /b 1
+
+  installer-powershell:
+    name: installer (windows-latest, setup.ps1)
+    runs-on: windows-latest
+    env:
+      OPENAGENT_SETUP_NO_LAUNCH: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # No actions/setup-python: setup.ps1 must bootstrap uv's managed Python itself.
+      - name: Isolate uv directories
+        shell: powershell
+        run: |
+          "UV_TOOL_DIR=$env:RUNNER_TEMP\uv-ps\tools" | Out-File $env:GITHUB_ENV -Append
+          "UV_TOOL_BIN_DIR=$env:RUNNER_TEMP\uv-ps\bin" | Out-File $env:GITHUB_ENV -Append
+          "UV_PYTHON_INSTALL_DIR=$env:RUNNER_TEMP\uv-ps\py" | Out-File $env:GITHUB_ENV -Append
+
+      - name: First PowerShell install and persisted-PATH verification
+        shell: powershell
+        run: .\setup.ps1
+
+      - name: Second install is an idempotent upgrade
+        shell: powershell
+        run: .\setup.ps1
+
+      - name: Install from a path containing spaces
+        shell: powershell
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP "Open Agent PowerShell Test"
+          Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -LiteralPath $PWD -Destination $destination -Recurse
+          Remove-Item -LiteralPath (Join-Path $destination ".venv") -Recurse -Force -ErrorAction SilentlyContinue
+          $env:UV_TOOL_DIR = "$env:RUNNER_TEMP\uv-ps2\tools"
+          $env:UV_TOOL_BIN_DIR = "$env:RUNNER_TEMP\uv-ps2\bin"
+          $env:UV_PYTHON_INSTALL_DIR = "$env:RUNNER_TEMP\uv-ps2\py"
+          & (Join-Path $destination "setup.ps1")
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:UV_TOOL_BIN_DIR\openagent.exe" version
+          if ($LASTEXITCODE -ne 0) { exit 1 }

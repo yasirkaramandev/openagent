@@ -4,6 +4,65 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] — 2026-07-16
+
+Security, data-integrity, project-scoping, responsive-TUI, and release hardening.
+
+### Added
+
+- **Execution backends** — default `host-restricted` policy execution plus an explicit
+  `container-sandbox` for structured API-agent tool commands. The container uses an already-local
+  Linux image, no host mount/network, read-only root, tmpfs workspace/`/tmp`, dropped capabilities,
+  no-new-privileges and CPU/memory/PID quotas. Missing images/runtimes and unsupported CLI adapters
+  fail closed without pull/build/host fallback.
+- **Stable projects** — `.openagent/project.json`, SQLite `projects`, active-project defaults,
+  explicit `--all-projects`, and `project list/relocate` for moved or missing roots.
+- **SQLite-authoritative events** — complete event bodies and transactional sequence allocation,
+  atomic JSONL export, Doctor consistency diagnostics, and `events repair`.
+- **Durable operation journal** for provider/keychain/agent/`OPENAGENT.md` mutations, with startup
+  compensation/completion and revision-scoped provider credential references.
+- **Model verification metadata** — persisted probe version/expiry/capability snapshot/fingerprints,
+  explicit override status and mandatory override reason. Catalog entries remain tri-state unknown.
+- **Artifact/Git provenance** — SHA-256 `integrity.json`, optional clean OpenAgent-worktree commits,
+  agent/model attribution, `rerun` with a new run ID, and `revert` via a new revert commit.
+- **Responsive TUI contract** — seven terminal sizes down to 40×12, fixed action bars, scrollable
+  modals, focus/page/home/end/mouse/resize behavior, explicit follow-output state, bounded LiveRun
+  retention and deterministic SVG snapshots.
+- **PowerShell installer** (`setup.ps1`) and CI jobs for a real Docker sandbox, v0.1.2 wheel/DB
+  upgrade plus backup restore, Windows PowerShell install, and fresh current-wheel install.
+
+### Changed
+
+- Migrations are an immutable `0001`–`0007` revision chain. Upgrades use `BEGIN IMMEDIATE`, SQLite
+  online backup, integrity/FK checks and critical row-count verification; unknown revisions and
+  interrupted upgrades fail closed.
+- All filesystem/copy/baseline/diff/artifact access uses a budgeted no-follow walker; atomic writes
+  use temp/write/flush/fsync/chmod/replace/directory-fsync.
+- API transport has fixed connect/read/write/pool/total timeouts, bounded Retry-After/retries,
+  cancellation-aware sleep, no retry after the first stream event, strict malformed/tool-call
+  failures and central byte/count limits.
+- All machine-readable CLI output goes directly through one JSON emitter; human warnings use stderr.
+
+### Fixed
+
+- Cross-process cancellation now verifies PID, creation time, executable and command identity,
+  terminates/kills survivors, then verifies again. Only `terminated` changes persisted run state.
+- General interpreters/shells/Git/file utilities no longer receive automatic test authority.
+  `run_tests` accepts only exact structured pytest/npm/pnpm/yarn/cargo/go/dotnet test argv shapes.
+- Git diff/status uses NUL-delimited porcelain without touching the user's index; cleanup requires
+  OpenAgent ownership metadata and in-place user changes are never committed.
+- Secret registration is run-scoped, thread-safe and reference-counted. Display sanitization and
+  every TUI password-widget exit/worker path now clear or redact secrets deterministically.
+- CLI stdout, final messages, provider errors, events, tool arguments, model/history text, diffs and
+  projections are bounded with visible truncation or `output_limit_exceeded` outcomes.
+
+### Known limitations
+
+- `container-sandbox` currently executes API-agent tool commands. Long-lived CLI adapters are
+  refused under this backend rather than silently running on the host.
+- Live provider/CLI audits remain environment/credential dependent and are reported separately from
+  the offline/real-container CI gates.
+
 ## [0.1.2] — 2026-07-16
 
 Orphan/resume hardening and NVIDIA Build integration.
@@ -151,3 +210,5 @@ First tagged release (alpha). Local-first control plane for AI APIs, coding CLIs
 - `agy` plan-mode reviews can exceed its print timeout on large multi-file prompts.
 
 [0.1.0]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.0
+[0.1.2]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.2
+[0.1.3]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.3

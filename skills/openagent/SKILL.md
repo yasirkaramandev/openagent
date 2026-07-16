@@ -247,7 +247,8 @@ Hard requirements:
 - **Never assume every NVIDIA catalog model is a chat model.** `provider models` reports
   `capabilities: null` for every entry — that is the truth, not a gap to fill in.
 - **Probe before creating a normal agent.** `openagent add` refuses an unprobed mixed-catalog model
-  unless `--allow-unverified-model` is passed, which produces a warning you must relay.
+  unless `--allow-unverified-model --model-override-reason "…"` is passed. An override is never
+  shown as Verified, and you must relay both the status and reason.
 - Treat embedding / rerank / vision models as **unverified** until capability testing. Name-based
   guesses are hints only, never verdicts.
 - `openagent provider test nvidia-build` only proves the **catalog is reachable** — it does not mean
@@ -277,9 +278,11 @@ Hard requirements:
   `openagent cancel --id <run-id>`, which verifies PID + create-time identity first.
 - NVIDIA Build's asynchronous (HTTP 202 + request id) model types are **not** supported by the chat
   runtime; they fail explicitly rather than returning an empty answer.
-- The NVIDIA capability-probe cache is per-process and expires after 24h, so a fresh CLI invocation
-  does not see a probe from a previous one — pass `--allow-unverified-model` for non-interactive
-  creation, and say so in your report.
+- Capability probes persist in SQLite for 24h. Provider/model/endpoint/protocol/credential revision
+  or probe-version changes invalidate them fail-closed. If overriding, pass both
+  `--allow-unverified-model` and `--model-override-reason`, and say so in your report.
+- `host-restricted` is a policy boundary, not an OS sandbox. The opt-in container backend currently
+  covers API-agent tool commands; it refuses long-lived CLI adapters instead of falling back to host.
 
 ## Complete example
 

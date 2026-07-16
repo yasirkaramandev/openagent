@@ -59,6 +59,10 @@ say "Installing OpenAgent from: $REPO_ROOT"
 # Note (not warn) any pre-existing `openagent` so a shadowed command is never a silent surprise (§4).
 PRE_EXISTING="$(command -v openagent 2>/dev/null || true)"
 [ -n "$PRE_EXISTING" ] && say "note: an 'openagent' command is already on PATH at $PRE_EXISTING"
+have git || warn "Git is not installed; git-worktree runs will fall back to isolated copies"
+if ! have docker && ! have podman; then
+    say "note: Docker/Podman is absent; optional container-sandbox runs will be unavailable"
+fi
 
 # --------------------------------------------------------------------------- 1. uv
 locate_uv() {

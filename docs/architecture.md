@@ -16,7 +16,7 @@ Runtimes        runtimes/api_agent/  — OpenAgent's own loop for API models
                         │
 Substrate       providers/  tools/  workspaces/  security/  credentials/
                         │
-Storage         storage/ (SQLite index)  ·  events.jsonl (source of truth)  ·  reporting/
+Storage         storage/ (SQLite authoritative events + revisions) · JSONL export · reporting/
 ```
 
 ## Key contracts
@@ -24,10 +24,13 @@ Storage         storage/ (SQLite index)  ·  events.jsonl (source of truth)  · 
 - **`ProviderAdapter`** (`providers/base.py`): `test_connection`, `list_models`, `probe_model`,
   `stream_response`, `count_tokens`. The agent loop speaks only normalized types.
 - **`CliAdapter`** (`runtimes/cli/base.py`): `detect`, `inspect_auth`, `capabilities`, `start_run`,
-  `resume_run`, `cancel`. Each maps native output to `NormalizedEvent`s via a **pure** function
+  `resume_run`, `cancel`. Cancellation returns a structured identity-verified termination result.
+  Each maps native output to `NormalizedEvent`s via a **pure** function
   (e.g. `map_codex_event`) that is unit-tested against recorded fixtures.
+- **`ExecutionBackend`** (`security/execution_backend.py`): `host-restricted` policy execution or an
+  explicitly selected local-image Docker/Podman tmpfs sandbox. Unsupported combinations fail closed.
 - **`NormalizedEvent`** (`core/events.py`): the shared vocabulary (`run.*`, `message.*`, `tool.*`,
-  `command.*`, `file.*`, `usage.updated`, …) written to `events.jsonl`.
+  `command.*`, `file.*`, `usage.updated`, …) stored in SQLite and atomically exported to JSONL.
 
 ## Data model separation
 
@@ -38,14 +41,16 @@ Storage         storage/ (SQLite index)  ·  events.jsonl (source of truth)  · 
 
 ## Run pipeline (`services/run_service.py`)
 
-1. Allocate a run id and emit the run's **one and only** `run.started`.
+1. Resolve the active stable project UUID, allocate a run id, and emit the run's **one and only**
+   `run.started`.
 2. **Preflight** (`services/preflight.py`): prove the agent can actually run — CLI present,
    executable, authenticated, adapter supports the requested mode (and for Codex: `codex exec` really
    accepts `--json` and the sandbox we are about to ask for); or, for an API agent: provider exists,
    credential ref valid, secret resolves, base URL resolves, model set, adapter constructs. A failed
    mandatory check blocks the run *before* a workspace exists.
 3. Create an isolated git worktree (`openagent/run_<id>`), or a temp copy for non-git projects.
-4. Dispatch to the API loop or a CLI adapter; stream `NormalizedEvent`s to `events.jsonl`.
+4. Dispatch to the API loop or a CLI adapter. Store each complete `NormalizedEvent` and allocate its
+   sequence in one SQLite write transaction; atomically refresh the JSONL export.
 5. Collect the diff, changed files, and test results.
 6. Write the standard bundle (including `timeline.md` and the structured sections of `result.json`)
    and set the final status.
@@ -65,8 +70,8 @@ it failed in, and a redacted message — landing in `events.jsonl`, `status.json
 
 ## Projection (`core/projection.py`)
 
-`events.jsonl` is append-only: a plan being ticked off, a command finishing, a patch failing each
-produce a *new* event. Readers therefore fold the log into current state, keyed by
+The SQLite event stream is append-only: a plan being ticked off, a command finishing, a patch failing
+each produce a *new* event. Readers therefore fold the stream into current state, keyed by
 `(source, turn, item_id)`.
 
 The turn is part of the key because a backend may restart its item numbering each turn — Codex does,

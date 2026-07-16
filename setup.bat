@@ -35,6 +35,8 @@ rem Note any pre-existing openagent so a shadowed command is never a silent surp
 for /f "delims=" %%p in ('where openagent 2^>nul') do (
     echo [openagent-setup] note: an 'openagent' command is already on PATH at %%p
 )
+where git >nul 2>&1 || echo [openagent-setup] warning: Git is not installed; git-worktree runs will fall back to isolated copies
+where docker >nul 2>&1 || where podman >nul 2>&1 || echo [openagent-setup] note: Docker/Podman is absent; optional container-sandbox runs will be unavailable
 
 rem --------------------------------------------------------------------- 1. uv
 echo [openagent-setup] [1/6] Locating uv

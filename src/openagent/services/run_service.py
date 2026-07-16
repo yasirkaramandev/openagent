@@ -215,6 +215,14 @@ class RunService:
                 raise RunError("container-sandbox refuses worktree 'none'")
             if not container_image:
                 raise RunError("container-sandbox requires --container-image with a local image")
+            if agent.runtime.type in (RuntimeType.CLI, RuntimeType.CLI.value):
+                # CLI adapters own a long-lived streaming process and cannot yet be launched through
+                # the one-shot structured command backend. Ignoring the selection and running on the
+                # host would be a security boundary violation, so this combination fails closed.
+                raise RunError(
+                    "container-sandbox currently supports API-agent tool commands only; "
+                    "CLI runs are refused rather than falling back to the host"
+                )
         if worktree == NONE and prof.can_edit_files and not confirm_in_place:
             raise RunError(
                 "worktree 'none' runs a file-editing agent directly in your project with no "

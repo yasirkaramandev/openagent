@@ -98,4 +98,5 @@ testpaths = ["tests"]
 markers = [
     "integration: opt-in tests that hit live APIs (require API keys in env)",
     "live_cli: tests that invoke a real installed CLI (codex/claude/…)",
+    "container: tests that require an explicitly provisioned local Docker/Podman image",
 ]
