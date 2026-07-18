@@ -245,15 +245,22 @@ class DoctorService:
                 issues.append(f"{run.id}: sequence discontinuity")
             if len(sequences) != len(set(sequences)):
                 issues.append(f"{run.id}: duplicate sequence")
-            terminals = self.app.repos.event_index.terminal_count(run.id)
-            terminal_status = run.status.value in {
-                "completed",
-                "failed",
-                "cancelled",
-                "orphaned",
+            terminal_types = self.app.repos.event_index.terminal_types(run.id)
+            status = run.status.value
+            allowed_by_status: dict[str, list[tuple[str, ...]]] = {
+                "completed": [("run.completed",)],
+                "failed": [("run.failed",)],
+                "orphaned": [("run.orphaned",)],
+                "cancelled": [
+                    ("run.cancelled",),
+                    ("run.orphaned", "run.cancelled"),
+                ],
             }
-            if terminals > 1 or (terminal_status and terminals != 1):
-                issues.append(f"{run.id}: terminal count {terminals}")
+            allowed = allowed_by_status.get(status, [()])
+            chain = tuple(terminal_types)
+            if chain not in allowed:
+                rendered = " -> ".join(terminal_types) if terminal_types else "none"
+                issues.append(f"{run.id}: invalid terminal chain {rendered} for {status}")
             path = self.app.runs.run_dir_for(run) / "events.jsonl"
             try:
                 exported = EventLog(path.parent).read_raw()

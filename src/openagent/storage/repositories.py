@@ -706,14 +706,24 @@ class EventIndexRepository:
         return [event.model_dump(mode="json") for event in self.read(run_id)]
 
     def terminal_count(self, run_id: str) -> int:
+        return len(self.terminal_types(run_id))
+
+    def terminal_types(self, run_id: str) -> list[str]:
+        """Terminal event types in durable sequence order, including duplicates.
+
+        A count cannot distinguish a corrupt pair such as ``completed, failed`` from the one valid
+        two-step terminal chain, ``orphaned, cancelled``. Doctor needs the ordered chain and must
+        retain duplicates so it can reject a repeated outcome explicitly.
+        """
+
         terminals = ("run.completed", "run.failed", "run.cancelled", "run.orphaned")
         with self.db.engine.connect() as conn:
-            row = conn.execute(
-                select(func.count())
-                .select_from(t.events)
+            rows = conn.execute(
+                select(t.events.c.type)
                 .where(t.events.c.run_id == run_id, t.events.c.type.in_(terminals))
-            ).first()
-        return int(row[0]) if row else 0
+                .order_by(t.events.c.seq)
+            ).all()
+        return [str(row[0]) for row in rows]
 
     def has_event_type(self, run_id: str, event_type: str) -> bool:
         """Whether this run already recorded an event of exactly ``event_type``.

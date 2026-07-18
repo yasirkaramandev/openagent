@@ -8,6 +8,7 @@ import pytest
 
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
+from openagent.core.events import EventType, NormalizedEvent
 from openagent.core.models import (
     AgentProfile,
     AgentRuntime,
@@ -15,9 +16,12 @@ from openagent.core.models import (
     CredentialType,
     Protocol,
     ProviderConnection,
+    Run,
+    RunStatus,
     RuntimeType,
 )
 from openagent.services.doctor_service import FAIL, OK, WARN
+from openagent.storage.event_log import EventLog
 
 
 def _app(tmp_path: Path) -> OpenAgentApp:
@@ -115,3 +119,28 @@ async def test_doctor_antigravity_status_line_when_installed(tmp_path: Path):
         status = checks["Antigravity adapter status"]
         assert "structured output: yes" in status.detail
         assert "resume: yes" in status.detail
+
+
+def test_doctor_accepts_orphaned_then_cancelled_terminal_chain(tmp_path: Path) -> None:
+    oa = _app(tmp_path)
+    run = Run(id="run_chain", agent="ghost", status=RunStatus.CANCELLED)
+    oa.repos.runs.upsert(run)
+    log = EventLog(oa.paths.run_dir(run.id), index=oa.repos.event_index, run_id=run.id)
+    log.append(NormalizedEvent(run_id=run.id, type=EventType.RUN_ORPHANED, source="test"))
+    log.append(NormalizedEvent(run_id=run.id, type=EventType.RUN_CANCELLED, source="test"))
+
+    check = oa.doctor._event_store_check()
+    assert check.status != FAIL, check.detail
+
+
+def test_doctor_rejects_conflicting_terminal_chain(tmp_path: Path) -> None:
+    oa = _app(tmp_path)
+    run = Run(id="run_bad_chain", agent="ghost", status=RunStatus.FAILED)
+    oa.repos.runs.upsert(run)
+    log = EventLog(oa.paths.run_dir(run.id), index=oa.repos.event_index, run_id=run.id)
+    log.append(NormalizedEvent(run_id=run.id, type=EventType.RUN_COMPLETED, source="test"))
+    log.append(NormalizedEvent(run_id=run.id, type=EventType.RUN_FAILED, source="test"))
+
+    check = oa.doctor._event_store_check()
+    assert check.status == FAIL
+    assert "invalid terminal chain" in check.detail
