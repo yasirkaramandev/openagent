@@ -64,7 +64,12 @@ def safe_display(value: object, *, limit: int | None = None, single_line: bool =
         text = text[: max(0, limit - 1)] + DEFAULT_ELLIPSIS
     if single_line:
         text = " ".join(text.split())
-    return escape(text)
+    escaped = escape(text)
+    # Rich's escaper intentionally leaves unknown-looking tags alone. Textual's Static renderer is
+    # more permissive and can consequently consume an uppercase placeholder such as ``[REDACTED]``
+    # as markup, making the fact that a secret was removed invisible. Every value entering this
+    # helper is untrusted text, so escape any opening bracket Rich left behind as well.
+    return re.sub(r"(?<!\\)\[", r"\\[", escaped)
 
 
 def safe_markup(value: object, limit: int | None = None) -> str:

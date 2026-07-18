@@ -45,6 +45,7 @@ from ...core.permissions import profile_names
 from ...credentials.store import CredentialError
 from ...providers.discovery import (
     AgentModelProbe,
+    ModelDiscoveryResult,
     filter_models,
     looks_non_chat,
     publishers,
@@ -157,6 +158,7 @@ class AddAgentScreen(SecretInputMixin, Screen):
         self._model_status = "default"  # discovered | manual | default (shown on Review)
         #: The full discovered catalog, kept so search/publisher filtering is purely local (§14.2).
         self._catalog: list[RemoteModel] = []
+        self._catalog_error: tuple[str, str] | None = None
         #: The last real capability probe — the ONLY thing that may call a model agent-compatible.
         self._probe: AgentModelProbe | None = None
 
@@ -663,6 +665,8 @@ class AddAgentScreen(SecretInputMixin, Screen):
             self.query_one("#model", Input).value = ""
             self.state.model = None
             self._model_method = ""
+            self._catalog = []
+            self._catalog_error = None
             self._set_model_status(
                 "[dim]Refresh to discover models, or enter an id / use the CLI default[/dim]"
             )
@@ -724,12 +728,19 @@ class AddAgentScreen(SecretInputMixin, Screen):
         select = self.query_one("#model_select", Select)
         select.set_options([(_catalog_label(m), m.id) for m in models])
         if not models:
-            self._set_model_status("[yellow]no catalog model matches these filters[/yellow]")
+            status = "[yellow]no catalog model matches these filters[/yellow]"
         else:
-            self._set_model_status(
+            status = (
                 f"[green]{len(models)} of {len(self._catalog)} model(s)[/green]"
                 " — pick one, then Validate Model & Key"
             )
+        if self._catalog_error is not None:
+            error_type, message = self._catalog_error
+            status += (
+                f"\n[yellow]partial catalog ({safe_markup(error_type)}): "
+                f"{safe_markup(message, 200)}[/yellow]"
+            )
+        self._set_model_status(status)
 
     def _open_url(self, url: str) -> None:
         """Open a URL with Python's cross-platform webbrowser — never a shell command (§13.4)."""
@@ -830,10 +841,38 @@ class AddAgentScreen(SecretInputMixin, Screen):
             )
             return
         self._model_method = result.method or ""
-        select.set_options([(m, m) for m in result.models])
+        if result.options:
+            labels: list[tuple[str, str]] = []
+            for option in result.options:
+                verification = (
+                    "credential verified"
+                    if option.entitlement_verified
+                    else (
+                        "installed CLI advertised"
+                        if option.source == "codex-app-server"
+                        else "availability resolved at runtime"
+                    )
+                )
+                labels.append(
+                    (
+                        f"{option.display_name} · {option.kind} · {option.source} · {verification}",
+                        option.id,
+                    )
+                )
+            select.set_options(labels)
+        else:
+            select.set_options([(m, m) for m in result.models])
         via = f" (via {safe_markup(result.method)})" if result.method else ""
+        qualification = ""
+        if result.cli_type == "claude":
+            qualification = (
+                " — Claude Code choices; account availability is resolved by Claude Code at runtime"
+            )
+        if result.partial and result.error:
+            qualification += f" — partial: {safe_markup(result.error, 180)}"
         self._set_model_status(
             f"[green]found {len(result.models)} model(s){via}[/green] — pick one below"
+            f"{qualification}"
         )
 
     async def _do_discover_api(self) -> None:
@@ -841,9 +880,9 @@ class AddAgentScreen(SecretInputMixin, Screen):
         s = self.state
         try:
             if s.provider_mode == "existing" and s.provider_name:
-                models = await oa.providers.remote_models(s.provider_name)
+                result = await oa.providers.remote_models(s.provider_name)
             else:
-                models = await oa.providers.remote_models_config(
+                result = await oa.providers.remote_models_config(
                     provider_type=s.provider_type or "custom",
                     protocol=s.protocol,
                     base_url=s.base_url,
@@ -858,16 +897,33 @@ class AddAgentScreen(SecretInputMixin, Screen):
             )
             self.query_one("#model_select", Select).set_options([])
             return
-        self._apply_api_models(models)
+        self._apply_api_models(result)
 
-    def _apply_api_models(self, models) -> None:
+    def _apply_api_models(self, result) -> None:
+        if not isinstance(result, ModelDiscoveryResult):
+            result = ModelDiscoveryResult(
+                models=list(result), ok=True, partial=False, source="legacy-provider-adapter"
+            )
         select = self.query_one("#model_select", Select)
-        self._catalog = list(models)
+        self._catalog = list(result.models)
+        self._catalog_error = (
+            (result.error_type or "unknown", result.error_message or "no detail")
+            if not result.ok
+            else None
+        )
         if not self._catalog:
             select.set_options([])
-            self._set_model_status(
-                "[yellow]no models reported — enter a model id manually below[/yellow]"
-            )
+            if result.ok:
+                self._set_model_status(
+                    "[yellow]the provider returned a valid empty catalog — enter a model id "
+                    "manually below[/yellow]"
+                )
+            else:
+                self._set_model_status(
+                    f"[red]model discovery failed ({safe_markup(result.error_type or 'unknown')}): "
+                    f"{safe_markup(result.error_message or 'no detail', 200)}[/red] — enter a "
+                    "model id manually below"
+                )
             return
         self._model_method = "provider models"
         # Populate the publisher filter from what the catalog actually reported (§14.2).
@@ -1163,6 +1219,8 @@ class AddAgentScreen(SecretInputMixin, Screen):
         self.state.api_key = None
         self.state.model = None
         self._model_context = None
+        self._catalog = []
+        self._catalog_error = None
         self._status("")
 
     def _clear_secret_widget(self) -> None:

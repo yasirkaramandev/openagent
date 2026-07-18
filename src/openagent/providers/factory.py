@@ -7,6 +7,7 @@ and supplies default base URLs / protocols for known providers so the user only 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from ..core.models import Protocol, ProviderConnection
 from .anthropic_messages import AnthropicMessagesAdapter
@@ -141,6 +142,34 @@ def get_preset(provider_type: str) -> ProviderPreset | None:
 
 def preset_names() -> list[str]:
     return list(PRESETS)
+
+
+def is_nvidia_build_endpoint(value: str | None) -> bool:
+    """Whether a URL is exactly NVIDIA Build's hosted endpoint after safe normalization.
+
+    Scheme/host casing, the default HTTPS port and a trailing slash are equivalent. User info,
+    query strings, fragments, non-default ports and any other path may denote a gateway or custom
+    endpoint, so those are intentionally not treated as NVIDIA Build.
+    """
+
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() == "integrate.api.nvidia.com"
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.rstrip("/") == "/v1"
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def resolve_base_url(provider: ProviderConnection) -> str:

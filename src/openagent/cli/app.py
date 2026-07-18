@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -20,13 +21,14 @@ from rich.table import Table
 from .. import __version__
 from ..app import OpenAgentApp
 from ..core.events import NormalizedEvent
-from ..core.models import Protocol, RuntimeType, enum_value
+from ..core.models import CliInstallation, CliUpdateState, Protocol, RuntimeType, enum_value
 from ..core.permissions import profile_names
 from ..providers.discovery import (
     PROBE_NOT_FOUND,
     PROBE_RATE_LIMITED,
     PROBE_UNAUTHORIZED,
     PROBE_VERIFIED,
+    ModelDiscoveryResult,
     filter_models,
     looks_non_chat,
 )
@@ -46,10 +48,12 @@ provider_app = typer.Typer(help="Manage API provider connections.")
 agent_app = typer.Typer(help="Manage agents.")
 events_app = typer.Typer(help="Inspect and repair event exports.")
 project_app = typer.Typer(help="Manage stable project identities.")
+cli_app = typer.Typer(help="Inspect and safely update coding CLI installations.")
 app.add_typer(provider_app, name="provider")
 app.add_typer(agent_app, name="agent")
 app.add_typer(events_app, name="events")
 app.add_typer(project_app, name="project")
+app.add_typer(cli_app, name="cli")
 
 console = Console()
 err = Console(stderr=True)
@@ -85,6 +89,71 @@ def version() -> None:
     console.print(f"openagent {__version__}")
 
 
+@app.command("update")
+def update_openagent(
+    check: bool = typer.Option(False, "--check", help="Check without changing the installation."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show the source-matched update plan without running it."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm the update non-interactively."),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Update OpenAgent itself from its proven installation source.
+
+    Source checkouts fast-forward only a clean official ``origin/main`` and re-run the platform
+    installer. Index installs use their owning uv/pipx environment (or that environment's exact
+    Python), then the command verifies PATH, version, and ``doctor --json`` before reporting success.
+    """
+
+    from ..services.self_update import check_self_update, perform_self_update
+
+    if check and dry_run:
+        _fail("choose at most one of --check and --dry-run")
+    try:
+        plan = check_self_update()
+    except Exception as exc:  # noqa: BLE001 - this command must remain a DB-independent repair path
+        _fail(f"OpenAgent update check failed ({exc.__class__.__name__})")
+
+    if check or dry_run or not plan.can_update or plan.update_available is False:
+        if json_out:
+            emit_json(
+                {"mode": "dry-run" if dry_run else "check", "plan": plan.model_dump(mode="json")}
+            )
+        else:
+            mark = "[green]✓[/green]" if plan.can_update else "[red]✗[/red]"
+            console.print(
+                f"{mark} OpenAgent {safe_markup(plan.current_version)} — {safe_markup(plan.detail)}"
+            )
+            console.print(
+                f"  source: {safe_markup(plan.source)}; executable: "
+                f"{safe_markup(plan.active_executable)}"
+            )
+            if dry_run:
+                for command in plan.commands:
+                    console.print(f"  would run: {safe_markup(shlex.join(command))}")
+        if not plan.can_update:
+            raise typer.Exit(1)
+        return
+
+    if not yes:
+        if not sys.stdin.isatty():
+            _fail("non-interactive update requires --yes (or use --check/--dry-run)")
+        latest = plan.latest_version or (plan.remote_revision or "newest revision")[:12]
+        if not typer.confirm(f"Update OpenAgent {plan.current_version} to {latest}?"):
+            raise typer.Exit(1)
+
+    result = perform_self_update(plan)
+    if json_out:
+        emit_json(result.model_dump(mode="json"))
+    else:
+        mark = "[green]✓[/green]" if result.ok else "[red]✗[/red]"
+        console.print(f"{mark} {safe_markup(result.detail)}")
+        if result.backup_path:
+            console.print(f"  database backup: {safe_markup(result.backup_path)}")
+    if not result.ok:
+        raise typer.Exit(1)
+
+
 @app.command()
 def init() -> None:
     """Initialize OpenAgent state for this project."""
@@ -117,6 +186,127 @@ def discover() -> None:
             console.print(f"[red]✗[/red] {cli_type} CLI not found")
     for extra in sorted(found - known):  # pragma: no cover
         console.print(f"[green]✓[/green] {extra}")
+
+
+# --------------------------------------------------------------------------- CLI lifecycle
+
+
+def _cli_payload(installation: CliInstallation) -> dict:
+    payload = installation.model_dump(mode="json")
+    status = installation.update_status
+    payload["update"] = status.model_dump(mode="json") if status is not None else None
+    return payload
+
+
+def _print_cli_table(installations: list[CliInstallation]) -> None:
+    table = Table(
+        "Type",
+        "Current",
+        "Latest",
+        "Update",
+        "Source",
+        "Active executable",
+        "Auth",
+        "Adapter",
+    )
+    for installation in installations:
+        status = installation.update_status
+        auth = (
+            "yes"
+            if installation.authenticated is True
+            else ("no" if installation.authenticated is False else "?")
+        )
+        table.add_row(
+            safe_line(installation.type),
+            safe_line(installation.version or "—"),
+            safe_line(status.latest_version if status and status.latest_version else "—"),
+            safe_line(status.state.value if status else "unknown"),
+            safe_line(installation.install_source.value),
+            safe_line(installation.executable),
+            auth,
+            safe_line(installation.adapter or "—"),
+        )
+    console.print(table)
+
+
+@cli_app.command("list")
+def cli_list(json_out: bool = typer.Option(False, "--json")) -> None:
+    """List exact active CLI paths, provenance, versions, and cached updater state."""
+
+    installations = _run(_app().clis.check_updates(refresh=False))
+    if json_out:
+        emit_json([_cli_payload(installation) for installation in installations])
+        return
+    _print_cli_table(installations)
+
+
+@cli_app.command("check")
+def cli_check(
+    refresh: bool = typer.Option(False, "--refresh", help="Refresh official network metadata."),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show cached update status, or refresh it explicitly from source metadata."""
+
+    installations = _run(_app().clis.check_updates(refresh=refresh))
+    if json_out:
+        emit_json([_cli_payload(installation) for installation in installations])
+        return
+    _print_cli_table(installations)
+
+
+@cli_app.command("update")
+def cli_update(
+    cli_type: str | None = typer.Argument(None, metavar="[codex|claude|antigravity]"),
+    all_: bool = typer.Option(False, "--all", help="Update every installed first-class CLI."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show commands without running them."),
+    yes: bool = typer.Option(False, "--yes", help="Confirm a non-interactive update-all."),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run only the updater that matches the proven installation source."""
+
+    if bool(cli_type) == all_:
+        _fail("choose exactly one CLI type or --all")
+    if all_ and not dry_run and not yes:
+        if not sys.stdin.isatty():
+            _fail("non-interactive --all requires --yes (or use --dry-run)")
+        if not typer.confirm("Update every safely updatable installed CLI?"):
+            raise typer.Exit(1)
+    service = _app().clis
+    try:
+        if all_:
+            results = _run(service.update_all(dry_run=dry_run))
+        else:
+            assert cli_type is not None
+            results = {cli_type: _run(service.update(cli_type, dry_run=dry_run))}
+    except (KeyError, RuntimeError, OSError) as exc:
+        _fail(str(exc))
+
+    payload = {name: result.model_dump(mode="json") for name, result in results.items()}
+    failed = any(
+        result.status.state in {CliUpdateState.BLOCKED, CliUpdateState.CHECK_FAILED}
+        for result in results.values()
+    )
+    if json_out:
+        emit_json(payload)
+    else:
+        for name, result in results.items():
+            mark = (
+                "[red]✗[/red]"
+                if result.status.state
+                in {
+                    CliUpdateState.BLOCKED,
+                    CliUpdateState.CHECK_FAILED,
+                }
+                else "[green]✓[/green]"
+            )
+            command = " ".join(result.command or [])
+            suffix = f" — {safe_markup(command)}" if command else ""
+            console.print(
+                f"{mark} {safe_markup(name)}: {safe_markup(result.detail or result.status.detail)}"
+                f"{suffix}"
+            )
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command("add")
@@ -454,19 +644,29 @@ def cancel(
 
 
 @app.command()
-def doctor(json_out: bool = typer.Option(False, "--json")) -> None:
+def doctor(
+    json_out: bool = typer.Option(False, "--json"),
+    refresh_cli_updates: bool = typer.Option(False, "--refresh-cli-updates"),
+) -> None:
     """Run system diagnostics (spec §41)."""
     oa = _app()
-    checks = _run(oa.doctor.run())
+    checks = _run(oa.doctor.run(refresh_cli_updates=refresh_cli_updates))
+    exit_code = oa.doctor.exit_code(checks)
     if json_out:
-        emit_json({"checks": [c.to_dict() for c in checks]})
-        return
-    marks = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
-    for check in checks:
-        console.print(
-            f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
-            + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else "")
-        )
+        emit_json({"checks": [c.to_dict() for c in checks], "exit_code": exit_code})
+    else:
+        marks = {
+            "ok": "[green]✓[/green]",
+            "warn": "[yellow]⚠[/yellow]",
+            "fail": "[red]✗[/red]",
+        }
+        for check in checks:
+            console.print(
+                f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
+                + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else "")
+            )
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 @events_app.command("repair")
@@ -646,22 +846,43 @@ def provider_models(
     ``openagent provider probe`` to find out what a model can actually do.
     """
     oa = _app()
-    models = filter_models(_run(oa.providers.remote_models(name)), search=search, owner=owner)
+    discovery = _run(oa.providers.remote_models(name))
+    # Compatibility for third-party service fakes written against the pre-v0.1.4 list-only API.
+    if not isinstance(discovery, ModelDiscoveryResult):
+        discovery = ModelDiscoveryResult(
+            models=list(discovery), ok=True, partial=False, source="legacy-provider-adapter"
+        )
+    models = filter_models(discovery.models, search=search, owner=owner)
     if json_out:
         emit_json(
             {
                 "provider": name,
+                "ok": discovery.ok,
+                "partial": discovery.partial,
+                "source": discovery.source,
+                "error_type": discovery.error_type,
+                "error_message": discovery.error_message,
                 "models": [
                     {"id": m.id, "owned_by": m.owned_by, "capabilities": None} for m in models
                 ],
             }
         )
+        if not discovery.ok:
+            raise typer.Exit(1)
         return
-    if not models:
-        console.print(
-            "[yellow]no models returned (provider may lack a /models endpoint, or the "
-            "filters matched nothing)[/yellow]"
+    if not discovery.ok:
+        err.print(
+            "[red]model discovery failed:[/red] "
+            f"{safe_markup(discovery.error_type or 'unknown')} — "
+            f"{safe_markup(discovery.error_message or 'no detail')}"
         )
+    if not models:
+        if discovery.ok and discovery.models:
+            console.print("[yellow]the filters matched no catalog models[/yellow]")
+        elif discovery.ok:
+            console.print("[yellow]the provider returned a valid empty model catalog[/yellow]")
+        if not discovery.ok:
+            raise typer.Exit(1)
         return
     preset = get_preset(_provider_type(oa, name))
     if preset is not None and preset.catalog_is_mixed:
@@ -679,6 +900,8 @@ def provider_models(
         f"[dim]{len(models)} model(s). Capabilities are unknown until probed:[/dim] "
         f"[bold]openagent provider probe {safe_markup(name)} --model <id>[/bold]"
     )
+    if not discovery.ok:
+        raise typer.Exit(1)
 
 
 @provider_app.command("probe")

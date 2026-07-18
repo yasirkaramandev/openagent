@@ -16,6 +16,7 @@ These tests build both databases for real and compare them.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,20 @@ CREATE TABLE runs (
     PRIMARY KEY (id)
 )
 """
+
+DOMAIN_TABLES = (
+    "provider_connections",
+    "models",
+    "agents",
+    "cli_installations",
+    "projects",
+    "runs",
+    "model_probes",
+    "sessions",
+    "events",
+    "event_sequences",
+    "usage_records",
+)
 
 
 def _engine(path: Path) -> Engine:
@@ -83,9 +98,19 @@ def _upgraded_from_legacy(path: Path) -> Engine:
         # A real run, so the migration has data to carry across.
         conn.exec_driver_sql(
             "INSERT INTO runs (id, agent, status, workspace, started_at, data) VALUES "
-            "('run_legacy', 'codex', 'completed', '/tmp/proj', '2026-01-01T00:00:00+00:00', "
-            """'{"id":"run_legacy","agent":"codex","status":"completed","workspace":"/tmp/proj",'"""
-            """'"started_at":"2026-01-01T00:00:00+00:00"}')"""
+            "('run_legacy', 'codex', 'completed', '/tmp/proj', "
+            "'2026-01-01T00:00:00+00:00', ?)",
+            (
+                json.dumps(
+                    {
+                        "id": "run_legacy",
+                        "agent": "codex",
+                        "status": "completed",
+                        "workspace": "/tmp/proj",
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ),
+            ),
         )
     run_migrations(engine, db_path=path)
     return engine
@@ -146,16 +171,52 @@ def test_runs_has_the_project_foreign_key_after_upgrade(both: tuple[Engine, Engi
     )
 
 
-@pytest.mark.parametrize("table", ["runs", "projects", "events", "provider_connections"])
+@pytest.mark.parametrize("table", DOMAIN_TABLES)
 def test_columns_match_between_fresh_and_upgraded(both: tuple[Engine, Engine], table: str) -> None:
     fresh, upgraded = both
     assert _columns(fresh, table) == _columns(upgraded, table)
 
 
-@pytest.mark.parametrize("table", ["runs", "events"])
+@pytest.mark.parametrize("table", DOMAIN_TABLES)
 def test_indexes_match_between_fresh_and_upgraded(both: tuple[Engine, Engine], table: str) -> None:
     fresh, upgraded = both
     assert _indexes(fresh, table) == _indexes(upgraded, table)
+
+
+@pytest.mark.parametrize("table", DOMAIN_TABLES)
+def test_foreign_keys_match_between_fresh_and_upgraded(
+    both: tuple[Engine, Engine], table: str
+) -> None:
+    fresh, upgraded = both
+    assert _foreign_keys(fresh, table) == _foreign_keys(upgraded, table)
+
+
+def _schema_objects(engine: Engine) -> dict[tuple[str, str, str], str]:
+    rows = _pragma(
+        engine,
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index')",
+    )
+    return {
+        (str(type_), str(name), str(table)): " ".join(str(sql or "").split())
+        for type_, name, table, sql in rows
+    }
+
+
+def test_sqlite_schema_objects_have_fresh_upgrade_parity(both: tuple[Engine, Engine]) -> None:
+    """Exercise ``sqlite_schema.sql`` in addition to PRAGMA's semantic schema views.
+
+    SQLite can spell the equivalent foreign key inline or as a table constraint, so raw table DDL
+    text is not a stable semantic equality check. Object identity must match, and every user table
+    plus explicit index must have inspectable SQL; PRAGMA tests above compare the actual semantics.
+    """
+
+    fresh, upgraded = both
+    fresh_objects = _schema_objects(fresh)
+    upgraded_objects = _schema_objects(upgraded)
+    assert set(fresh_objects) == set(upgraded_objects)
+    assert all(sql for sql in fresh_objects.values())
+    assert all(sql for sql in upgraded_objects.values())
 
 
 def test_upgrade_preserves_the_existing_run(both: tuple[Engine, Engine]) -> None:

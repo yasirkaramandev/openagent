@@ -26,6 +26,7 @@ from .base import (
     TokenEstimate,
     default_probe,
     normalized_tool_call,
+    parse_model_catalog,
     rough_token_estimate,
 )
 from .compat.profiles import CompatibilityProfile, get_compat
@@ -68,21 +69,9 @@ class OpenAIChatAdapter:
 
     async def list_models(self) -> list[RemoteModel]:
         data = await self.transport.get_json("/models")
-        items = data.get("data", data if isinstance(data, list) else [])
-        models: list[RemoteModel] = []
-        for item in items:
-            if isinstance(item, dict) and item.get("id"):
-                # Preserve ``owned_by`` (the publisher the catalog reports) so a mixed catalog like
-                # NVIDIA Build can be filtered by publisher, and never assumed chat-compatible (§14.1).
-                models.append(
-                    RemoteModel(
-                        id=item["id"],
-                        display_name=item.get("id"),
-                        owned_by=item.get("owned_by"),
-                        context_window=item.get("context_window") or item.get("context_length"),
-                    )
-                )
-        return models
+        # Preserve owner/context metadata so mixed catalogs can be filtered without implying that a
+        # listed model is agent-compatible.
+        return parse_model_catalog(data)
 
     async def probe_model(self, model_id: str) -> ModelCapabilities:
         """Capability probe (spec §25.2). Only claims capabilities actually observed (item 9)."""

@@ -26,16 +26,26 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, text
 
+from openagent.core.models import (
+    AgentProfile,
+    AgentRuntime,
+    ModelProfile,
+    ProviderConnection,
+    RuntimeType,
+)
 from openagent.storage.db import Database
 from openagent.storage.migrations import (
     LATEST_VERSION,
     MIGRATIONS,
+    MigrationFailedError,
+    MigrationVerificationError,
     SchemaTooNewError,
     UnknownRevisionError,
     current_revision,
     current_version,
     run_migrations,
 )
+from openagent.storage.repositories import Repositories
 
 
 def _v1_database(path: Path) -> None:
@@ -187,6 +197,19 @@ def test_migration_report_exposes_backup_and_verification(tmp_path: Path):
     assert report.integrity_check == "ok"
     assert report.foreign_key_violations == ()
     assert report.row_counts["runs"] == 1
+    assert set(report.row_counts) >= {
+        "provider_connections",
+        "models",
+        "agents",
+        "cli_installations",
+        "projects",
+        "runs",
+        "model_probes",
+        "sessions",
+        "events",
+        "event_sequences",
+        "usage_records",
+    }
     assert report.applied == tuple(f"{version:04d}" for version in range(2, LATEST_VERSION + 1))
 
 
@@ -251,8 +274,10 @@ def test_an_interrupted_migration_leaves_the_version_behind_and_retries_cleanly(
         return real_apply(conn)
 
     monkeypatch.setattr(MIGRATIONS[-1], "apply", exploding_apply)
-    with pytest.raises(RuntimeError, match="power cut"):
+    with pytest.raises(MigrationFailedError) as excinfo:
         Database.open(db_path)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "power cut" in str(excinfo.value.__cause__)
 
     # The version must NOT claim the failed migration landed.
     engine = create_engine(f"sqlite:///{db_path}", future=True)
@@ -278,3 +303,179 @@ def test_in_memory_database_migrates_to_latest():
         assert conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='table' AND name='event_sequences'")
         ).first()
+
+
+def _rewind_to(db: Database, revision: str) -> None:
+    with db.engine.begin() as conn:
+        conn.execute(
+            text("UPDATE schema_meta SET value=:revision WHERE key='revision'"),
+            {"revision": revision},
+        )
+        conn.execute(
+            text("UPDATE schema_meta SET value=:version WHERE key='version'"),
+            {"version": str(int(revision))},
+        )
+
+
+def test_legacy_nvidia_normalization_preserves_bindings_and_invalidates_probe(tmp_path: Path):
+    db_path = tmp_path / "nvidia.db"
+    db = Database.open(db_path)
+    repos = Repositories(db)
+    provider = ProviderConnection(
+        id="provider_legacy",
+        name="legacy-name",
+        provider_type="openai",
+        protocol="openai-chat",
+        base_url="HTTPS://INTEGRATE.API.NVIDIA.COM:443/v1/",
+        credential_revision="credential-revision-kept",
+    )
+    repos.providers.upsert(provider)
+    repos.models.upsert(
+        ModelProfile(
+            id="model_kept",
+            provider_connection=provider.id,
+            remote_model_id="nvidia/model-kept",
+        )
+    )
+    repos.agents.upsert(
+        AgentProfile(
+            name="agent-kept",
+            runtime=AgentRuntime(
+                type=RuntimeType.API_AGENT,
+                provider=provider.id,
+                model="model_kept",
+            ),
+        )
+    )
+    repos.model_probes.put(
+        cache_key="probe-kept",
+        provider_id=provider.id,
+        model_id="nvidia/model-kept",
+        base_url_fingerprint="endpoint-fingerprint",
+        protocol="openai-chat",
+        credential_revision="credential-revision-kept",
+        probe_version="1",
+        tested_at="2026-01-01T00:00:00+00:00",
+        data={
+            "model": "nvidia/model-kept",
+            "text": True,
+            "streaming": True,
+            "tool_calling": True,
+            "agent_compatible": True,
+            "category": "verified",
+            "detail": "",
+            "tested_at": "2026-01-01T00:00:00+00:00",
+            "probe_version": "1",
+        },
+    )
+    _rewind_to(db, "0009")
+    db.engine.dispose()
+
+    upgraded = Database.open(db_path)
+    upgraded_repos = Repositories(upgraded)
+    normalized = upgraded_repos.providers.get(provider.id)
+    assert normalized is not None
+    assert normalized.name == provider.name
+    assert normalized.provider_type == "nvidia-build"
+    assert normalized.credential == provider.credential
+    assert normalized.credential_revision == provider.credential_revision
+    assert upgraded_repos.models.get("model_kept").remote_model_id == "nvidia/model-kept"
+    assert upgraded_repos.agents.get("agent-kept").runtime.provider == provider.id
+    with upgraded.engine.connect() as conn:
+        probe = conn.execute(
+            text("SELECT probe_version, data FROM model_probes WHERE cache_key='probe-kept'")
+        ).first()
+    assert probe is not None
+    assert probe[0] == "invalidated-provider-normalization"
+    assert json.loads(probe[1])["probe_version"] == "invalidated-provider-normalization"
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "base_url"),
+    [
+        ("custom", "https://integrate.api.nvidia.com/v1"),
+        ("openai", "https://integrate.api.nvidia.com/v1?gateway=custom"),
+        ("openai", "https://integrate.api.nvidia.com/v1/extra"),
+        ("openai", "https://integrate.api.nvidia.com:8443/v1"),
+    ],
+)
+def test_nvidia_normalization_does_not_guess_custom_endpoints(
+    tmp_path: Path, provider_type: str, base_url: str
+):
+    db_path = tmp_path / "custom.db"
+    db = Database.open(db_path)
+    provider = ProviderConnection(
+        id="provider_custom",
+        name="custom",
+        provider_type=provider_type,
+        protocol="openai-chat",
+        base_url=base_url,
+    )
+    Repositories(db).providers.upsert(provider)
+    _rewind_to(db, "0009")
+    db.engine.dispose()
+
+    upgraded = Database.open(db_path)
+    assert Repositories(upgraded).providers.get(provider.id).provider_type == provider_type
+
+
+def test_domain_validation_rolls_back_entire_chain_and_keeps_backup(tmp_path: Path):
+    db_path = tmp_path / "corrupt.db"
+    db = Database.open(db_path)
+    repos = Repositories(db)
+    repos.providers.upsert(
+        ProviderConnection(
+            id="provider_should_not_leak",
+            name="legacy",
+            provider_type="openai",
+            protocol="openai-chat",
+            base_url="https://integrate.api.nvidia.com/v1",
+        )
+    )
+    secret = "secret-value-must-not-leak"
+    with db.engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO provider_connections (id, name, provider_type, enabled, data) "
+            "VALUES (?, ?, ?, 1, ?)",
+            ("provider_corrupt_identifier", "broken", "custom", json.dumps({"secret": secret})),
+        )
+    _rewind_to(db, "0009")
+    db.engine.dispose()
+
+    with pytest.raises(MigrationFailedError) as excinfo:
+        Database.open(db_path)
+    message = str(excinfo.value)
+    assert "provider_connections" in message
+    assert "sha256:" in message
+    assert "provider_corrupt_identifier" not in message
+    assert secret not in message
+    assert list(tmp_path.glob("corrupt.db.v9.*.bak"))
+
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.connect() as conn:
+        # Revision 0010 and its NVIDIA rewrite were in the same transaction as validation.
+        assert current_revision(conn) == "0009"
+        rows = conn.execute(
+            text("SELECT id, provider_type FROM provider_connections ORDER BY id")
+        ).all()
+    engine.dispose()
+    assert rows == [
+        ("provider_corrupt_identifier", "custom"),
+        ("provider_should_not_leak", "openai"),
+    ]
+
+
+def test_latest_database_with_corrupt_json_fails_closed_on_reopen(tmp_path: Path):
+    db_path = tmp_path / "latest-corrupt.db"
+    db = Database.open(db_path)
+    with db.engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO cli_installations (id, type, executable, data) VALUES (?, ?, ?, ?)",
+            ("cli_private_name", "codex", "/private/bin/codex", "{}"),
+        )
+    db.engine.dispose()
+
+    with pytest.raises(MigrationVerificationError) as excinfo:
+        Database.open(db_path)
+    assert "cli_installations" in str(excinfo.value)
+    assert "cli_private_name" not in str(excinfo.value)

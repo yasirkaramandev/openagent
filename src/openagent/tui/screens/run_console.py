@@ -25,6 +25,8 @@ does not cancel the run, and reopening it replays ``events.jsonl`` and then tail
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import datetime, timezone
 
 from textual.app import ComposeResult
@@ -50,6 +52,7 @@ from ...core.models import enum_value
 from ...core.permissions import get_profile, profile_names
 from ...core.projection import Item, RunProjection
 from ...runtimes.cli.registry import cli_registry_entries
+from ...services.run_event_tailer import RunEventTailer
 from ...services.run_service import RunError
 from ...workspaces.worktree import STRATEGIES
 from ..markup import safe_line, safe_markup
@@ -361,6 +364,8 @@ class RunConsoleScreen(Screen):
         self.projection = RunProjection(run_id)
         self._dirty = True
         self._live = None
+        self._tailer: RunEventTailer | None = None
+        self._tailer_task: asyncio.Task[None] | None = None
         self.follow_output = True
 
     # ------------------------------------------------------------------ compose
@@ -390,32 +395,61 @@ class RunConsoleScreen(Screen):
             yield Button("Back", id="back")
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         oa = self.app.oa  # type: ignore[attr-defined]
         self.query_one("#followup-row").display = False
 
-        # 1) Replay the persisted log — this is what makes a run reopenable, live or finished.
-        self.projection = oa.runs.projection(self.run_id)
-        # 2) Then subscribe to the live stream, if this app is the one running it.
+        # Mount order closes the replay/subscribe race across both local and remote writers:
+        # replay DB -> subscribe local -> query DB again -> start the cross-process poller.
+        self.projection = RunProjection(self.run_id)
+        self._tailer = RunEventTailer(
+            self.run_id,
+            oa.repos.event_index,
+            self._on_db_events,
+            on_warning=self._on_tailer_warning,
+        )
+        await self._tailer.initial_replay()
         self._live = self.app.live_run(self.run_id)  # type: ignore[attr-defined]
         if self._live is not None:
-            # Adopt the in-memory projection so nothing that arrived between replay and subscribe is
-            # lost, and keep receiving updates.
-            self.projection = self._live.projection
             self._live.subscribe(self._on_event)
+        await self._tailer.poll_once(force=True)
+        self._tailer_task = asyncio.create_task(
+            self._tailer.run(), name=f"run-event-tailer:{self.run_id}"
+        )
         self._dirty = True
         self.set_interval(REFRESH_INTERVAL, self._refresh_if_dirty)
         self.set_interval(1.0, self._tick)
         self._render_all()
 
-    def on_unmount(self) -> None:
+    async def on_unmount(self) -> None:
         if self._live is not None:
             self._live.unsubscribe(self._on_event)
+        if self._tailer is not None:
+            await self._tailer.stop()
+        if self._tailer_task is not None:
+            self._tailer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._tailer_task
+            self._tailer_task = None
 
     # ------------------------------------------------------------------ live updates
 
     def _on_event(self, event: NormalizedEvent) -> None:
+        if self._tailer is not None and not self._tailer.mark_local(event):
+            return
+        self.projection.apply(event)
         self._dirty = True
+
+    def _on_db_events(self, events: list[NormalizedEvent]) -> None:
+        # One callback per SQLite batch: projection updates stay on Textual's event loop and one
+        # render is coalesced by the existing 200ms dirty timer.
+        for event in events:
+            self.projection.apply(event)
+        self._dirty = True
+
+    def _on_tailer_warning(self, detail: str) -> None:
+        if self.is_mounted:
+            self.notify(detail, severity="warning", timeout=8)
 
     def _tick(self) -> None:
         self._render_status()  # the elapsed clock keeps moving even when nothing happens

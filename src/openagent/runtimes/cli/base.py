@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -72,6 +72,18 @@ class CliAdapter(Protocol):
     """The CLI adapter contract (spec §6.2)."""
 
     async def detect(self) -> CliInstallation | None: ...
+
+    def locate_candidates(self) -> Any: ...
+
+    async def inspect_installation(self) -> CliInstallation | None: ...
+
+    async def check_update(self) -> Any: ...
+
+    async def perform_update(
+        self, *, dry_run: bool = False, active_run_ids: Sequence[str] = ()
+    ) -> Any: ...
+
+    async def list_models(self) -> list[str]: ...
 
     async def inspect_auth(self) -> AuthStatus: ...
 

@@ -68,6 +68,55 @@ class TokenEstimate:
     input_tokens: int
 
 
+class ModelCatalogError(ValueError):
+    """A model endpoint returned malformed entries, optionally alongside usable ones."""
+
+    def __init__(self, message: str, *, models: list[RemoteModel] | None = None) -> None:
+        super().__init__(message)
+        self.models = list(models or [])
+
+
+def parse_model_catalog(
+    payload: dict[str, Any], *, display_name_key: str = "id"
+) -> list[RemoteModel]:
+    """Strictly parse a conventional ``{"data": [...]}`` model catalog.
+
+    Invalid entries are never silently reinterpreted as an empty catalog. Valid siblings are kept
+    on :class:`ModelCatalogError`, allowing callers to report an honest partial result.
+    """
+
+    items = payload.get("data")
+    if not isinstance(items, list):
+        raise ModelCatalogError("provider model catalog has no data array")
+    models: list[RemoteModel] = []
+    malformed = 0
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or not item["id"].strip()
+        ):
+            malformed += 1
+            continue
+        try:
+            models.append(
+                RemoteModel(
+                    id=item["id"],
+                    display_name=item.get(display_name_key) or item["id"],
+                    owned_by=item.get("owned_by"),
+                    context_window=item.get("context_window") or item.get("context_length"),
+                )
+            )
+        except (TypeError, ValueError):
+            malformed += 1
+    if malformed:
+        raise ModelCatalogError(
+            f"provider model catalog contained {malformed} malformed entr{'y' if malformed == 1 else 'ies'}",
+            models=models,
+        )
+    return models
+
+
 @dataclass
 class CollectedResponse:
     """The fully-assembled result of one model turn (what the agent loop consumes)."""

@@ -1,13 +1,19 @@
+import asyncio
 from pathlib import Path
 
 import pytest
 
+from openagent.core.cancellation import RunCancelled
 from openagent.core.events import ToolCall
 from openagent.core.permissions import DEVELOPMENT, READ_ONLY, SAFE_EDIT, get_profile
+from openagent.credentials.redaction import secret_scope
 from openagent.security.approvals import ApprovalGate
-from openagent.tools.base import ToolContext, ToolError
+from openagent.security.execution_backend import ExecutionBackendError
+from openagent.security.filesystem import WorkspaceBudgetExceeded
+from openagent.security.process import OutputLimitExceeded
+from openagent.tools.base import ToolContext, ToolError, ToolExecutionInternalError
 from openagent.tools.control import TaskFinished
-from openagent.tools.registry import ALL_TOOLS, ToolExecutor, schemas_for_profile
+from openagent.tools.registry import ALL_TOOLS, Tool, ToolExecutor, schemas_for_profile
 
 
 def make_ctx(root: Path, profile_name: str = SAFE_EDIT) -> ToolContext:
@@ -168,3 +174,87 @@ def test_executor_rejects_unknown_and_oversized_arguments(tmp_path: Path):
         )
     )
     assert not oversized.ok and "exceeds 65536 bytes" in oversized.content
+
+
+def _replace_read_handler(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
+    original = ALL_TOOLS["read_file"]
+
+    def _raise(_ctx, **_kwargs):
+        raise exc
+
+    monkeypatch.setitem(
+        ALL_TOOLS,
+        "read_file",
+        Tool(original.name, original.description, original.parameters, _raise),
+    )
+
+
+@pytest.mark.parametrize(
+    ("exc", "error_type"),
+    [
+        (OSError("disk unavailable"), "os_error"),
+        (PermissionError("access denied"), "permission_denied"),
+        (UnicodeError("invalid encoding"), "encoding_error"),
+        (WorkspaceBudgetExceeded("workspace byte budget exceeded"), "workspace_budget_exceeded"),
+        (ExecutionBackendError("backend unavailable"), "execution_backend_error"),
+        (OutputLimitExceeded(10), "output_limit_exceeded"),
+    ],
+)
+def test_executor_converts_operational_exceptions_to_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+    error_type: str,
+):
+    _replace_read_handler(monkeypatch, exc)
+    result = ToolExecutor(make_ctx(tmp_path)).execute(
+        ToolCall(id="1", name="read_file", arguments={"path": "anything"})
+    )
+    assert result.ok is False
+    assert result.data["error_type"] == error_type
+    assert result.content
+
+
+def test_operational_exception_secret_is_redacted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    secret = "prefixless-secret-99887766"
+    _replace_read_handler(monkeypatch, OSError(f"backend echoed {secret}"))
+    with secret_scope(secret):
+        result = ToolExecutor(make_ctx(tmp_path)).execute(
+            ToolCall(id="1", name="read_file", arguments={"path": "anything"})
+        )
+    assert result.ok is False
+    assert secret not in result.content
+    assert "[REDACTED]" in result.content
+
+
+def test_unexpected_handler_exception_fails_with_normalized_internal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    secret = "sk-secret-value-that-must-not-escape"
+    _replace_read_handler(monkeypatch, AssertionError(f"invariant broke: {secret}"))
+    with pytest.raises(ToolExecutionInternalError) as excinfo:
+        ToolExecutor(make_ctx(tmp_path)).execute(
+            ToolCall(id="1", name="read_file", arguments={"path": "anything"})
+        )
+    assert excinfo.value.error_type == "tool_internal_error"
+    assert secret not in str(excinfo.value)
+    assert "internal error" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        KeyboardInterrupt(),
+        SystemExit(2),
+        asyncio.CancelledError(),
+        RunCancelled(),
+    ],
+)
+def test_executor_never_swallows_process_or_cancellation_control_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+):
+    _replace_read_handler(monkeypatch, exc)
+    with pytest.raises(type(exc)):
+        ToolExecutor(make_ctx(tmp_path)).execute(
+            ToolCall(id="1", name="read_file", arguments={"path": "anything"})
+        )

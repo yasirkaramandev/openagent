@@ -44,6 +44,7 @@ counted (as :attr:`TokenUsage.reasoning_tokens`) but the tokens themselves are n
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -67,10 +68,14 @@ from .base import (
     CliCapabilities,
     CliRunRequest,
     StreamOutcome,
-    detect_version,
-    find_executable,
     run_managed_cli,
 )
+from .installations import inspect_installation
+from .locator import CliLocation
+from .locator import locate_candidates as locate_cli_candidates
+from .model_discovery import CliModelDiscoveryResult, discover_codex_models
+from .updates import check_update as inspect_update
+from .updates import perform_update as execute_update
 
 SOURCE = "codex-cli"
 
@@ -101,21 +106,48 @@ _CHANGE_EVENT = {
 
 class CodexAdapter:
     def __init__(self, executable: str | None = None) -> None:
-        self.executable = executable or find_executable("codex")
+        self._explicit_executable = executable
+        self.location: CliLocation = locate_cli_candidates("codex", explicit_path=executable)
+        self.executable = executable or self.location.active_executable
+        self.last_model_discovery: CliModelDiscoveryResult | None = None
         self._processes: dict[str, ManagedProcess] = {}
 
     async def detect(self) -> CliInstallation | None:
-        if not self.executable:
-            return None
-        version = detect_version(self.executable)
-        return CliInstallation(
-            id="cli_codex",
-            type="codex",
-            executable=self.executable,
-            version=version,
+        self.location = await asyncio.to_thread(self.locate_candidates)
+        install = inspect_installation(
+            "codex",
+            self.location,
             adapter="codex-json",
-            authenticated=None,
             validated_version=VALIDATED_VERSION,
+        )
+        if install is not None:
+            self.executable = install.executable
+        return install
+
+    def locate_candidates(self) -> CliLocation:
+        self.location = locate_cli_candidates("codex", explicit_path=self._explicit_executable)
+        return self.location
+
+    async def inspect_installation(self) -> CliInstallation | None:
+        return await self.detect()
+
+    async def check_update(self):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("codex is not installed")
+        return await asyncio.to_thread(inspect_update, installation)
+
+    async def perform_update(self, *, dry_run: bool = False, active_run_ids=()):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("codex is not installed")
+        status = await asyncio.to_thread(inspect_update, installation)
+        return await asyncio.to_thread(
+            execute_update,
+            installation,
+            status,
+            dry_run=dry_run,
+            active_run_ids=active_run_ids,
         )
 
     async def inspect_auth(self) -> AuthStatus:
@@ -132,6 +164,21 @@ class CodexAdapter:
             edits_files=True,
             runs_commands=True,
         )
+
+    model_discovery_method = "codex app-server model/list"
+
+    async def list_models(self) -> list[str]:
+        if not self.executable:
+            raise RuntimeError("codex is not installed")
+        install = await self.detect()
+        result = await discover_codex_models(
+            self.executable,
+            version=install.version if install is not None else None,
+        )
+        self.last_model_discovery = result
+        if not result.available:
+            raise RuntimeError(result.error or "Codex model/list is unavailable")
+        return result.models
 
     # ------------------------------------------------------------------ running
 

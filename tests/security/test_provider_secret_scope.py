@@ -95,10 +95,13 @@ async def test_the_key_does_not_outlive_the_call(oa_app, echoing_provider):
 
 
 async def test_remote_models_config_scopes_and_redacts(oa_app, echoing_provider):
-    models = await oa_app.providers.remote_models_config(
+    result = await oa_app.providers.remote_models_config(
         provider_type="openai", base_url="https://example.invalid/v1", api_key=PREFIXLESS
     )
-    assert models == []
+    assert result.models == []
+    assert result.ok is False
+    assert result.error_type == "unauthorized"
+    assert PREFIXLESS not in (result.error_message or "")
     assert active_secret_count() == 0
 
 

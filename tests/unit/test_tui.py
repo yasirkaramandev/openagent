@@ -38,6 +38,29 @@ async def test_dashboard_boots_and_shows_stats(tmp_path: Path):
         assert "OpenAgent" in str(stats.render())
 
 
+async def test_dashboard_degrades_each_failed_data_source_and_keeps_doctor_reachable(
+    tmp_path: Path, monkeypatch
+):
+    oa = _make_app(tmp_path)
+
+    def broken_agents():
+        raise ValueError("corrupt record containing sk-secret-value-that-must-not-render")
+
+    monkeypatch.setattr(oa.agents, "list", broken_agents)
+    app = OpenAgentTUI(oa)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        rendered = str(app.screen.query_one("#stats").render())
+        assert "Agents" in rendered and "unavailable" in rendered
+        assert "Providers" in rendered
+        assert "Database compatibility issue detected" in rendered
+        assert "sk-secret-value-that-must-not-render" not in rendered
+
+        await pilot.click("#dash-doctor")
+        await pilot.pause()
+        assert isinstance(app.screen, DoctorScreen)
+
+
 async def test_open_agents_and_doctor_sections(tmp_path: Path):
     app = OpenAgentTUI(_make_app(tmp_path))
     async with app.run_test() as pilot:

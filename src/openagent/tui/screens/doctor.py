@@ -39,7 +39,15 @@ class DoctorScreen(Screen):
             self.app.pop_screen()
 
     async def _load(self) -> None:
-        checks = await self.app.oa.doctor.run()  # type: ignore[attr-defined]
+        try:
+            checks = await self.app.oa.doctor.run()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a diagnostic screen must not show a crash traceback
+            self.query_one("#checks", Static).update(
+                "[red]✗ Doctor could not complete diagnostics.[/red]\n"
+                "Database compatibility or migration failure detected; no record contents were "
+                "rendered."
+            )
+            return
         lines = []
         for c in checks:
             mark = self._MARKS.get(c.status, "?")

@@ -18,7 +18,6 @@ from ..core.models import (
     ModelCapabilities,
     Protocol,
     ProviderConnection,
-    RemoteModel,
     enum_value,
 )
 from ..credentials.redaction import redact, secret_scope
@@ -27,6 +26,9 @@ from ..providers.discovery import (
     PROBE_UNREACHABLE,
     PROBE_VERSION,
     AgentModelProbe,
+    ModelDiscoveryResult,
+    discover_models,
+    failed_model_discovery,
     probe_agent_model,
 )
 from ..providers.factory import build_adapter, get_preset, resolve_base_url
@@ -483,11 +485,11 @@ class ProviderService:
         workspace_id: str | None = None,
         api_key: str | None = None,
         key_env: str | None = None,
-    ) -> Sequence[RemoteModel]:
+    ) -> ModelDiscoveryResult:
         """List models for a *would-be* provider before it is saved (Add-Agent new-connection flow).
 
         Mirrors :meth:`test_config`: builds a transient adapter from the supplied fields, persists
-        nothing, and never stores or echoes the key. Best-effort — returns ``[]`` on any failure.
+        nothing, and never stores or echoes the key. Empty catalogs and failures remain distinct.
         """
 
         preset = get_preset(provider_type)
@@ -508,13 +510,11 @@ class ProviderService:
         with secret_scope(key):
             try:
                 resolve_base_url(provider)
-            except ValueError:
-                return []
+            except ValueError as exc:
+                return failed_model_discovery(exc, source=self._model_discovery_source(provider))
             adapter = build_adapter(provider, key)
             try:
-                return await adapter.list_models()
-            except Exception:  # noqa: BLE001 - discovery is best-effort
-                return []
+                return await discover_models(adapter, source=self._model_discovery_source(provider))
             finally:
                 await _maybe_close(adapter)
 
@@ -532,17 +532,25 @@ class ProviderService:
             finally:
                 await _maybe_close(adapter)
 
-    async def remote_models(self, name: str) -> Sequence[RemoteModel]:
+    async def remote_models(self, name: str) -> ModelDiscoveryResult:
         provider = self.get(name)
         if not provider:
-            return []
+            return ModelDiscoveryResult(
+                ok=False,
+                source="provider-configuration",
+                error_type="provider_missing",
+                error_message="provider not found",
+            )
         with self.adapter_scope(provider) as adapter:
             try:
-                return await adapter.list_models()
-            except Exception:  # noqa: BLE001 - discovery is best-effort
-                return []
+                return await discover_models(adapter, source=self._model_discovery_source(provider))
             finally:
                 await _maybe_close(adapter)
+
+    @staticmethod
+    def _model_discovery_source(provider: ProviderConnection) -> str:
+        endpoint = "/v1/models" if provider.protocol is Protocol.ANTHROPIC_MESSAGES else "/models"
+        return f"{provider.provider_type}:{endpoint}"
 
     # ------------------------------------------------------------------ capability probe (§15, §16)
 

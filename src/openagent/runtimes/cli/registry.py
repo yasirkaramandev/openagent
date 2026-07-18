@@ -7,7 +7,7 @@ the TUI never hard-codes the list of CLIs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ...core.models import CliInstallation
@@ -15,6 +15,7 @@ from .antigravity import AntigravityAdapter
 from .base import CliAdapter
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .model_discovery import CliModelOption
 
 #: Known first-class CLI adapters, keyed by type.
 _BUILDERS: dict[str, Any] = {
@@ -60,6 +61,15 @@ class CliRegistryEntry:
     #: The version the adapter was actually validated against, and whether that's what is installed.
     validated_version: str | None = None
     version_verified: bool = False
+    install_source: str = "unknown"
+    resolved_executable: str | None = None
+    shadowed_executables: list[str] = field(default_factory=list)
+    path_conflict: bool = False
+    desktop_conflict: bool = False
+    release_channel: str | None = None
+    update_state: str = "unknown"
+    latest_version: str | None = None
+    model_discovery_method: str = ""
 
 
 def build_cli_adapter(cli_type: str, executable: str | None = None) -> CliAdapter:
@@ -136,16 +146,17 @@ class CliModelDiscovery:
     models: list[str]
     method: str = ""
     error: str | None = None
+    options: list[CliModelOption] = field(default_factory=list)
+    partial: bool = False
 
 
 async def discover_cli_models(cli_type: str, executable: str | None = None) -> CliModelDiscovery:
     """Discover a CLI's models via its own real command — never a hard-coded guess (Phase 4).
 
     The single adapter-level contract: an adapter that can enumerate models offline exposes an async
-    ``list_models()`` (Antigravity does, via ``agy models``). Codex and Claude Code expose a
-    ``--model`` flag but no listing command, so discovery is reported ``available=False`` with an
-    actionable message — the wizard falls back to a manual id or the CLI's configured default, and
-    never labels an unverified manual choice as "verified".
+    ``list_models()``. Codex uses the installed app-server's documented ``model/list`` method,
+    Claude combines documented aliases/config with credential-scoped model endpoints, and
+    Antigravity uses ``agy models``. Failures remain honest fallbacks rather than fabricated lists.
     """
 
     try:
@@ -167,7 +178,26 @@ async def discover_cli_models(cli_type: str, executable: str | None = None) -> C
         models = await lister()
     except Exception as exc:  # noqa: BLE001 - discovery is best-effort; surface the real reason
         return CliModelDiscovery(cli_type, False, [], method, str(exc))
-    return CliModelDiscovery(cli_type, True, list(models), method)
+    catalog = getattr(adapter, "last_model_discovery", None)
+    if catalog is not None:
+        return CliModelDiscovery(
+            cli_type=cli_type,
+            available=catalog.available,
+            models=catalog.models,
+            method=catalog.method,
+            error=catalog.error,
+            options=list(catalog.options),
+            partial=catalog.partial,
+        )
+    options = [
+        CliModelOption(
+            id=model,
+            display_name=model,
+            source=method or f"{cli_type}-models",
+        )
+        for model in models
+    ]
+    return CliModelDiscovery(cli_type, True, list(models), method, options=options)
 
 
 async def cli_registry_entries() -> list[CliRegistryEntry]:
@@ -217,6 +247,25 @@ async def cli_registry_entries() -> list[CliRegistryEntry]:
                 status_label=label,
                 validated_version=install.validated_version if install else None,
                 version_verified=verified,
+                install_source=install.install_source.value if install else "unknown",
+                resolved_executable=install.resolved_executable if install else None,
+                shadowed_executables=(list(install.shadowed_executables) if install else []),
+                path_conflict=bool(install and install.shadowed_executables),
+                desktop_conflict=bool(
+                    getattr(getattr(adapter, "location", None), "desktop_conflict", False)
+                ),
+                release_channel=install.release_channel if install else None,
+                update_state=(
+                    install.update_status.state.value
+                    if install and install.update_status is not None
+                    else "unknown"
+                ),
+                latest_version=(
+                    install.update_status.latest_version
+                    if install and install.update_status is not None
+                    else None
+                ),
+                model_discovery_method=str(getattr(adapter, "model_discovery_method", "") or ""),
             )
         )
     return entries

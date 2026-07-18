@@ -857,6 +857,15 @@ class SessionRepository:
         return Session.model_validate(row[0]) if row else None
 
 
+class MalformedEventBody(ValueError):
+    """A durable event row exists but its JSON body cannot be normalized."""
+
+    def __init__(self, seq: int, detail: str) -> None:
+        super().__init__(f"event seq {seq} is malformed: {detail}")
+        self.seq = seq
+        self.detail = detail
+
+
 class EventIndexRepository:
     """SQLite-authoritative event body store and per-run sequence allocator."""
 
@@ -934,6 +943,83 @@ class EventIndexRepository:
                 select(t.events.c.body).where(t.events.c.run_id == run_id).order_by(t.events.c.seq)
             ).all()
         return [NormalizedEvent.model_validate(row[0]) for row in rows]
+
+    def iter_events_after(
+        self,
+        run_id: str,
+        after_seq: int,
+        limit: int = 500,
+    ) -> Iterator[tuple[int, NormalizedEvent]]:
+        """Read one keyset-paginated event batch for an authoritative live tailer.
+
+        Unlike :meth:`iter_event_rows`, this performs exactly one bounded query. A poller controls
+        when to fetch another page, so it never accidentally rereads the whole history on every
+        tick. Malformed durable rows carry their sequence in :class:`MalformedEventBody`, allowing
+        a tailer to report/skip the corrupt row instead of spinning on it forever.
+        """
+
+        if limit < 1:
+            return
+        with self.db.engine.connect() as conn:
+            rows = conn.execute(
+                select(t.events.c.seq, t.events.c.body)
+                .where(t.events.c.run_id == run_id, t.events.c.seq > after_seq)
+                .order_by(t.events.c.seq)
+                .limit(limit)
+            ).all()
+        for seq, body in rows:
+            numeric_seq = int(seq)
+            try:
+                event = NormalizedEvent.model_validate(body)
+            except Exception as exc:  # noqa: BLE001 - normalize into a sequence-aware read error
+                raise MalformedEventBody(numeric_seq, str(exc)[:500]) from exc
+            yield numeric_seq, event
+
+    def latest_activity_events(self, run_ids: Sequence[str]) -> dict[str, NormalizedEvent]:
+        """Fetch the newest projection-relevant event for many runs in one indexed query."""
+
+        if not run_ids:
+            return {}
+        activity_types = (
+            "run.phase",
+            "reasoning.summary",
+            "progress.updated",
+            "plan.updated",
+            "command.started",
+            "command.output",
+            "command.completed",
+            "file.created",
+            "file.modified",
+            "file.deleted",
+            "tool.started",
+            "tool.completed",
+            "tool.failed",
+            "web_search.started",
+            "web_search.completed",
+            "message.started",
+            "message.delta",
+            "message.completed",
+        )
+        latest = (
+            select(t.events.c.run_id, func.max(t.events.c.seq).label("max_seq"))
+            .where(t.events.c.run_id.in_(run_ids), t.events.c.type.in_(activity_types))
+            .group_by(t.events.c.run_id)
+            .subquery()
+        )
+        with self.db.engine.connect() as conn:
+            rows = conn.execute(
+                select(t.events.c.run_id, t.events.c.body).join(
+                    latest,
+                    (t.events.c.run_id == latest.c.run_id) & (t.events.c.seq == latest.c.max_seq),
+                )
+            ).all()
+        result: dict[str, NormalizedEvent] = {}
+        for run_id, body in rows:
+            try:
+                result[str(run_id)] = NormalizedEvent.model_validate(body)
+            except Exception:  # noqa: BLE001 - Runs screen degrades to persisted phase
+                continue
+        return result
 
     def iter_event_rows(
         self, run_id: str, *, after_seq: int = 0, batch_size: int = 500

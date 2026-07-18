@@ -418,6 +418,7 @@ class RunService:
                 report = await self.preflight.check(
                     agent_name=run.agent,
                     permission_profile=run.permission_profile,
+                    run_id=run.id,
                 )
                 sink(
                     NormalizedEvent(

@@ -58,10 +58,14 @@ from .base import (
     AuthStatus,
     CliCapabilities,
     CliRunRequest,
-    detect_version,
-    find_executable,
     run_managed_cli,
 )
+from .installations import antigravity_updater_state, inspect_installation
+from .locator import CliLocation
+from .locator import locate_candidates as locate_cli_candidates
+from .model_discovery import CliModelDiscoveryResult, discover_agy_models
+from .updates import check_update as inspect_update
+from .updates import perform_update as execute_update
 
 SOURCE = "antigravity-cli"
 
@@ -91,22 +95,21 @@ def _env_flag(name: str) -> bool:
 
 
 def _run_agy_models(executable: str) -> list[str]:
-    """Run ``agy models`` and return the model labels it prints (one per line). Raises on failure."""
+    """Legacy test/helper surface; production discovery uses the bounded model_discovery path."""
 
-    try:
-        result = subprocess.run(
-            [executable, "models"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"`agy models` did not run: {exc}") from exc
+    result = subprocess.run(  # noqa: S603 - exact executable and structured argv
+        [executable, "models"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip() or f"exit code {result.returncode}"
+        detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
         raise RuntimeError(f"`agy models` failed: {detail[:200]}")
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    from .model_discovery import parse_agy_models
+
+    return parse_agy_models(result.stdout)
 
 
 class AntigravityAdapter:
@@ -118,7 +121,10 @@ class AntigravityAdapter:
         allow_dangerous_bypass: bool | None = None,
     ) -> None:
         # The official executable is ``agy``; ``antigravity`` is accepted as an alias if present.
-        self.executable = executable or find_executable("agy", "antigravity")
+        self._explicit_executable = executable
+        self.location: CliLocation = locate_cli_candidates("antigravity", explicit_path=executable)
+        self.executable = executable or self.location.active_executable
+        self.last_model_discovery: CliModelDiscoveryResult | None = None
         self._processes: dict[str, ManagedProcess] = {}
         self.allow_experimental_edit = (
             _env_flag(EXPERIMENTAL_EDIT_ENV)
@@ -132,17 +138,45 @@ class AntigravityAdapter:
         )
 
     async def detect(self) -> CliInstallation | None:
-        if not self.executable:
-            return None
-        return CliInstallation(
-            id="cli_antigravity",
-            type="antigravity",
-            executable=self.executable,
-            version=detect_version(self.executable),
+        self.location = await asyncio.to_thread(self.locate_candidates)
+        install = inspect_installation(
+            "antigravity",
+            self.location,
             adapter="antigravity-json",
-            authenticated=None,
             experimental=False,
             validated_version=VALIDATED_VERSION,
+            **antigravity_updater_state(),
+        )
+        if install is not None:
+            self.executable = install.executable
+        return install
+
+    def locate_candidates(self) -> CliLocation:
+        self.location = locate_cli_candidates(
+            "antigravity", explicit_path=self._explicit_executable
+        )
+        return self.location
+
+    async def inspect_installation(self) -> CliInstallation | None:
+        return await self.detect()
+
+    async def check_update(self):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("Antigravity is not installed")
+        return await asyncio.to_thread(inspect_update, installation)
+
+    async def perform_update(self, *, dry_run: bool = False, active_run_ids=()):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("Antigravity is not installed")
+        status = await asyncio.to_thread(inspect_update, installation)
+        return await asyncio.to_thread(
+            execute_update,
+            installation,
+            status,
+            dry_run=dry_run,
+            active_run_ids=active_run_ids,
         )
 
     async def inspect_auth(self) -> AuthStatus:
@@ -182,7 +216,11 @@ class AntigravityAdapter:
 
         if not self.executable:
             raise RuntimeError("antigravity (agy) is not installed")
-        return await asyncio.to_thread(_run_agy_models, self.executable)
+        result = await asyncio.to_thread(discover_agy_models, self.executable)
+        self.last_model_discovery = result
+        if not result.available:
+            raise RuntimeError(result.error or "agy models failed")
+        return result.models
 
     # ------------------------------------------------------------------ running
 

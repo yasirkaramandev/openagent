@@ -11,6 +11,8 @@ from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
 from ...core.models import AgentProfile, enum_value
+from ...core.projection import RunProjection
+from ...runtimes.cli.registry import discover_cli_models
 from ...services.provider_service import ProviderInUseError
 from ..markup import safe_line, safe_markup
 
@@ -345,7 +347,31 @@ class ProvidersScreen(_TableScreen):
 
 
 class CliToolsScreen(_TableScreen):
-    title_text = "CLI Tools"
+    title_text = (
+        "CLI Tools  ([b]R[/b] refresh · [b]C[/b] check updates · "
+        "[b]U[/b] update selected · [b]A[/b] update all)"
+    )
+    BINDINGS = _TableScreen.BINDINGS + [
+        Binding("c", "check_updates", "Check updates"),
+        Binding("u", "update_selected", "Update selected"),
+        Binding("a", "update_all", "Update all"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._model_counts: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(self.title_text, classes="screen-title")
+        yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+        with Horizontal(classes="action-bar"):
+            yield Button("Refresh", id="cli-refresh")
+            yield Button("Check Updates", id="cli-check")
+            yield Button("Update Selected", id="cli-update")
+            yield Button("Update All", id="cli-update-all")
+            yield Button("Back", id="cli-back")
+        yield Footer()
 
     def on_mount(self) -> None:
         import asyncio
@@ -357,15 +383,126 @@ class CliToolsScreen(_TableScreen):
         self.reload()
 
     async def _discover(self) -> None:
-        await self.app.oa.clis.discover(persist=True)  # type: ignore[attr-defined]
+        installations = await self.app.oa.clis.discover(persist=True)  # type: ignore[attr-defined]
+        for installation in installations:
+            result = await discover_cli_models(installation.type, installation.executable)
+            self._model_counts[installation.type] = (
+                str(len(result.models)) if result.available else "manual/default"
+            )
         self.reload()
 
     def populate(self, table: DataTable) -> None:
-        table.add_columns("Type", "Version", "Executable", "Auth", "Adapter")
+        table.add_columns(
+            "Type",
+            "Current",
+            "Latest",
+            "Update",
+            "Update detail",
+            "Source",
+            "Active Executable",
+            "Shadowed / conflicts",
+            "Auth",
+            "Models",
+            "Adapter",
+        )
         for c in self.app.oa.clis.list():  # type: ignore[attr-defined]
             auth = "yes" if c.authenticated else ("no" if c.authenticated is False else "?")
             label = f"{c.type}{' (exp)' if c.experimental else ''}"
-            table.add_row(label, c.version or "—", c.executable, auth, c.adapter)
+            update = c.update_status
+            table.add_row(
+                label,
+                c.version or "—",
+                update.latest_version if update and update.latest_version else "—",
+                update.state.value if update else "unknown",
+                safe_line(update.detail, 500) if update and update.detail else "—",
+                c.install_source.value,
+                c.executable,
+                safe_line("; ".join(c.shadowed_executables), 500) or "—",
+                auth,
+                self._model_counts.get(c.type, "?"),
+                c.adapter,
+                key=c.type,
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "cli-refresh": self.action_refresh,
+            "cli-check": self.action_check_updates,
+            "cli-update": self.action_update_selected,
+            "cli-update-all": self.action_update_all,
+            "cli-back": self.app.pop_screen,
+        }
+        action = actions.get(event.button.id or "")
+        if action is not None:
+            action()
+
+    def _selected_type(self) -> str | None:
+        table = self.query_one("#table", DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            return str(table.get_row_at(table.cursor_row)[0]).removesuffix(" (exp)")
+        except Exception:  # pragma: no cover - transient table rebuild
+            return None
+
+    def action_check_updates(self) -> None:
+        self.notify("checking official update metadata…")
+        self.run_worker(self._check_updates(), exclusive=True)
+
+    async def _check_updates(self) -> None:
+        await self.app.oa.clis.check_updates(refresh=True)  # type: ignore[attr-defined]
+        self.reload()
+        self.notify("CLI update check complete")
+
+    def action_update_selected(self) -> None:
+        cli_type = self._selected_type()
+        if cli_type:
+            self._confirm_update(cli_type)
+
+    def action_update_all(self) -> None:
+        self._confirm_update(None)
+
+    def _confirm_update(self, cli_type: str | None) -> None:
+        from .modals import ConfirmModal
+
+        target = safe_markup(cli_type, 40) if cli_type else "all installed CLIs"
+
+        def done(confirmed: bool | None) -> None:
+            if confirmed:
+                self.run_worker(self._perform_update(cli_type), exclusive=True)
+
+        self.app.push_screen(
+            ConfirmModal(
+                f"Update [b]{target}[/b]? Active runs, unknown sources, and conflicts remain blocked.",
+                confirm_label="Update",
+            ),
+            callback=done,
+        )
+
+    async def _perform_update(self, cli_type: str | None) -> None:
+        try:
+            if cli_type is None:
+                results = await self.app.oa.clis.update_all()  # type: ignore[attr-defined]
+            else:
+                result = await self.app.oa.clis.update(cli_type)  # type: ignore[attr-defined]
+                results = {cli_type: result}
+        except Exception as exc:  # noqa: BLE001 - updater error is user-visible, screen stays alive
+            self.notify(f"CLI update failed: {safe_line(exc, 500)}", severity="error", timeout=8)
+            return
+        self.reload()
+        failed = [
+            name
+            for name, result in results.items()
+            if result.status.state.value in {"blocked", "check_failed"}
+        ]
+        if failed:
+            self.notify(
+                f"update blocked/failed: {', '.join(failed)}",
+                severity="error",
+                timeout=8,
+            )
+        else:
+            self.notify("CLI update complete", severity="information")
 
 
 _ACTIVE_STATUSES = ("queued", "starting", "running", "waiting_approval")
@@ -381,12 +518,19 @@ class RunsScreen(_TableScreen):
         Binding("c", "cancel_run", "Cancel"),
     ]
 
+    def on_mount(self) -> None:
+        self.reload()
+        self.set_interval(1.0, self.reload)
+
     def populate(self, table: DataTable) -> None:
         table.add_columns(
             "ID", "Agent", "Runtime", "Phase", "Status", "Elapsed", "Activity", "Files"
         )
         oa = self.app.oa  # type: ignore[attr-defined]
-        for r in oa.runs.list(50):
+        runs = list(oa.runs.list(50))
+        active_ids = [r.id for r in runs if enum_value(r.status) in _ACTIVE_STATUSES]
+        sqlite_activity = oa.repos.event_index.latest_activity_events(active_ids)
+        for r in runs:
             status = enum_value(r.status)
             agent = oa.agents.get(r.agent)
             runtime = "—"
@@ -399,7 +543,13 @@ class RunsScreen(_TableScreen):
             if live is not None:
                 activity = live.projection.current_activity
             elif status in _ACTIVE_STATUSES:
-                activity = r.phase
+                event = sqlite_activity.get(r.id)
+                if event is not None:
+                    activity_projection = RunProjection(r.id)
+                    activity_projection.apply(event)
+                    activity = activity_projection.current_activity or r.phase
+                else:
+                    activity = r.phase
             table.add_row(
                 r.id,
                 r.agent,

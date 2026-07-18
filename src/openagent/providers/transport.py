@@ -213,20 +213,26 @@ class Transport:
     async def get_json(self, path: str) -> dict[str, Any]:
         try:
             response = await asyncio.wait_for(self.client().get(path), timeout=self.total_timeout)
-        except (
-            TimeoutError,
-            asyncio.TimeoutError,
-            httpx.TimeoutException,
-            httpx.TransportError,
-        ) as exc:
+        except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
             raise TransportError(ErrorType.TIMEOUT, "provider request timed out") from exc
+        except httpx.TransportError as exc:
+            # Keep URLs and proxy diagnostics out of the durable/user-visible message; discovery
+            # still distinguishes this from a timeout via CONNECTION_LOST.
+            raise TransportError(
+                ErrorType.CONNECTION_LOST, "provider network request failed"
+            ) from exc
         if response.status_code >= 400:
             raise TransportError(
                 classify_http_status(response.status_code),
                 _error_text(response),
                 status=response.status_code,
             )
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise TransportError(
+                ErrorType.INVALID_REQUEST, "provider returned invalid JSON"
+            ) from exc
         if not isinstance(data, dict):
             raise TransportError(
                 ErrorType.INVALID_REQUEST, "provider returned a non-object JSON body"

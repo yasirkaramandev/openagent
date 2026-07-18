@@ -111,8 +111,33 @@ def test_api_agent_requires_existing_provider():
 
 def test_doctor_json():
     result = runner.invoke(app, ["doctor", "--json"])
-    assert result.exit_code == 0
+    # A fresh non-git project has advisory warnings, which is the documented exit-code 1 case.
+    assert result.exit_code == 1
     assert '"checks"' in result.stdout
+    assert '"exit_code": 1' in result.stdout
+
+
+def test_doctor_reports_unmigrated_legacy_nvidia_mapping():
+    added = runner.invoke(
+        app,
+        [
+            "provider",
+            "add",
+            "legacy-nvidia",
+            "--type",
+            "openai",
+            "--base-url",
+            "https://integrate.api.nvidia.com/v1",
+            "--key-env",
+            "NVIDIA_API_KEY",
+        ],
+    )
+    assert added.exit_code == 0, added.stdout
+
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 2
+    assert "Provider mapping: legacy-nvidia" in result.stdout
+    assert '"expected_type": "nvidia-build"' in result.stdout
 
 
 def test_output_missing_run_errors():
@@ -163,7 +188,6 @@ def test_machine_readable_list_outputs_are_json_roundtrippable():
         ["runs", "--json"],
         ["provider", "list", "--json"],
         ["agent", "list", "--json"],
-        ["doctor", "--json"],
         ["project", "list", "--json"],
     )
     for command in commands:

@@ -2,6 +2,9 @@ FROM alpine:3.20
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
+    'test "$(id -u)" = 65532' \
+    "grep -Eq '^NoNewPrivs:[[:space:]]+1' /proc/self/status" \
+    "grep -Eq '^Seccomp:[[:space:]]+2' /proc/self/status" \
     'test "$(ls /sys/class/net)" = lo' \
     "grep -q ' /workspace .*tmpfs' /proc/mounts" \
     'test "$(cat input.txt)" = "host snapshot"' \

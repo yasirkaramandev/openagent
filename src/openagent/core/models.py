@@ -192,6 +192,67 @@ class ModelVerification(BaseModel):
     model_fingerprint: str
 
 
+class ModelProbePayload(BaseModel):
+    """Secret-free capability evidence persisted in ``model_probes.data``.
+
+    Older rows used flattened capability fields while a short-lived build wrote a nested
+    ``capabilities`` object. Both are readable domain shapes; arbitrary extra provider response
+    data remains forbidden so a secret cannot become durable by accident.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    text: bool | None = None
+    streaming: bool | None = None
+    tool_calling: bool | None = None
+    capabilities: ModelCapabilities | None = None
+    agent_compatible: bool
+    category: str
+    detail: str = ""
+    tested_at: datetime | None = None
+    probe_version: str
+
+
+class ModelProbe(BaseModel):
+    """The complete relational and JSON representation of a persisted model probe."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cache_key: str
+    provider_id: str
+    model_id: str
+    base_url_fingerprint: str
+    protocol: str
+    credential_revision: str
+    probe_version: str
+    tested_at: datetime
+    data: ModelProbePayload
+
+
+class UsagePayload(BaseModel):
+    """Token accounting persisted in ``usage_records.data``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
+    provider_cost: float | None = Field(default=None, ge=0)
+
+
+class UsageRecord(BaseModel):
+    """The complete relational and JSON representation of one usage row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    run_id: str
+    timestamp: datetime
+    data: UsagePayload
+
+
 # --------------------------------------------------------------------------- agents
 
 
@@ -229,6 +290,57 @@ class AgentProfile(BaseModel):
 # --------------------------------------------------------------------------- CLI installs
 
 
+class CliInstallSource(str, Enum):
+    NATIVE = "native"
+    NPM = "npm"
+    HOMEBREW_CASK = "homebrew-cask"
+    HOMEBREW_FORMULA_LEGACY = "homebrew-formula-legacy"
+    WINGET = "winget"
+    APT = "apt"
+    DNF = "dnf"
+    APK = "apk"
+    STANDALONE_RELEASE = "standalone-release"
+    LEGACY_LOCAL = "legacy-local"
+    UNKNOWN = "unknown"
+
+
+class CliUpdatePolicy(str, Enum):
+    NOTIFY = "notify"
+    ASK = "ask"
+    AUTO = "auto"
+    NEVER = "never"
+
+
+class CliUpdateState(str, Enum):
+    CURRENT = "current"
+    AVAILABLE = "available"
+    UNKNOWN = "unknown"
+    CHECK_FAILED = "check_failed"
+    BLOCKED = "blocked"
+    RESTART_REQUIRED = "restart_required"
+
+
+class CliUpdateStatus(BaseModel):
+    """Cached, source-aware result of checking one active CLI installation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_version: str | None = None
+    latest_version: str | None = None
+    update_available: bool | None = None
+    state: CliUpdateState = CliUpdateState.UNKNOWN
+    install_source: CliInstallSource = CliInstallSource.UNKNOWN
+    active_executable: str = ""
+    resolved_executable: str = ""
+    shadowed_executables: list[str] = Field(default_factory=list)
+    check_method: str = ""
+    update_method: str | None = None
+    checked_at: datetime | None = None
+    cache_expires_at: datetime | None = None
+    detail: str = ""
+    restart_required: bool = False
+
+
 class CliInstallation(BaseModel):
     """A coding CLI detected on this machine (spec §3.4)."""
 
@@ -246,6 +358,17 @@ class CliInstallation(BaseModel):
     authenticated: bool | None = None
     adapter: str = ""
     experimental: bool = False
+    install_source: CliInstallSource = CliInstallSource.UNKNOWN
+    resolved_executable: str | None = None
+    shadowed_executables: list[str] = Field(default_factory=list)
+    update_status: CliUpdateStatus | None = None
+    last_checked_at: datetime | None = None
+    release_channel: str | None = None
+    minimum_version: str | None = None
+    auto_updates_disabled: bool = False
+    package_manager_auto_update: bool | None = None
+    updater_lock_path: str | None = None
+    updater_lock_present: bool = False
 
     @property
     def version_verified(self) -> bool:

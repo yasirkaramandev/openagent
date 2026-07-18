@@ -12,19 +12,25 @@ which actually exercises the selected model, may be used to call a model agent-c
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from ..core.errors import ErrorType
 from ..core.models import ModelCapabilities, ModelProfile, RemoteModel
+from ..credentials.redaction import redact
 from .base import (
     Message,
+    ModelCatalogError,
     NormalizedModelRequest,
     ProviderAdapter,
     Role,
     collect,
 )
+from .transport import TransportError
 
 DEFAULT_TTL = timedelta(days=7)
 
@@ -199,13 +205,99 @@ async def probe_agent_model(
     return AgentModelProbe(model_id, caps, agent_compatible, category, "", _now())
 
 
-async def discover_models(adapter: ProviderAdapter) -> list[RemoteModel]:
-    """List models the provider exposes (empty list if it has no ``/models``)."""
+class ModelDiscoveryResult(BaseModel):
+    """Structured outcome of one provider catalog request.
+
+    A valid empty catalog is ``ok=True`` with no models. Every transport/configuration/shape error
+    is ``ok=False`` and classified, so callers never have to guess why they received ``[]``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[RemoteModel] = Field(default_factory=list)
+    ok: bool
+    partial: bool = False
+    source: str
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+def failed_model_discovery(
+    exc: BaseException,
+    *,
+    source: str,
+    models: Sequence[RemoteModel] = (),
+) -> ModelDiscoveryResult:
+    """Classify a catalog failure without allowing its payload or credentials to escape."""
+
+    partial_models = list(models)
+    error_type: str | None
+    if isinstance(exc, ModelCatalogError):
+        partial_models = list(exc.models)
+        error_type = "malformed_response"
+    elif isinstance(exc, TransportError):
+        error_type = {
+            ErrorType.AUTHENTICATION_FAILED: "unauthorized",
+            ErrorType.PERMISSION_DENIED: "forbidden",
+            ErrorType.PROVIDER_RATE_LIMITED: "rate_limited",
+            ErrorType.TIMEOUT: "timeout",
+            ErrorType.CONNECTION_LOST: "network",
+            ErrorType.MODEL_NOT_FOUND: "endpoint_unsupported",
+        }.get(exc.error_type)
+        if error_type is None:
+            error_type = (
+                "malformed_response"
+                if "invalid json" in exc.message.lower() or "non-object json" in exc.message.lower()
+                else "endpoint_unsupported"
+            )
+    elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        error_type = "timeout"
+    elif isinstance(exc, PermissionError):
+        error_type = "forbidden"
+    elif isinstance(exc, (json.JSONDecodeError, ValidationError, TypeError, ValueError)):
+        error_type = "malformed_response"
+    elif isinstance(exc, OSError):
+        error_type = "network"
+    else:
+        lowered = str(exc).lower()
+        if "401" in lowered or "unauthorized" in lowered:
+            error_type = "unauthorized"
+        elif "403" in lowered or "forbidden" in lowered:
+            error_type = "forbidden"
+        elif "429" in lowered or "rate limit" in lowered:
+            error_type = "rate_limited"
+        elif "timeout" in lowered or "timed out" in lowered:
+            error_type = "timeout"
+        elif any(token in lowered for token in ("dns", "network", "connect", "name resolution")):
+            error_type = "network"
+        elif "404" in lowered or "not found" in lowered or "unsupported" in lowered:
+            error_type = "endpoint_unsupported"
+        elif "json" in lowered or "malformed" in lowered:
+            error_type = "malformed_response"
+        else:
+            error_type = "network"
+
+    safe_message = redact(str(exc)).strip()[:512] or error_type.replace("_", " ")
+    return ModelDiscoveryResult(
+        models=partial_models,
+        ok=False,
+        partial=bool(partial_models),
+        source=source,
+        error_type=error_type,
+        error_message=safe_message,
+    )
+
+
+async def discover_models(
+    adapter: ProviderAdapter, *, source: str = "provider-model-endpoint"
+) -> ModelDiscoveryResult:
+    """List models while preserving empty, partial, and classified failure states."""
 
     try:
-        return await adapter.list_models()
-    except Exception:  # noqa: BLE001 - discovery is best-effort
-        return []
+        models = await adapter.list_models()
+    except Exception as exc:  # noqa: BLE001 - classified result; cancellation remains BaseException
+        return failed_model_discovery(exc, source=source)
+    return ModelDiscoveryResult(models=models, ok=True, partial=False, source=source)
 
 
 #: Substrings that *hint* a catalog entry may not be a chat model. These drive a **warning only**

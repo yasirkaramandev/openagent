@@ -20,6 +20,15 @@ class ToolError(Exception):
     """Raised by tools for expected, reportable failures (bad path, denied command…)."""
 
 
+class ToolExecutionInternalError(RuntimeError):
+    """A tool handler violated an internal invariant; safe to expose, with no raw exception text."""
+
+    error_type = "tool_internal_error"
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(f"tool {tool_name!r} failed due to an internal error")
+
+
 @dataclass
 class ToolResult:
     ok: bool

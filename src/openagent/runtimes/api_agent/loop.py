@@ -89,7 +89,7 @@ async def run_api_agent(
         if cancel.cancelled:  # a new step must never begin after a cancel (item 9)
             return _cancelled(step - 1)
 
-        _emit(EventType.MESSAGE_STARTED, step=step)
+        _emit(EventType.MESSAGE_STARTED, item_id=f"msg_{step}", step=step)
         history_bytes = len(
             json.dumps(
                 [message.model_dump(mode="json") for message in conversation],
@@ -145,7 +145,12 @@ async def run_api_agent(
                             error_type=ErrorType.OUTPUT_LIMIT_EXCEEDED.value,
                             error_message="model text exceeded 1 MiB",
                         )
-                    _emit(EventType.MESSAGE_DELTA, text=event.text, step=step)
+                    _emit(
+                        EventType.MESSAGE_DELTA,
+                        item_id=f"msg_{step}",
+                        text=event.text,
+                        step=step,
+                    )
                 elif event.type == ModelEventType.TOOL_CALL and event.tool_call is not None:
                     call = event.tool_call
                     if not call.id or not call.name:

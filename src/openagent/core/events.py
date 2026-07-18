@@ -77,6 +77,11 @@ class EventType(str, Enum):
     USAGE_UPDATED = "usage.updated"
     RATE_LIMIT_DETECTED = "rate_limit.detected"
     RETRY_SCHEDULED = "retry.scheduled"
+    # machine-level CLI updater audit events (not run lifecycle terminals)
+    CLI_UPDATE_STARTED = "cli.update.started"
+    CLI_UPDATE_COMPLETED = "cli.update.completed"
+    CLI_UPDATE_FAILED = "cli.update.failed"
+    CLI_UPDATE_RESTART_REQUIRED = "cli.update.restart_required"
     # artifacts
     ARTIFACT_CREATED = "artifact.created"
     TEST_COMPLETED = "test.completed"
@@ -134,6 +139,8 @@ ITEM_EVENT_TYPES = frozenset(
         EventType.TOOL_STARTED.value,
         EventType.TOOL_COMPLETED.value,
         EventType.TOOL_FAILED.value,
+        EventType.MESSAGE_STARTED.value,
+        EventType.MESSAGE_DELTA.value,
         EventType.MESSAGE_COMPLETED.value,
     }
 )

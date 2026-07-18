@@ -10,7 +10,7 @@ import pytest
 
 from openagent.core.events import EventType, NormalizedEvent
 from openagent.storage.db import Database
-from openagent.storage.event_log import EventLog
+from openagent.storage.event_log import EventExportError, EventLog
 from openagent.storage.repositories import EventIndexRepository
 
 
@@ -56,8 +56,10 @@ def test_zero_progress_write_raises_and_does_not_advance_export_cursor(
     before_seq = log._exported_seq
 
     monkeypatch.setattr("openagent.storage.event_log.os.write", lambda _fd, _payload: 0)
-    with pytest.raises(OSError, match="made no progress"):
+    with pytest.raises(EventExportError, match="SQLite event committed") as raised:
         log.append(_event(2))
+    assert isinstance(raised.value.__cause__, OSError)
+    assert "made no progress" in str(raised.value.__cause__)
 
     assert log._exported_seq == before_seq
     assert [event.id for event in index.read("run_short_write")] == ["evt_1", "evt_2"]

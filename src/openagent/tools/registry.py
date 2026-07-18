@@ -16,12 +16,17 @@ from typing import Any
 
 from jsonschema import ValidationError, validate
 
+from ..core.cancellation import RunCancelled
 from ..core.events import ToolCall
 from ..core.limits import RUNTIME_LIMITS
 from ..core.permissions import PermissionProfile
+from ..credentials.redaction import redact
+from ..security.execution_backend import ExecutionBackendError
+from ..security.filesystem import WorkspaceBudgetExceeded
+from ..security.process import OutputLimitExceeded
 from . import control, fs, git
 from . import exec as exec_tools
-from .base import ToolContext, ToolError, ToolResult
+from .base import ToolContext, ToolError, ToolExecutionInternalError, ToolResult
 
 ToolHandler = Callable[..., ToolResult]
 
@@ -184,25 +189,61 @@ class ToolExecutor:
     def execute(self, call: ToolCall) -> ToolResult:
         tool = ALL_TOOLS.get(call.name)
         if tool is None:
-            return ToolResult.failure(f"unknown tool: {call.name}")
+            return ToolResult.failure(
+                f"unknown tool: {redact(call.name)}", error_type="unknown_tool"
+            )
         if tool.name not in self.ctx.profile.allowed_tools:
-            return ToolResult.failure(f"tool {call.name!r} is not permitted by this profile")
+            return ToolResult.failure(
+                f"tool {redact(call.name)!r} is not permitted by this profile",
+                error_type="permission_denied",
+            )
         try:
             encoded = json.dumps(call.arguments, ensure_ascii=False).encode("utf-8")
         except (TypeError, ValueError) as exc:
-            return ToolResult.failure(f"invalid arguments for {call.name}: {exc}")
+            return ToolResult.failure(
+                f"invalid arguments for {redact(call.name)}: {redact(str(exc))}",
+                error_type="invalid_arguments",
+            )
         if len(encoded) > RUNTIME_LIMITS.tool_arguments_bytes:
             return ToolResult.failure(
                 f"invalid arguments for {call.name}: exceeds "
-                f"{RUNTIME_LIMITS.tool_arguments_bytes} bytes"
+                f"{RUNTIME_LIMITS.tool_arguments_bytes} bytes",
+                error_type="invalid_arguments",
             )
         try:
             validate(instance=call.arguments, schema=tool.parameters)
         except ValidationError as exc:
-            return ToolResult.failure(f"invalid arguments for {call.name}: {exc.message}")
+            return ToolResult.failure(
+                f"invalid arguments for {redact(call.name)}: {redact(exc.message)}",
+                error_type="invalid_arguments",
+            )
         try:
             return tool.handler(self.ctx, **call.arguments)
+        except (control.TaskFinished, RunCancelled):
+            raise
         except ToolError as exc:
-            return ToolResult.failure(str(exc))
-        except TypeError as exc:  # bad/missing arguments from the model
-            return ToolResult.failure(f"invalid arguments for {call.name}: {exc}")
+            return _operational_failure("tool_error", exc)
+        except PermissionError as exc:
+            return _operational_failure("permission_denied", exc)
+        except WorkspaceBudgetExceeded as exc:
+            return _operational_failure("workspace_budget_exceeded", exc)
+        except ExecutionBackendError as exc:
+            return _operational_failure("execution_backend_error", exc)
+        except OutputLimitExceeded as exc:
+            return _operational_failure("output_limit_exceeded", exc)
+        except UnicodeError as exc:
+            return _operational_failure("encoding_error", exc)
+        except OSError as exc:
+            return _operational_failure("os_error", exc)
+        except Exception as exc:
+            # Schema validation already established the call shape. A TypeError/AssertionError/etc.
+            # raised *inside* the handler is therefore a programmer/invariant bug, not bad model
+            # input. Chain it for local diagnostics but expose only the normalized safe exception.
+            raise ToolExecutionInternalError(tool.name) from exc
+
+
+def _operational_failure(error_type: str, exc: BaseException) -> ToolResult:
+    """Turn an expected host/backend failure into bounded, redacted model-visible output."""
+
+    detail = redact(str(exc)).strip()[:1_000] or error_type.replace("_", " ")
+    return ToolResult.failure(detail, error_type=error_type)

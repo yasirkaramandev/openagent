@@ -466,9 +466,19 @@ class RunProjection:
             item.status = ItemStatus.COMPLETED.value
 
     def _apply_message(self, item: Item, data: dict) -> None:
-        item.text = str(data.get("text") or "")
+        if "text" in data:
+            item.text = str(data.get("text") or "")
         item.title = "Message"
         item.status = ItemStatus.COMPLETED.value
+
+    def _apply_message_started(self, item: Item, data: dict) -> None:
+        item.title = "Message"
+        item.status = ItemStatus.IN_PROGRESS.value
+
+    def _apply_message_delta(self, item: Item, data: dict) -> None:
+        item.title = "Message"
+        item.status = ItemStatus.IN_PROGRESS.value
+        item.text += str(data.get("delta") or data.get("text") or "")
 
 
 _RUN_LEVEL: dict[str, Any] = {
@@ -500,6 +510,8 @@ _ITEM_KIND: dict[str, str] = {
     EventType.TOOL_FAILED.value: "tool",
     EventType.WEB_SEARCH_STARTED.value: "web_search",
     EventType.WEB_SEARCH_COMPLETED.value: "web_search",
+    EventType.MESSAGE_STARTED.value: "message",
+    EventType.MESSAGE_DELTA.value: "message",
     EventType.MESSAGE_COMPLETED.value: "message",
 }
 
@@ -518,5 +530,7 @@ _ITEM_APPLY: dict[str, Any] = {
     EventType.TOOL_FAILED.value: RunProjection._apply_tool,
     EventType.WEB_SEARCH_STARTED.value: RunProjection._apply_web_search,
     EventType.WEB_SEARCH_COMPLETED.value: RunProjection._apply_web_search,
+    EventType.MESSAGE_STARTED.value: RunProjection._apply_message_started,
+    EventType.MESSAGE_DELTA.value: RunProjection._apply_message_delta,
     EventType.MESSAGE_COMPLETED.value: RunProjection._apply_message,
 }

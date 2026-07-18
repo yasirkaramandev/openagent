@@ -8,6 +8,7 @@ profile. Claude is not installed on this machine, so the mapping is validated ag
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -26,30 +27,63 @@ from .base import (
     AuthStatus,
     CliCapabilities,
     CliRunRequest,
-    detect_version,
-    find_executable,
     run_managed_cli,
 )
+from .installations import claude_update_preferences, inspect_installation
+from .locator import CliLocation
+from .locator import locate_candidates as locate_cli_candidates
+from .model_discovery import CliModelDiscoveryResult, discover_claude_models
+from .updates import check_update as inspect_update
+from .updates import perform_update as execute_update
 
 SOURCE = "claude-cli"
 
 
 class ClaudeAdapter:
     def __init__(self, executable: str | None = None, *, isolated: bool = False) -> None:
-        self.executable = executable or find_executable("claude")
+        self._explicit_executable = executable
+        self.location: CliLocation = locate_cli_candidates("claude", explicit_path=executable)
+        self.executable = executable or self.location.active_executable
+        self.last_model_discovery: CliModelDiscoveryResult | None = None
         self.isolated = isolated  # --bare mode (spec §8)
         self._processes: dict[str, ManagedProcess] = {}
 
     async def detect(self) -> CliInstallation | None:
-        if not self.executable:
-            return None
-        return CliInstallation(
-            id="cli_claude",
-            type="claude",
-            executable=self.executable,
-            version=detect_version(self.executable),
+        self.location = await asyncio.to_thread(self.locate_candidates)
+        install = inspect_installation(
+            "claude",
+            self.location,
             adapter="claude-stream-json",
-            authenticated=None,
+            **claude_update_preferences(),
+        )
+        if install is not None:
+            self.executable = install.executable
+        return install
+
+    def locate_candidates(self) -> CliLocation:
+        self.location = locate_cli_candidates("claude", explicit_path=self._explicit_executable)
+        return self.location
+
+    async def inspect_installation(self) -> CliInstallation | None:
+        return await self.detect()
+
+    async def check_update(self):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("Claude Code is not installed")
+        return await asyncio.to_thread(inspect_update, installation)
+
+    async def perform_update(self, *, dry_run: bool = False, active_run_ids=()):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("Claude Code is not installed")
+        status = await asyncio.to_thread(inspect_update, installation)
+        return await asyncio.to_thread(
+            execute_update,
+            installation,
+            status,
+            dry_run=dry_run,
+            active_run_ids=active_run_ids,
         )
 
     async def inspect_auth(self) -> AuthStatus:
@@ -68,6 +102,13 @@ class ClaudeAdapter:
             edits_files=True,
             runs_commands=True,
         )
+
+    model_discovery_method = "aliases + account settings"
+
+    async def list_models(self) -> list[str]:
+        result = await asyncio.to_thread(discover_claude_models)
+        self.last_model_discovery = result
+        return result.models
 
     # ------------------------------------------------------------------ running
 

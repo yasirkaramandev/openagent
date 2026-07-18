@@ -28,6 +28,7 @@ from .base import (
     collect,
     default_probe,
     normalized_tool_call,
+    parse_model_catalog,
     rough_token_estimate,
 )
 from .transport import Transport, TransportError
@@ -74,16 +75,8 @@ class AnthropicMessagesAdapter:
         return _classify_health(result.error_type, result.error_message)
 
     async def list_models(self) -> list[RemoteModel]:
-        try:
-            data = await self.transport.get_json("/v1/models")
-        except TransportError:
-            return []
-        items = data.get("data", [])
-        return [
-            RemoteModel(id=i["id"], display_name=i.get("display_name", i["id"]))
-            for i in items
-            if i.get("id")
-        ]
+        data = await self.transport.get_json("/v1/models")
+        return parse_model_catalog(data, display_name_key="display_name")
 
     async def probe_model(self, model_id: str) -> ModelCapabilities:
         return await default_probe(self, model_id)

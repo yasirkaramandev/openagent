@@ -20,6 +20,7 @@ from .base import (
     TokenEstimate,
     default_probe,
     normalized_tool_call,
+    parse_model_catalog,
     rough_token_estimate,
 )
 from .transport import Transport, TransportError
@@ -54,11 +55,7 @@ class OpenAIResponsesAdapter:
 
     async def list_models(self) -> list[RemoteModel]:
         data = await self.transport.get_json("/models")
-        return [
-            RemoteModel(id=i["id"], display_name=i.get("id"))
-            for i in data.get("data", [])
-            if i.get("id")
-        ]
+        return parse_model_catalog(data)
 
     async def probe_model(self, model_id: str) -> ModelCapabilities:
         return await default_probe(self, model_id)

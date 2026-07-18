@@ -22,18 +22,26 @@ blocks immediately.
 from __future__ import annotations
 
 import os
-import subprocess
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..core.models import AgentProfile, CredentialType, RuntimeType
+from ..core.models import (
+    AgentProfile,
+    CliInstallation,
+    CliUpdatePolicy,
+    CliUpdateState,
+    CredentialType,
+    RuntimeType,
+)
 from ..core.permissions import PROFILES, get_profile
 from ..credentials.redaction import redact, secret_scope
 from ..providers.factory import build_adapter, resolve_base_url
 from ..runtimes.cli.antigravity import AntigravityAdapter
-from ..runtimes.cli.base import detect_version, find_executable
+from ..runtimes.cli.locator import locate_candidates, run_bounded
 from ..runtimes.cli.registry import build_cli_adapter, known_cli_types
+from ..runtimes.cli.updates import cache_valid
 
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
@@ -127,6 +135,7 @@ class PreflightService:
         agent_name: str,
         permission_profile: str | None = None,
         workspace: Path | None = None,
+        run_id: str | None = None,
     ) -> PreflightReport:
         report = PreflightReport()
         agent = self.app.repos.agents.get(agent_name)
@@ -156,7 +165,7 @@ class PreflightService:
 
         rtype = agent.runtime.type
         if rtype in (RuntimeType.CLI, RuntimeType.CLI.value):
-            await self._check_cli(report, agent, profile_name)
+            await self._check_cli(report, agent, profile_name, run_id=run_id)
         else:
             self._check_api(report, agent)
         return report
@@ -164,7 +173,12 @@ class PreflightService:
     # ------------------------------------------------------------------ CLI
 
     async def _check_cli(
-        self, report: PreflightReport, agent: AgentProfile, profile_name: str
+        self,
+        report: PreflightReport,
+        agent: AgentProfile,
+        profile_name: str,
+        *,
+        run_id: str | None = None,
     ) -> None:
         cli_type = agent.runtime.cli or ""
         if cli_type not in known_cli_types():
@@ -178,16 +192,46 @@ class PreflightService:
         report.add("CLI type is known", True, cli_type)
 
         adapter = build_cli_adapter(cli_type)
-        executable = getattr(adapter, "executable", None)
-        if not executable:
+        try:
+            inspector = getattr(adapter, "inspect_installation", adapter.detect)
+            installation = await inspector()
+        except Exception as exc:  # noqa: BLE001 - precise readiness failure below
+            installation = None
+            detection_error = str(exc)
+        else:
+            detection_error = ""
+        if installation is None:
             report.add(
                 f"{cli_type} is installed",
                 False,
-                f"{cli_type} was not found on PATH — install it, then re-run readiness",
+                detection_error
+                or f"{cli_type} was not found in PATH/native/package-manager candidates",
                 error_type="cli_not_found",
             )
             return
+        executable = installation.executable
         report.add(f"{cli_type} found", True, executable)
+        report.add(
+            "Active executable resolved",
+            True,
+            installation.resolved_executable or installation.executable,
+        )
+        report.add(
+            "Installation source identified",
+            installation.install_source.value != "unknown",
+            installation.install_source.value,
+            mandatory=False,
+        )
+        report.add(
+            "No conflicting CLI installations",
+            not installation.shadowed_executables,
+            (
+                ", ".join(installation.shadowed_executables)
+                if installation.shadowed_executables
+                else "no independent shadowed copies"
+            ),
+            mandatory=False,
+        )
 
         path = Path(executable)
         report.add(
@@ -197,12 +241,28 @@ class PreflightService:
             error_type="cli_not_found",
         )
 
-        version = detect_version(executable)
+        version = installation.version
         report.add(
             "Version detected",
             bool(version),
             version or "could not read --version",
             mandatory=False,
+        )
+
+        if installation.minimum_version:
+            minimum_ok = _version_at_least(version, installation.minimum_version)
+            report.add(
+                "CLI minimum-version policy",
+                minimum_ok,
+                f"detected {version or 'unknown'}, required {installation.minimum_version}",
+                error_type="cli_version_unsupported",
+            )
+
+        await self._check_cli_update_policy(
+            report,
+            cli_type,
+            installation,
+            run_id=run_id,
         )
 
         try:
@@ -243,6 +303,66 @@ class PreflightService:
                 f"{profile_name} on {cli_type}",
                 error_type="permission_mode_unsupported",
             )
+
+    async def _check_cli_update_policy(
+        self,
+        report: PreflightReport,
+        cli_type: str,
+        installation: CliInstallation,
+        *,
+        run_id: str | None,
+    ) -> None:
+        config = self.app.clis.update_config()
+        if not config.check_before_run or config.policy is CliUpdatePolicy.NEVER:
+            report.add(
+                "CLI update policy",
+                True,
+                f"{config.policy.value}; no pre-run network check",
+            )
+            return
+        cached_install = self.app.repos.clis.get(installation.id)
+        cached = cached_install.update_status if cached_install is not None else None
+        refresh = not cache_valid(cached)
+        try:
+            checked = await self.app.clis.check_updates(refresh=refresh)
+        except Exception as exc:  # noqa: BLE001 - supported installed version may still run
+            report.add(
+                "CLI update check",
+                False,
+                f"check failed; continuing with installed version: {exc}",
+                mandatory=False,
+            )
+            return
+        current = next((item for item in checked if item.type == cli_type), installation)
+        status = current.update_status
+        if status is None:
+            return
+        if status.state is not CliUpdateState.AVAILABLE:
+            report.add(
+                "CLI update status",
+                status.state not in {CliUpdateState.BLOCKED, CliUpdateState.CHECK_FAILED},
+                status.detail or status.state.value,
+                mandatory=False,
+            )
+            return
+        if config.policy is CliUpdatePolicy.AUTO:
+            result = await self.app.clis.update(
+                cli_type,
+                exclude_run_ids=([run_id] if run_id else []),
+            )
+            report.add(
+                "CLI automatic update",
+                result.status.state not in {CliUpdateState.BLOCKED, CliUpdateState.CHECK_FAILED},
+                result.detail or result.status.detail,
+                mandatory=False,
+            )
+            return
+        report.add(
+            "CLI update available",
+            False,
+            f"{status.detail}; policy={config.policy.value}. Use `openagent cli update {cli_type}`",
+            mandatory=False,
+        )
 
     def _check_codex(self, report: PreflightReport, executable: str, profile_name: str) -> None:
         """Codex-specific readiness: ``codex exec``, JSON output, and the sandbox we will request."""
@@ -399,16 +519,10 @@ def _exec_help(executable: str) -> str | None:
     if executable in _HELP_CACHE:
         return _HELP_CACHE[executable]
     try:
-        result = subprocess.run(  # noqa: S603 - executable came from our own PATH lookup
-            [executable, "exec", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        result = run_bounded([executable, "exec", "--help"], 15, 512 * 1024)
         text = (result.stdout or "") + (result.stderr or "")
         _HELP_CACHE[executable] = text if result.returncode == 0 and text else None
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         _HELP_CACHE[executable] = None
     return _HELP_CACHE[executable]
 
@@ -417,15 +531,9 @@ def _root_help(executable: str) -> str | None:
     key = f"{executable}::__root__"
     if key not in _HELP_CACHE:
         try:
-            result = subprocess.run(
-                [executable, "--help"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
+            result = run_bounded([executable, "--help"], 10, 512 * 1024)
             _HELP_CACHE[key] = result.stdout + result.stderr if result.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
             _HELP_CACHE[key] = None
     return _HELP_CACHE[key]
 
@@ -437,4 +545,16 @@ def antigravity_permission_status(profile_name: str) -> tuple[bool, str]:
 
 
 def find_cli_executable(cli_type: str) -> str | None:
-    return find_executable(cli_type)
+    return locate_candidates(cli_type).active_executable
+
+
+def _version_at_least(current: str | None, minimum: str) -> bool:
+    def parts(value: str | None) -> tuple[int, ...] | None:
+        match = re.search(r"\d+(?:\.\d+)+", value or "")
+        return tuple(int(part) for part in match.group(0).split(".")) if match else None
+
+    left, right = parts(current), parts(minimum)
+    if left is None or right is None:
+        return False
+    width = max(len(left), len(right))
+    return left + (0,) * (width - len(left)) >= right + (0,) * (width - len(right))

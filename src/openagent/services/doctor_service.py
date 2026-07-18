@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from ..core.models import CredentialType, RuntimeType
+from ..core.models import CliUpdateState, CredentialType, RuntimeType
 from ..credentials.store import keychain_available
-from ..providers.factory import get_preset
+from ..providers.factory import get_preset, is_nvidia_build_endpoint
 from ..reporting.openagent_md import render_agents_block
 from ..runtimes.cli.registry import (
     cli_install_status,
@@ -37,16 +37,26 @@ class Check:
     name: str
     status: str
     detail: str = ""
+    data: dict = field(default_factory=dict)
+    exit_code_hint: int | None = None
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "status": self.status, "detail": self.detail}
+        result: dict[str, object] = {
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail,
+            "data": self.data,
+        }
+        if self.exit_code_hint is not None:
+            result["exit_code_hint"] = self.exit_code_hint
+        return result
 
 
 class DoctorService:
     def __init__(self, app: OpenAgentApp) -> None:
         self.app = app
 
-    async def run(self) -> list[Check]:
+    async def run(self, *, refresh_cli_updates: bool = False) -> list[Check]:
         checks: list[Check] = []
         checks.append(Check("OpenAgent configuration", OK, str(self.app.paths.config_dir)))
         checks.append(
@@ -54,8 +64,32 @@ class DoctorService:
                 "SQLite writable",
                 OK if self.app.db.writable() else FAIL,
                 str(self.app.paths.db_path),
+                exit_code_hint=2 if not self.app.db.writable() else None,
             )
         )
+        migration = self.app.db.migration_report
+        if migration is not None:
+            checks.append(
+                Check(
+                    "Database migration",
+                    OK,
+                    (
+                        f"schema {migration.to_revision}; applied "
+                        f"{', '.join(migration.applied) if migration.applied else 'none'}"
+                    ),
+                    data={
+                        "from_revision": migration.from_revision,
+                        "to_revision": migration.to_revision,
+                        "applied": list(migration.applied),
+                        "backup_path": (
+                            str(migration.backup_path)
+                            if migration.backup_path is not None
+                            else None
+                        ),
+                        "integrity_check": migration.integrity_check,
+                    },
+                )
+            )
         checks.append(
             Check(
                 "OS keychain available",
@@ -78,14 +112,39 @@ class DoctorService:
             )
         )
 
-        checks.extend(await self._cli_checks())
-        checks.extend(self._provider_checks())
-        checks.extend(self._agent_checks())
-        checks.append(self._event_store_check())
-        checks.append(self._openagent_md_check())
+        try:
+            checks.extend(await self._cli_checks(refresh_updates=refresh_cli_updates))
+        except Exception:  # noqa: BLE001 - Doctor must remain available for corrupt domain rows
+            checks.append(self._unavailable_domain_check("CLI installation records"))
+        for name, loader in (
+            ("Provider records", self._provider_checks),
+            ("Agent records", self._agent_checks),
+        ):
+            try:
+                checks.extend(loader())
+            except Exception:  # noqa: BLE001 - report classification, never record contents
+                checks.append(self._unavailable_domain_check(name))
+        try:
+            checks.append(self._event_store_check())
+        except Exception:  # noqa: BLE001
+            checks.append(self._unavailable_domain_check("Event records"))
+        try:
+            checks.append(self._openagent_md_check())
+        except Exception:  # noqa: BLE001
+            checks.append(Check("OPENAGENT.md sync", WARN, "could not inspect project document"))
         return checks
 
-    async def _cli_checks(self) -> list[Check]:
+    @staticmethod
+    def _unavailable_domain_check(name: str) -> Check:
+        return Check(
+            name,
+            FAIL,
+            "domain records are unavailable or incompatible; inspect the migration backup and "
+            "database health before continuing",
+            exit_code_hint=2,
+        )
+
+    async def _cli_checks(self, *, refresh_updates: bool = False) -> list[Check]:
         """Per-CLI readiness for every known runtime — Codex, Claude Code, and Antigravity (item 18).
 
         For each installed CLI, distinguishes: executable detected, authentication detected,
@@ -93,17 +152,82 @@ class DoctorService:
         A binary being present is never reported as "ready" on its own.
         """
 
+        if refresh_updates:
+            await self.app.clis.check_updates(refresh=True)
+        else:
+            # Local discovery refreshes paths/versions while retaining a matching cached update
+            # status. It never performs a network request.
+            await self.app.clis.discover(persist=True)
+        persisted = {installation.type: installation for installation in self.app.clis.list()}
+
         checks: list[Check] = []
         for entry in await cli_registry_entries():
             name = entry.display_name
+            stored = persisted.get(entry.type)
             if not entry.installed:
-                checks.append(Check(f"{name} installed", WARN, "not found"))
+                checks.append(Check(f"{name} executable", WARN, "not found"))
                 continue
             checks.append(
                 Check(
-                    f"{name} installed",
+                    f"{name} executable",
                     OK,
-                    entry.version or entry.executable or "detected",
+                    entry.executable or "detected",
+                    data={
+                        "active_executable": entry.executable,
+                        "resolved_executable": (
+                            stored.resolved_executable if stored else entry.resolved_executable
+                        ),
+                    },
+                )
+            )
+            checks.append(
+                Check(
+                    f"{name} version",
+                    OK if entry.version else WARN,
+                    entry.version or "could not determine version",
+                )
+            )
+            source = stored.install_source.value if stored else entry.install_source
+            checks.append(
+                Check(
+                    f"{name} install source",
+                    OK if source != "unknown" else WARN,
+                    source,
+                    data={
+                        "install_source": source,
+                        "release_channel": stored.release_channel
+                        if stored
+                        else entry.release_channel,
+                        "minimum_version": stored.minimum_version if stored else None,
+                        "auto_updates_disabled": (
+                            stored.auto_updates_disabled if stored else False
+                        ),
+                        "package_manager_auto_update": (
+                            stored.package_manager_auto_update if stored else None
+                        ),
+                    },
+                )
+            )
+            shadowed = (
+                list(stored.shadowed_executables)
+                if stored is not None
+                else list(entry.shadowed_executables)
+            )
+            conflict_detail = (
+                ", ".join(shadowed)
+                if shadowed
+                else ("desktop executable conflict detected" if entry.desktop_conflict else "none")
+            )
+            checks.append(
+                Check(
+                    f"{name} conflicting installations",
+                    WARN if shadowed or entry.desktop_conflict else OK,
+                    conflict_detail,
+                    data={
+                        "shadowed_executables": shadowed,
+                        "path_conflict": bool(shadowed),
+                        "desktop_executable_conflict": entry.desktop_conflict,
+                    },
                 )
             )
             checks.append(
@@ -128,9 +252,84 @@ class DoctorService:
                     f"{entry.status_label}; {caps}",
                 )
             )
+            update = stored.update_status if stored is not None else None
+            if update is None:
+                update_status = WARN
+                update_detail = "not checked (cached/offline); use --refresh-cli-updates"
+                update_data: dict = {
+                    "current_version": entry.version,
+                    "latest_version": None,
+                    "install_source": source,
+                    "active_executable": entry.executable,
+                    "shadowed_executables": shadowed,
+                    "checked_at": None,
+                    "update_available": None,
+                }
+            else:
+                update_status = (
+                    OK if update.state in {CliUpdateState.CURRENT, CliUpdateState.UNKNOWN} else WARN
+                )
+                update_detail = update.detail or update.state.value
+                update_data = update.model_dump(mode="json")
+            checks.append(
+                Check(
+                    f"{name} update",
+                    update_status,
+                    update_detail,
+                    data=update_data,
+                )
+            )
+            checks.append(
+                Check(
+                    f"{name} model discovery",
+                    OK if entry.model_discovery_method else WARN,
+                    entry.model_discovery_method or "manual model id or CLI default",
+                )
+            )
+            active_runs = self.app.clis.active_run_ids(entry.type)
+            checks.append(
+                Check(
+                    f"{name} active-run/update safety",
+                    WARN if active_runs else OK,
+                    (
+                        f"update blocked while active: {', '.join(active_runs[:5])}"
+                        if active_runs
+                        else "no active runs use this CLI"
+                    ),
+                    data={"active_run_ids": active_runs},
+                )
+            )
             if entry.type == "antigravity":
+                if stored is not None:
+                    checks.append(
+                        Check(
+                            "Antigravity updater lock",
+                            WARN if stored.updater_lock_present else OK,
+                            (
+                                f"present at {stored.updater_lock_path}; "
+                                "OpenAgent will not remove it"
+                                if stored.updater_lock_present
+                                else f"not present ({stored.updater_lock_path})"
+                            ),
+                            data={
+                                "path": stored.updater_lock_path,
+                                "present": stored.updater_lock_present,
+                            },
+                        )
+                    )
                 checks.append(self._antigravity_permission_check())
         return checks
+
+    @staticmethod
+    def exit_code(checks: list[Check]) -> int:
+        """Map diagnostics onto the documented stable doctor exit-code contract."""
+
+        hinted = [check.exit_code_hint for check in checks if check.exit_code_hint is not None]
+        if hinted:
+            return max(hinted)
+        if any(check.status != OK for check in checks):
+            return 1
+        return 0
 
     def _antigravity_permission_check(self) -> Check:
         """What Antigravity is actually allowed to do right now, and why (item 15)."""
@@ -161,6 +360,17 @@ class DoctorService:
             Check("Providers configured", OK, ", ".join(p.name for p in providers))
         ]
         for p in providers:
+            if p.provider_type == "openai" and is_nvidia_build_endpoint(p.base_url):
+                checks.append(
+                    Check(
+                        f"Provider mapping: {p.name}",
+                        FAIL,
+                        "the NVIDIA Build endpoint is still mapped as openai; migration 0010 "
+                        "should map this exact legacy record to nvidia-build",
+                        data={"provider_type": p.provider_type, "expected_type": "nvidia-build"},
+                        exit_code_hint=2,
+                    )
+                )
             checks.append(self._provider_credential_check(p))
         return checks
 
@@ -271,7 +481,12 @@ class DoctorService:
             if exported_ids != database_ids:
                 repairable += 1
         if issues:
-            return Check("Event store integrity", FAIL, "; ".join(issues[:10]))
+            return Check(
+                "Event store integrity",
+                FAIL,
+                "; ".join(issues[:10]),
+                exit_code_hint=4,
+            )
         if repairable:
             return Check(
                 "Event store integrity",

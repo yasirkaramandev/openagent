@@ -5,17 +5,38 @@ from pathlib import Path
 
 import pytest
 from textual.events import MouseScrollDown, MouseScrollUp
-from textual.widgets import Button
+from textual.widgets import Button, Static, TabbedContent
 
 from openagent.app import OpenAgentApp
 from openagent.config import Paths
-from openagent.core.models import RuntimeType
+from openagent.core.models import (
+    CliInstallation,
+    CliInstallSource,
+    CliUpdateState,
+    CliUpdateStatus,
+    RuntimeType,
+)
+from openagent.security.approvals import ApprovalRequest
+from openagent.services.doctor_service import DoctorService
 from openagent.tui.app import OpenAgentTUI
+from openagent.tui.screens import add_agent as add_agent_module
+from openagent.tui.screens import run_console as run_console_module
 from openagent.tui.screens.add_agent import AddAgentScreen
 from openagent.tui.screens.add_provider import AddProviderScreen
+from openagent.tui.screens.agent_detail import AgentDetailScreen
 from openagent.tui.screens.doctor import DoctorScreen
-from openagent.tui.screens.lists import AgentsScreen
-from openagent.tui.screens.modals import QuestionModal
+from openagent.tui.screens.lists import (
+    AgentsScreen,
+    CliToolsScreen,
+    ProvidersScreen,
+    RunsScreen,
+)
+from openagent.tui.screens.modals import (
+    ApprovalModal,
+    ConfirmModal,
+    InPlaceConfirmModal,
+    QuestionModal,
+)
 from openagent.tui.screens.run_console import RunConsoleScreen, RunSetupScreen
 
 SIZES = [(120, 40), (100, 30), (80, 24), (70, 20), (60, 18), (50, 14), (40, 12)]
@@ -34,7 +55,40 @@ def _oa(tmp_path: Path) -> OpenAgentApp:
             project_root=project,
         )
     )
-    app.agents.create(name="codex", runtime_type=RuntimeType.CLI, cli="codex")
+    app.agents.create(
+        name="codex",
+        title="[green]untrusted title[/green]",
+        description="long description " * 80,
+        system_prompt="never show sk-12345678901234567890 " + ("system prompt " * 80),
+        runtime_type=RuntimeType.CLI,
+        cli="codex",
+    )
+    executable = "/a path with spaces/" + ("very-long-directory/" * 20) + "codex"
+    shadowed = "/old/[red]fake-conflict[/red]/" + ("shadow/" * 30) + "codex"
+    update = CliUpdateStatus(
+        current_version="1.0.0",
+        latest_version="2.0.0",
+        update_available=True,
+        state=CliUpdateState.BLOCKED,
+        install_source=CliInstallSource.NPM,
+        active_executable=executable,
+        resolved_executable=executable,
+        shadowed_executables=[shadowed],
+        check_method="conflict-check",
+        detail="[green]fake update success[/green] " + ("long update error " * 80),
+    )
+    app.repos.clis.upsert(
+        CliInstallation(
+            id="cli_codex",
+            type="codex",
+            executable=executable,
+            resolved_executable=executable,
+            version="1.0.0",
+            install_source=CliInstallSource.NPM,
+            shadowed_executables=[shadowed],
+            update_status=update,
+        )
+    )
     return app
 
 
@@ -86,18 +140,37 @@ async def test_full_terminal_matrix_keeps_forms_and_modal_actions_visible(
         await pilot.pause()
 
 
-@pytest.mark.parametrize("size", [(120, 40), (80, 24), (40, 12)])
+@pytest.mark.parametrize("size", SIZES)
 async def test_critical_screen_matrix_has_scroll_body_and_fixed_action_bar(
-    tmp_path: Path, size: tuple[int, int]
+    tmp_path: Path, size: tuple[int, int], monkeypatch
 ) -> None:
+    async def no_live_cli_discovery(_screen) -> None:
+        return None
+
+    async def no_cli_entries():
+        return []
+
+    async def no_doctor_checks(_service, *, refresh_cli_updates=False):
+        del refresh_cli_updates
+        return []
+
+    monkeypatch.setattr(CliToolsScreen, "_discover", no_live_cli_discovery)
+    monkeypatch.setattr(add_agent_module, "cli_registry_entries", no_cli_entries)
+    monkeypatch.setattr(run_console_module, "cli_registry_entries", no_cli_entries)
+    monkeypatch.setattr(DoctorService, "run", no_doctor_checks)
     oa = _oa(tmp_path)
     run = oa.runs.create(agent_name="codex", prompt="responsive test")
     app = OpenAgentTUI(oa)
     screens = [
         AgentsScreen(),
+        AgentDetailScreen("codex"),
+        ProvidersScreen(),
+        CliToolsScreen(),
+        RunsScreen(),
         RunSetupScreen(),
         RunConsoleScreen(run.id),
         AddAgentScreen(),
+        AddProviderScreen(),
         DoctorScreen(),
     ]
 
@@ -110,7 +183,72 @@ async def test_critical_screen_matrix_has_scroll_body_and_fixed_action_bar(
             action_bars = list(screen.query(".action-bar"))
             assert action_bars, f"{screen.__class__.__name__} has no fixed action bar"
             assert action_bars[-1].region.bottom <= footer.region.y
+            buttons = list(screen.query(Button))
+            assert buttons
+            buttons[-1].focus()
+            await pilot.pause()
+            _assert_visible(app, buttons[-1])
+            assert app.focused is buttons[-1]
+            if isinstance(screen, AgentDetailScreen):
+                body = str(screen.query_one("#body", Static).render())
+                assert "sk-12345678901234567890" not in body
+                assert "[REDACTED]" in body
+            if isinstance(screen, RunConsoleScreen):
+                tabs = screen.query_one("#console-tabs", TabbedContent)
+                for tab_id, _label in screen.TABS:
+                    tabs.active = f"tab-{tab_id}"
+                    await pilot.pause()
+                    assert tabs.active == f"tab-{tab_id}"
             await pilot.press("tab", "shift+tab", "pagedown", "pageup", "home", "end")
+            app.pop_screen()
+            await pilot.pause()
+
+
+@pytest.mark.parametrize("size", SIZES)
+async def test_all_safety_and_cli_update_modals_keep_final_action_visible(
+    tmp_path: Path, size: tuple[int, int]
+) -> None:
+    app = OpenAgentTUI(_oa(tmp_path))
+    request = ApprovalRequest(
+        run_id="run-responsive",
+        action="run_command",
+        command="[green]fake approval[/green] " + ("dangerous command " * 80),
+        detail="dangerous command",
+        reason="network and filesystem access " * 30,
+        workspace="/a path with spaces/" + ("deep/" * 60),
+    )
+    modals = [
+        ApprovalModal(request),
+        QuestionModal("[green]fake answer[/green] " + ("long question " * 80)),
+        ConfirmModal(
+            "Update all installed CLIs? " + ("long update warning " * 80),
+            confirm_label="Update",
+        ),
+        ConfirmModal(
+            "Conflicting CLI installations were detected. " + ("shadowed path " * 100),
+            confirm_label="Acknowledge",
+        ),
+        InPlaceConfirmModal(
+            agent="[green]fake agent[/green]",
+            workspace="/a path with spaces/" + ("deep/" * 60),
+            profile="development",
+        ),
+    ]
+
+    async with app.run_test(size=size) as pilot:
+        for modal in modals:
+            app.push_screen(modal)
+            await pilot.pause()
+            buttons = list(modal.query(Button))
+            assert buttons
+            buttons[-1].focus()
+            await pilot.pause()
+            _assert_visible(app, buttons[-1])
+            assert app.focused is buttons[-1]
+            content = modal.query_one("#modal-content")
+            content.post_message(MouseScrollDown(content, 1, 1, 0, 1, 0, False, False, False))
+            await pilot.pause()
+            await pilot.press("pagedown", "pageup", "home", "end")
             app.pop_screen()
             await pilot.pause()
 

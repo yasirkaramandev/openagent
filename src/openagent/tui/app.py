@@ -33,6 +33,7 @@ from ..core.events import NormalizedEvent
 from ..core.models import Run, enum_value
 from ..core.projection import RunProjection
 from ..security.approvals import ApprovalRequest
+from .markup import safe_markup
 from .screens.add_agent import AddAgentScreen
 from .screens.doctor import DoctorScreen
 from .screens.lists import AgentsScreen, CliToolsScreen, ProvidersScreen, RunsScreen
@@ -98,7 +99,10 @@ class LiveRun:
         self.events.append(event)
         self.touch()
         for hook in list(self._subscribers):
-            hook(event)
+            # A closed/broken screen is not allowed to prevent every other subscriber from seeing
+            # the event, nor to fail the run that just persisted it.
+            with contextlib.suppress(Exception):
+                hook(event)
         if self._on_change is not None:
             self._on_change()
 
@@ -131,6 +135,7 @@ class DashboardScreen(Screen):
                 )
         with Horizontal(classes="action-bar"):
             yield Button("Refresh", id="dash-refresh")
+            yield Button("Doctor", id="dash-doctor")
             yield Button("Quit", id="dash-quit")
         yield Footer()
 
@@ -143,30 +148,62 @@ class DashboardScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "dash-refresh":
             self.action_refresh()
+        elif event.button.id == "dash-doctor":
+            self.app.open_section("doctor")  # type: ignore[attr-defined]
         elif event.button.id == "dash-quit":
             self.app.exit()
 
     def refresh_stats(self) -> None:
         oa: OpenAgentApp = self.app.oa  # type: ignore[attr-defined]
-        agents = oa.agents.list()
-        providers = oa.providers.list()
-        clis = oa.clis.list()
-        runs = oa.runs.list(100)
-        active = [
-            r
-            for r in runs
-            if (enum_value(r.status)) in ("running", "starting", "queued", "waiting_approval")
-        ]
-        failed = [r for r in runs if (enum_value(r.status)) == "failed"]
-        text = (
-            f"[b]OpenAgent[/b]   project: [cyan]{oa.paths.project_root.name}[/cyan]\n\n"
-            f"Agents         [b]{len(agents):>3}[/b]\n"
-            f"Providers      [b]{len(providers):>3}[/b]\n"
-            f"CLI Tools      [b]{len(clis):>3}[/b]\n"
-            f"Runs (recent)  [b]{len(runs):>3}[/b]\n"
-            f"Active runs    [b]{len(active):>3}[/b]\n"
-            f"Failed runs    [b]{len(failed):>3}[/b]\n"
+        unavailable: list[str] = []
+
+        def load(name: str, callback):
+            try:
+                return list(callback())
+            except Exception:  # noqa: BLE001 - one corrupt aggregate must not crash navigation
+                unavailable.append(name)
+                return None
+
+        agents = load("agents", oa.agents.list)
+        providers = load("providers", oa.providers.list)
+        clis = load("clis", oa.clis.list)
+        runs = load("runs", lambda: oa.runs.list(100))
+        projects = load("projects", oa.projects.list)
+        update_cache = load(
+            "update cache",
+            lambda: [item for item in oa.clis.list() if item.update_status is not None],
         )
+        active = (
+            [
+                r
+                for r in runs
+                if enum_value(r.status) in ("running", "starting", "queued", "waiting_approval")
+            ]
+            if runs is not None
+            else None
+        )
+        failed = [r for r in runs if enum_value(r.status) == "failed"] if runs is not None else None
+
+        def value(items) -> str:
+            return "[yellow]unavailable[/yellow]" if items is None else f"[b]{len(items):>3}[/b]"
+
+        text = (
+            f"[b]OpenAgent[/b]   project: [cyan]{safe_markup(oa.paths.project_root.name)}[/cyan]\n\n"
+            f"Agents         {value(agents)}\n"
+            f"Providers      {value(providers)}\n"
+            f"CLI Tools      {value(clis)}\n"
+            f"Projects       {value(projects)}\n"
+            f"Runs (recent)  {value(runs)}\n"
+            f"Active runs    {value(active)}\n"
+            f"Failed runs    {value(failed)}\n"
+            f"Update cache   {value(update_cache)}\n"
+        )
+        if unavailable:
+            text += (
+                "\n[red]Database compatibility issue detected.[/red]\n"
+                "Open Doctor for details. Unavailable: "
+                f"{safe_markup(', '.join(unavailable))}"
+            )
         self.query_one("#stats", Static).update(text)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -188,6 +225,8 @@ class OpenAgentTUI(App):
     .screen-title { padding: 0 1; text-style: bold; color: $accent; }
     .action-bar { height: 3; min-height: 3; padding: 0 1; background: $panel; }
     .action-bar Button { margin: 0 1 0 0; }
+    AgentsScreen .action-bar Button,
+    CliToolsScreen .action-bar Button { width: 1fr; min-width: 0; margin: 0; }
 
     OpenAgentTUI.narrow #dash-body,
     OpenAgentTUI.narrow AgentsScreen #agents-body,
@@ -208,6 +247,16 @@ class OpenAgentTUI(App):
     }
     OpenAgentTUI.tiny .screen-title { height: auto; min-height: 1; }
     OpenAgentTUI.tiny .action-bar { height: auto; min-height: 3; }
+    OpenAgentTUI.tiny ConfirmModal #buttons,
+    OpenAgentTUI.tiny ApprovalModal #buttons,
+    OpenAgentTUI.tiny QuestionModal #buttons,
+    OpenAgentTUI.tiny InPlaceConfirmModal #buttons { align-horizontal: left; }
+    OpenAgentTUI.tiny ConfirmModal Button,
+    OpenAgentTUI.tiny ApprovalModal Button,
+    OpenAgentTUI.tiny QuestionModal Button,
+    OpenAgentTUI.tiny InPlaceConfirmModal Button {
+        width: 1fr; min-width: 0; margin: 0;
+    }
     """
     BINDINGS = [Binding("q", "quit", "Quit"), Binding("escape", "home", "Home")]
 
@@ -221,7 +270,10 @@ class OpenAgentTUI(App):
 
     def on_mount(self) -> None:
         self._apply_breakpoints(self.size.width)
-        self.oa.runs.recover_orphans()
+        # Recovery diagnostics belong in Doctor; a corrupt run row must not prevent the degraded
+        # dashboard and its Doctor route from appearing.
+        with contextlib.suppress(Exception):
+            self.oa.runs.recover_orphans()
         self.push_screen(DashboardScreen())
         self.set_interval(30, self._prune_live_runs)
 

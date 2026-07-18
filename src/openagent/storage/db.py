@@ -196,6 +196,7 @@ class Database:
 
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
+        self.migration_report: MigrationReport | None = None
 
     @classmethod
     def open(cls, db_path: Path) -> Database:
@@ -210,7 +211,7 @@ class Database:
         )
         _configure_sqlite(engine)
         db = cls(engine)
-        db.migrate(db_path=db_path)
+        db.migration_report = db.migrate(db_path=db_path)
         return db
 
     @classmethod
@@ -218,7 +219,7 @@ class Database:
         engine = create_engine("sqlite://", future=True)
         _configure_sqlite(engine)
         db = cls(engine)
-        db.migrate()
+        db.migration_report = db.migrate()
         return db
 
     def migrate(self, db_path: Path | None = None) -> MigrationReport:

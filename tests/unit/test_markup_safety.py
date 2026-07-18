@@ -69,6 +69,12 @@ def test_none_renders_empty():
     assert safe_line(None) == ""
 
 
+def test_redaction_placeholder_remains_visible_and_inert_in_textual_markup():
+    rendered = safe_markup("key=sk-12345678901234567890")
+    assert "sk-12345678901234567890" not in rendered
+    assert_inert(rendered, "key=[REDACTED]")
+
+
 # --------------------------------------------------------------------------- through the projection
 
 

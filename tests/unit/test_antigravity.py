@@ -321,14 +321,23 @@ def test_discover_cli_models_surfaces_the_real_error(monkeypatch):
     assert result.method == "agy models"
 
 
-def test_discover_cli_models_unavailable_for_clis_without_listing():
-    """Codex/Claude expose --model but no listing command — report that honestly, don't invent one."""
+def test_discover_cli_models_supports_claude_aliases_and_honest_codex_fallback(monkeypatch):
+    """Claude has documented choices; an old Codex still falls back without inventing models."""
 
-    for cli in ("codex", "claude"):
-        result = asyncio.run(discover_cli_models(cli))
-        assert result.available is False
-        assert result.models == []
-        assert "unavailable" in (result.error or "")
+    from openagent.runtimes.cli.codex import CodexAdapter
+
+    async def _unsupported(self):
+        raise RuntimeError("installed Codex schema does not advertise model/list; use manual id")
+
+    monkeypatch.setattr(CodexAdapter, "list_models", _unsupported)
+    codex = asyncio.run(discover_cli_models("codex"))
+    assert codex.available is False
+    assert codex.models == []
+    assert "manual id" in (codex.error or "")
+
+    claude = asyncio.run(discover_cli_models("claude", executable="/nonexistent/claude"))
+    assert claude.available is True
+    assert {"default", "sonnet", "opus", "haiku", "opusplan"} <= set(claude.models)
 
 
 def test_registry_knows_antigravity():

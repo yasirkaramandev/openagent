@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
@@ -23,6 +26,32 @@ class UnknownRevisionError(RuntimeError):
 
 class MigrationVerificationError(RuntimeError):
     pass
+
+
+class MigrationFailedError(RuntimeError):
+    """A pending revision failed after backup; the complete chain was rolled back."""
+
+    def __init__(
+        self,
+        from_revision: str | None,
+        backup_path: Path | None,
+        cause: BaseException,
+    ) -> None:
+        self.from_revision = from_revision
+        self.backup_path = backup_path
+        detail = (
+            str(cause)
+            if isinstance(cause, MigrationVerificationError)
+            else cause.__class__.__name__
+        )
+        backup = f"; backup preserved at {backup_path}" if backup_path is not None else ""
+        super().__init__(
+            f"migration from {from_revision or 'unversioned'} failed and was rolled back: "
+            f"{detail}{backup}"
+        )
+
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 @dataclass
@@ -541,6 +570,95 @@ def _m009_run_revision_payload_and_previous_status(conn: Connection) -> None:
         )
 
 
+def _redacted_record_id(value: object) -> str:
+    """Return a stable diagnostic identity without disclosing a user-controlled identifier."""
+
+    digest = hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"sha256:{digest}"
+
+
+def _decode_domain_json(table: str, record_id: object, raw: object) -> dict:
+    try:
+        value = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MigrationVerificationError(
+            f"domain validation failed in {table} record {_redacted_record_id(record_id)}: "
+            "invalid JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise MigrationVerificationError(
+            f"domain validation failed in {table} record {_redacted_record_id(record_id)}: "
+            "expected a JSON object"
+        )
+    return dict(value)
+
+
+def _m010_legacy_nvidia_provider_normalization(conn: Connection) -> None:
+    """Normalize only the exact historical OpenAI/NVIDIA Build combination.
+
+    No credential, name, model or agent row is rewritten. Probe rows are retained for row/ID
+    preservation but marked invalid, so the cache fails closed while leaving an auditable record.
+    """
+
+    if not _table_exists(conn, "provider_connections"):
+        return
+    from ..providers.factory import is_nvidia_build_endpoint
+
+    result = conn.exec_driver_sql(
+        "SELECT id, provider_type, data FROM provider_connections WHERE provider_type='openai'"
+    )
+    while True:
+        rows = result.fetchmany(250)
+        if not rows:
+            break
+        for provider_id, provider_type, raw_data in rows:
+            payload = _decode_domain_json("provider_connections", provider_id, raw_data)
+            if provider_type != "openai" or payload.get("provider_type") != "openai":
+                continue
+            if not is_nvidia_build_endpoint(payload.get("base_url")):
+                continue
+            payload["provider_type"] = "nvidia-build"
+            conn.execute(
+                text(
+                    "UPDATE provider_connections SET provider_type='nvidia-build', data=:data "
+                    "WHERE id=:provider_id"
+                ),
+                {"data": json.dumps(payload), "provider_id": provider_id},
+            )
+            if not _table_exists(conn, "model_probes"):
+                continue
+            probe_rows = conn.execute(
+                text("SELECT cache_key, data FROM model_probes WHERE provider_id=:provider_id"),
+                {"provider_id": provider_id},
+            ).fetchall()
+            for cache_key, raw_probe in probe_rows:
+                probe = _decode_domain_json("model_probes", cache_key, raw_probe)
+                probe["probe_version"] = "invalidated-provider-normalization"
+                conn.execute(
+                    text(
+                        "UPDATE model_probes SET probe_version=:version, data=:data "
+                        "WHERE cache_key=:cache_key"
+                    ),
+                    {
+                        "version": "invalidated-provider-normalization",
+                        "data": json.dumps(probe),
+                        "cache_key": cache_key,
+                    },
+                )
+
+
+def _m011_domain_json_validation(conn: Connection) -> None:
+    """Pin the domain-validation invariant at an immutable migration boundary."""
+
+    # Some v0.1.2 databases recorded revision 0001 even though optional domain tables had never
+    # been materialized. ``create_all`` is safe here: it only creates missing tables; all ALTER and
+    # rebuild work remains owned by the numbered migrations above.
+    from .db import metadata
+
+    metadata.create_all(conn, checkfirst=True)
+    _validate_domain_records(conn)
+
+
 _FORWARD = (
     "Local user data revisions are forward-only; restoration uses the reported online backup."
 )
@@ -582,6 +700,20 @@ MIGRATIONS: list[Migration] = [
         "0008",
         "run revision payload and previous turn status",
         _m009_run_revision_payload_and_previous_status,
+        _FORWARD,
+    ),
+    Migration(
+        "0010",
+        "0009",
+        "legacy NVIDIA provider normalization",
+        _m010_legacy_nvidia_provider_normalization,
+        _FORWARD,
+    ),
+    Migration(
+        "0011",
+        "0010",
+        "domain JSON validation",
+        _m011_domain_json_validation,
         _FORWARD,
     ),
 ]
@@ -657,18 +789,196 @@ def _write_revision(conn: Connection, revision: str) -> None:
         )
 
 
-_CRITICAL_TABLES = ("runs", "provider_connections", "agents")
+_DOMAIN_TABLES = (
+    "provider_connections",
+    "models",
+    "agents",
+    "cli_installations",
+    "projects",
+    "runs",
+    "model_probes",
+    "sessions",
+    "events",
+    "event_sequences",
+    "usage_records",
+)
+
+_IDENTITY_COLUMNS = {
+    "provider_connections": "id",
+    "models": "id",
+    "agents": "name",
+    "cli_installations": "id",
+    "projects": "id",
+    "runs": "id",
+    "model_probes": "cache_key",
+    "sessions": "openagent_session_id",
+    "events": "id",
+    "event_sequences": "run_id",
+    "usage_records": "id",
+}
 
 
 def _row_counts(conn: Connection) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for table in _CRITICAL_TABLES:
+    for table in _DOMAIN_TABLES:
         if _table_exists(conn, table):
             counts[table] = int(conn.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar() or 0)
     return counts
 
 
-def _verify(conn: Connection, minimum_counts: dict[str, int]) -> tuple[str, tuple[tuple, ...]]:
+def _row_ids(conn: Connection) -> dict[str, set[object]]:
+    identities: dict[str, set[object]] = {}
+    for table, column in _IDENTITY_COLUMNS.items():
+        if _table_exists(conn, table):
+            identities[table] = {
+                row[0] for row in conn.exec_driver_sql(f"SELECT {column} FROM {table}")
+            }
+    return identities
+
+
+def _validate_model(model: type[_ModelT], table: str, record_id: object, payload: dict) -> _ModelT:
+    try:
+        return model.model_validate(payload)
+    except ValidationError as exc:
+        # Pydantic's normal rendering includes the invalid input. It may contain a credential
+        # reference, header, URL query or provider error, so only expose the error count.
+        raise MigrationVerificationError(
+            f"domain validation failed in {table} record {_redacted_record_id(record_id)}: "
+            f"{exc.error_count()} schema error(s)"
+        ) from exc
+
+
+def _validate_domain_records(conn: Connection) -> None:
+    """Stream every JSON aggregate through its current Pydantic model and check mirrored IDs."""
+
+    from ..core.events import NormalizedEvent
+    from ..core.models import (
+        AgentProfile,
+        CliInstallation,
+        ModelProbe,
+        ModelProfile,
+        Project,
+        ProviderConnection,
+        Run,
+        Session,
+        UsageRecord,
+    )
+
+    specs: tuple[tuple[str, str, type[BaseModel], str], ...] = (
+        ("provider_connections", "id", ProviderConnection, "id"),
+        ("models", "id", ModelProfile, "id"),
+        ("agents", "name", AgentProfile, "name"),
+        ("cli_installations", "id", CliInstallation, "id"),
+        ("projects", "id", Project, "id"),
+        ("runs", "id", Run, "id"),
+        ("sessions", "openagent_session_id", Session, "openagent_session_id"),
+    )
+    for table, identity_column, model, payload_identity in specs:
+        if not _table_exists(conn, table):
+            continue
+        result = conn.exec_driver_sql(f"SELECT {identity_column}, data FROM {table}")
+        while True:
+            rows = result.fetchmany(250)
+            if not rows:
+                break
+            for record_id, raw in rows:
+                payload = _decode_domain_json(table, record_id, raw)
+                parsed = _validate_model(model, table, record_id, payload)
+                if getattr(parsed, payload_identity) != record_id:
+                    raise MigrationVerificationError(
+                        f"domain identity mismatch in {table} record "
+                        f"{_redacted_record_id(record_id)}"
+                    )
+
+    if _table_exists(conn, "events"):
+        result = conn.exec_driver_sql(
+            "SELECT id, run_id, type, timestamp, source, body FROM events ORDER BY run_id, seq"
+        )
+        while True:
+            rows = result.fetchmany(250)
+            if not rows:
+                break
+            for event_id, run_id, event_type, timestamp, source, raw in rows:
+                payload = _decode_domain_json("events", event_id, raw)
+                parsed = _validate_model(NormalizedEvent, "events", event_id, payload)
+                mirrors = (
+                    (parsed.id, event_id),
+                    (parsed.run_id, run_id),
+                    (str(parsed.type), event_type),
+                    (parsed.timestamp, timestamp),
+                    (parsed.source, source),
+                )
+                if any(left != right for left, right in mirrors):
+                    raise MigrationVerificationError(
+                        f"domain identity mismatch in events record {_redacted_record_id(event_id)}"
+                    )
+
+    if _table_exists(conn, "model_probes"):
+        result = conn.exec_driver_sql(
+            "SELECT cache_key, provider_id, model_id, base_url_fingerprint, protocol, "
+            "credential_revision, probe_version, tested_at, data FROM model_probes"
+        )
+        while True:
+            rows = result.fetchmany(250)
+            if not rows:
+                break
+            for row in rows:
+                record_id = row[0]
+                payload = {
+                    "cache_key": row[0],
+                    "provider_id": row[1],
+                    "model_id": row[2],
+                    "base_url_fingerprint": row[3],
+                    "protocol": row[4],
+                    "credential_revision": row[5],
+                    "probe_version": row[6],
+                    "tested_at": row[7],
+                    "data": _decode_domain_json("model_probes", record_id, row[8]),
+                }
+                parsed = _validate_model(ModelProbe, "model_probes", record_id, payload)
+                if (
+                    parsed.data.model != parsed.model_id
+                    or parsed.data.probe_version != parsed.probe_version
+                ):
+                    raise MigrationVerificationError(
+                        "domain identity mismatch in model_probes record "
+                        f"{_redacted_record_id(record_id)}"
+                    )
+
+    if _table_exists(conn, "usage_records"):
+        result = conn.exec_driver_sql("SELECT id, run_id, timestamp, data FROM usage_records")
+        while True:
+            rows = result.fetchmany(250)
+            if not rows:
+                break
+            for record_id, run_id, timestamp, raw in rows:
+                payload = {
+                    "id": record_id,
+                    "run_id": run_id,
+                    "timestamp": timestamp,
+                    "data": _decode_domain_json("usage_records", record_id, raw),
+                }
+                _validate_model(UsageRecord, "usage_records", record_id, payload)
+
+    if _table_exists(conn, "event_sequences") and _table_exists(conn, "events"):
+        bad = conn.exec_driver_sql(
+            "SELECT s.run_id FROM event_sequences s LEFT JOIN "
+            "(SELECT run_id, COALESCE(MAX(seq), 0) + 1 AS expected FROM events GROUP BY run_id) e "
+            "ON e.run_id=s.run_id WHERE s.next_seq < COALESCE(e.expected, 1) LIMIT 1"
+        ).first()
+        if bad is not None:
+            raise MigrationVerificationError(
+                f"event sequence is behind durable events for record {_redacted_record_id(bad[0])}"
+            )
+
+
+def _verify(
+    conn: Connection,
+    minimum_counts: dict[str, int],
+    minimum_ids: dict[str, set[object]] | None = None,
+    *,
+    validate_domain: bool = False,
+) -> tuple[str, tuple[tuple, ...]]:
     integrity = str(conn.exec_driver_sql("PRAGMA integrity_check").scalar() or "")
     if integrity.lower() != "ok":
         raise MigrationVerificationError(f"SQLite integrity_check failed: {integrity}")
@@ -681,6 +991,17 @@ def _verify(conn: Connection, minimum_counts: dict[str, int]) -> tuple[str, tupl
             raise MigrationVerificationError(
                 f"critical row count decreased for {table}: {before} -> {after.get(table, 0)}"
             )
+    if minimum_ids:
+        after_ids = _row_ids(conn)
+        for table, expected_ids in minimum_ids.items():
+            missing = expected_ids - after_ids.get(table, set())
+            if missing:
+                sample = next(iter(missing))
+                raise MigrationVerificationError(
+                    f"domain identity disappeared from {table}: {_redacted_record_id(sample)}"
+                )
+    if validate_domain:
+        _validate_domain_records(conn)
     return integrity, violations
 
 
@@ -722,13 +1043,22 @@ def _pending_from(revision: str | None) -> list[Migration]:
 
 
 def run_migrations(engine: Engine, *, db_path: Path | None = None) -> MigrationReport:
+    existed_before_connect = bool(
+        db_path is not None and db_path.exists() and db_path.stat().st_size > 0
+    )
     with engine.connect() as conn:
         conn.exec_driver_sql("BEGIN IMMEDIATE")
         try:
             _ensure_meta(conn)
             revision = current_revision(conn)
             minimum_counts = _row_counts(conn)
-            _verify(conn, minimum_counts)
+            minimum_ids = _row_ids(conn)
+            _verify(
+                conn,
+                minimum_counts,
+                minimum_ids,
+                validate_domain=revision == LATEST_REVISION,
+            )
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -737,7 +1067,7 @@ def run_migrations(engine: Engine, *, db_path: Path | None = None) -> MigrationR
     pending = _pending_from(revision)
     if not pending:
         with engine.connect() as conn:
-            integrity, violations = _verify(conn, minimum_counts)
+            integrity, violations = _verify(conn, minimum_counts, minimum_ids, validate_domain=True)
             counts = _row_counts(conn)
         return MigrationReport(
             revision,
@@ -747,23 +1077,32 @@ def run_migrations(engine: Engine, *, db_path: Path | None = None) -> MigrationR
             row_counts=counts,
         )
 
-    backup = _online_backup(db_path, revision) if db_path is not None and revision else None
+    backup = (
+        _online_backup(db_path, revision)
+        if db_path is not None and existed_before_connect
+        else None
+    )
     applied: list[str] = []
-    for migration in pending:
-        with engine.connect() as conn:
-            conn.exec_driver_sql("BEGIN IMMEDIATE")
-            try:
+    # The complete pending chain is atomic. Normalization must not commit if the following domain
+    # validation discovers a corrupt unrelated row.
+    with engine.connect() as conn:
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            for migration in pending:
                 migration.upgrade(conn)
-                _verify(conn, minimum_counts)
                 _write_revision(conn, migration.revision)
-                conn.commit()
                 applied.append(migration.revision)
-            except BaseException:
-                conn.rollback()
-                raise
+            _verify(conn, minimum_counts, minimum_ids, validate_domain=True)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            raise MigrationFailedError(revision, backup, exc) from exc
+        except BaseException:
+            conn.rollback()
+            raise
 
     with engine.connect() as conn:
-        integrity, violations = _verify(conn, minimum_counts)
+        integrity, violations = _verify(conn, minimum_counts, minimum_ids, validate_domain=True)
         counts = _row_counts(conn)
     return MigrationReport(
         revision,
