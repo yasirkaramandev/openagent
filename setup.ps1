@@ -185,9 +185,11 @@ try {
         $env:Path = $freshPath
         $env:OA_OPENAGENT_BIN = $OpenAgent
         $env:OA_EXPECTED_VERSION = $ExpectedVersion
-        $psResolved = (& powershell.exe -NoProfile -Command '(Get-Command openagent -ErrorAction Stop).Source' | Select-Object -First 1).Trim()
-        if ($LASTEXITCODE -ne 0 -or -not (Test-SamePath $psResolved $OpenAgent)) {
-            throw "fresh PowerShell PATH resolves '$psResolved' instead of '$OpenAgent'"
+        $psMatches = @(& powershell.exe -NoProfile -Command '(Get-Command openagent -ErrorAction Stop).Source')
+        $psResolveExit = $LASTEXITCODE
+        $psResolved = [string]($psMatches | Select-Object -First 1)
+        if ($psResolveExit -ne 0 -or -not (Test-SamePath $psResolved.Trim() $OpenAgent)) {
+            throw "fresh PowerShell PATH resolves '$($psResolved.Trim())' instead of '$OpenAgent' (exit $psResolveExit)"
         }
         $psVersion = (& powershell.exe -NoProfile -Command 'openagent version' | Out-String).Trim()
         if ($LASTEXITCODE -ne 0 -or $psVersion -cne "openagent $ExpectedVersion") {
