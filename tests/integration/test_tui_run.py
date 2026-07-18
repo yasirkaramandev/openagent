@@ -26,6 +26,16 @@ def _git(args, cwd):
     subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
 
 
+def _terminal_lines(oa: OpenAgentApp, run_id: str) -> list[str]:
+    return [
+        line
+        for line in oa.runs.output(run_id, "events").splitlines()
+        if '"type":"run.completed"' in line.replace(" ", "")
+        or '"type":"run.failed"' in line.replace(" ", "")
+        or '"type":"run.cancelled"' in line.replace(" ", "")
+    ]
+
+
 @pytest.fixture()
 def oa(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "proj"
@@ -66,7 +76,9 @@ async def _await_terminal(oa: OpenAgentApp, pilot, run_id: str, tries: int = 300
         run = oa.runs.get(run_id)
         if run is not None:
             status = run.status if isinstance(run.status, str) else run.status.value
-            if status in TERMINAL:
+            # The row reserves its terminal status before the worker flushes artifacts and the
+            # terminal JSONL event. Tests that inspect the bundle must wait for both boundaries.
+            if status in TERMINAL and _terminal_lines(oa, run_id):
                 return status
     raise AssertionError(f"run {run_id} never reached a terminal status")
 
@@ -220,14 +232,7 @@ async def test_cancel_from_the_console_really_stops_the_run(
         assert status == "cancelled"
 
         # Exactly one terminal event, and it is the cancellation — never a later "completed".
-        raw = oa.runs.output(run_id, "events").splitlines()
-        terminals = [
-            line
-            for line in raw
-            if '"type":"run.completed"' in line.replace(" ", "")
-            or '"type":"run.failed"' in line.replace(" ", "")
-            or '"type":"run.cancelled"' in line.replace(" ", "")
-        ]
+        terminals = _terminal_lines(oa, run_id)
         assert len(terminals) == 1
         assert "run.cancelled" in terminals[0]
 
