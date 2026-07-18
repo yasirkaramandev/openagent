@@ -54,6 +54,12 @@ grep -q '^name = "openagent"' "$REPO_ROOT/pyproject.toml" 2>/dev/null \
     || die "locate-repo" "pyproject.toml is not the 'openagent' package" \
            "Make sure you cloned https://github.com/yasirkaramandev/openagent"
 
+EXPECTED_VERSION="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' \
+    "$REPO_ROOT/src/openagent/__init__.py" | sed -n '1p')"
+[ -n "$EXPECTED_VERSION" ] \
+    || die "locate-repo" "could not read the source OpenAgent version" \
+           "Restore src/openagent/__init__.py from the official repository."
+
 say "Installing OpenAgent from: $REPO_ROOT"
 
 # Note (not warn) any pre-existing `openagent` so a shadowed command is never a silent surprise (§4).
@@ -144,20 +150,13 @@ if [ ! -e "$HOME/.zshrc" ] && [ ! -e "$HOME/.bashrc" ] && \
     add_path_to_profile "$HOME/.profile" "$TOOL_BIN"
 fi
 
-# A launcher in an already-on-PATH dir works even in shells that don't source a profile. Best-effort,
-# and sudo is used only interactively and only with an explicit heads-up (§4 — never hidden).
+# A launcher in an already-on-PATH dir works even in shells that don't source a profile. It is
+# strictly best-effort and is created only when already writable; setup never elevates itself.
 LINK="/usr/local/bin/openagent"
 if [ -L "$LINK" ] && [ "$(readlink "$LINK" 2>/dev/null)" = "$OPENAGENT_BIN" ]; then
     say "      launcher already present: $LINK"
 elif [ -w "/usr/local/bin" ]; then
     ln -sf "$OPENAGENT_BIN" "$LINK" 2>/dev/null && say "      linked $LINK -> $OPENAGENT_BIN"
-elif [ -t 0 ] && have sudo; then
-    say "      NOTE: creating $LINK needs admin rights — sudo may prompt for your password."
-    if sudo ln -sf "$OPENAGENT_BIN" "$LINK" 2>/dev/null; then
-        say "      linked $LINK -> $OPENAGENT_BIN (via sudo)"
-    else
-        warn "could not create $LINK; relying on the PATH entry above (open a new terminal)"
-    fi
 fi
 
 # Make it work in THIS process too.
@@ -166,21 +165,54 @@ export PATH
 
 # --------------------------------------------------------------------------- 5. verify
 say "[5/6] Verifying installation"
-"$OPENAGENT_BIN" version \
+INSTALLED_VERSION="$("$OPENAGENT_BIN" version 2>/dev/null)" \
     || die "verify" "openagent could not run — the entrypoint or an import is broken" \
            "This is a real install failure; please re-run setup.sh and report the output."
-# doctor exiting non-zero only because optional CLIs (Codex/Claude/agy) are missing is NOT a failure.
-if "$OPENAGENT_BIN" doctor --json >/dev/null 2>&1; then
-    say "      doctor: ok"
-else
-    say "      doctor reported warnings (e.g. optional Codex/Claude/agy CLIs not installed) — not an install failure"
-fi
+[ "$INSTALLED_VERSION" = "openagent $EXPECTED_VERSION" ] \
+    || die "verify-version" \
+           "installed binary reported '$INSTALLED_VERSION'; expected 'openagent $EXPECTED_VERSION'" \
+           "The uv tool environment did not receive this checkout; re-run setup.sh."
+say "      version: $EXPECTED_VERSION"
 
 RESOLVED="$(command -v openagent 2>/dev/null || true)"
-if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$OPENAGENT_BIN" ] && \
-   [ "$(readlink "$RESOLVED" 2>/dev/null || echo "$RESOLVED")" != "$OPENAGENT_BIN" ]; then
-    warn "another 'openagent' resolves first on PATH ($RESOLVED). The one just installed is: $OPENAGENT_BIN"
-fi
+[ -n "$RESOLVED" ] \
+    || die "verify-path" "PATH does not resolve an openagent command after installation"
+[ "$RESOLVED" = "$OPENAGENT_BIN" ] \
+    || die "verify-path" \
+           "PATH resolves '$RESOLVED' instead of the installed '$OPENAGENT_BIN'" \
+           "Remove or move the shadowing OpenAgent binary, then re-run setup.sh."
+say "      PATH: $RESOLVED"
+
+TOOL_DIR="$("$UV" tool dir 2>/dev/null)" \
+    || die "verify-doctor" "could not read uv's OpenAgent tool environment"
+TOOL_PYTHON="$TOOL_DIR/openagent/bin/python"
+[ -x "$TOOL_PYTHON" ] \
+    || die "verify-doctor" "managed OpenAgent Python missing at $TOOL_PYTHON"
+DOCTOR_JSON="$WORK/doctor.json"
+set +e
+"$OPENAGENT_BIN" doctor --json >"$DOCTOR_JSON" 2>"$WORK/doctor.stderr"
+DOCTOR_EXIT=$?
+set -e
+"$TOOL_PYTHON" -c \
+    'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); c=p.get("exit_code"); sys.exit(0 if isinstance(c,int) and c==int(sys.argv[2]) else 1)' \
+    "$DOCTOR_JSON" "$DOCTOR_EXIT" \
+    || die "verify-doctor" "doctor did not emit valid JSON matching exit code $DOCTOR_EXIT" \
+           "Run '$OPENAGENT_BIN doctor --json' and inspect the database diagnostic."
+BACKUP_PATH="$("$TOOL_PYTHON" -c \
+    'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(next((str(c.get("data",{}).get("backup_path")) for c in p.get("checks",[]) if c.get("data",{}).get("backup_path")), ""))' \
+    "$DOCTOR_JSON")"
+[ -z "$BACKUP_PATH" ] || say "      database backup: $BACKUP_PATH"
+case "$DOCTOR_EXIT" in
+    0) say "      doctor: ok" ;;
+    1) say "      doctor: warnings only (optional CLI/tool readiness may be incomplete)" ;;
+    2) die "verify-database" \
+           "Doctor found an incompatible, corrupt, or invalid OpenAgent database" \
+           "Preserve the backup shown above and run '$OPENAGENT_BIN doctor --json'." ;;
+    3) die "verify-migration" \
+           "Doctor reports a failed or interrupted database migration" \
+           "Preserve the backup shown above; TUI launch has been blocked." ;;
+    *) die "verify-doctor" "Doctor exited with unsupported code $DOCTOR_EXIT" ;;
+esac
 
 # --------------------------------------------------------------------------- 6. launch
 if [ "${OPENAGENT_SETUP_NO_LAUNCH:-0}" = "1" ]; then

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: [main, "feat/**", "fix/**"]
   pull_request:
 
 concurrency:
@@ -132,8 +132,17 @@ jobs:
         run: pytest -q -m container tests/integration/test_container_sandbox_real.py
 
   wheel-lifecycle:
-    name: wheel fresh + v0.1.2 upgrade/backup restore
+    name: wheel fresh + ${{ matrix.legacy-name }} upgrade/backup restore
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - legacy-name: v0.1.2
+            legacy-ref: v0.1.2
+          # v0.1.3 was released from this immutable commit without a repository tag.
+          - legacy-name: v0.1.3
+            legacy-ref: bb5a67a31d707fa947adbb5d6b192ed1138980cc
     steps:
       - uses: actions/checkout@v4
         with:
@@ -143,13 +152,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build current and tagged v0.1.2 wheels
+      - name: Build current and legacy wheels
         run: |
           python -m pip install --upgrade pip build
           python -m build --outdir "$RUNNER_TEMP/current-dist"
-          mkdir -p "$RUNNER_TEMP/v012-src" "$RUNNER_TEMP/v012-dist"
-          git archive v0.1.2 | tar -x -C "$RUNNER_TEMP/v012-src"
-          python -m build "$RUNNER_TEMP/v012-src" --outdir "$RUNNER_TEMP/v012-dist"
+          mkdir -p "$RUNNER_TEMP/legacy-src" "$RUNNER_TEMP/legacy-dist"
+          git archive "${{ matrix.legacy-ref }}" | tar -x -C "$RUNNER_TEMP/legacy-src"
+          python -m build "$RUNNER_TEMP/legacy-src" --outdir "$RUNNER_TEMP/legacy-dist"
 
       - name: Fresh current-wheel install in a sandbox HOME
         run: |
@@ -160,10 +169,10 @@ jobs:
             OPENAGENT_CONFIG_DIR="$RUNNER_TEMP/fresh-config" \
             "$RUNNER_TEMP/fresh/bin/openagent" version
 
-      - name: Create a real v0.1.2 DB, upgrade it, and reopen its online backup copy
+      - name: Create a real legacy DB, upgrade it, and reopen its online backup copy
         run: |
           python -m venv "$RUNNER_TEMP/upgrade"
-          "$RUNNER_TEMP/upgrade/bin/pip" install "$RUNNER_TEMP"/v012-dist/*.whl
+          "$RUNNER_TEMP/upgrade/bin/pip" install "$RUNNER_TEMP"/legacy-dist/*.whl
           mkdir -p "$RUNNER_TEMP/upgrade-home" "$RUNNER_TEMP/upgrade-data" \
             "$RUNNER_TEMP/upgrade-config" "$RUNNER_TEMP/legacy-project"
           export HOME="$RUNNER_TEMP/upgrade-home"
@@ -248,6 +257,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     env:
       OPENAGENT_SETUP_NO_LAUNCH: "1"
+      OPENAGENT_DATA_DIR: ${{ runner.temp }}/installer-data
+      OPENAGENT_CONFIG_DIR: ${{ runner.temp }}/installer-config
     steps:
       - uses: actions/checkout@v4
 
@@ -278,6 +289,14 @@ jobs:
       - name: Second install (update / idempotency)
         run: bash setup.sh
 
+      - name: Older PATH binary is repaired, never accepted as a warning
+        run: |
+          mkdir -p "$RUNNER_TEMP/old-openagent"
+          printf '#!/bin/sh\nprintf "openagent 0.0.1\\n"\n' > "$RUNNER_TEMP/old-openagent/openagent"
+          chmod +x "$RUNNER_TEMP/old-openagent/openagent"
+          PATH="$RUNNER_TEMP/old-openagent:$PATH" bash setup.sh > "$RUNNER_TEMP/old-path.log"
+          grep "PATH: $UV_TOOL_BIN_DIR/openagent" "$RUNNER_TEMP/old-path.log"
+
       - name: Install from a path containing spaces
         run: |
           dest="$RUNNER_TEMP/Open Agent Test"
@@ -287,6 +306,74 @@ jobs:
           UV_TOOL_DIR="$RUNNER_TEMP/uv2/tools" UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv2/bin" \
             bash "$dest/setup.sh"
           "$RUNNER_TEMP/uv2/bin/openagent" version
+
+      - name: Installer blocks future schema, broken JSON, and failed migration
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          tool_python="$UV_TOOL_DIR/openagent/bin/python"
+          fixture_project="$RUNNER_TEMP/installer-fixture-project"
+          mkdir -p "$fixture_project"
+          FIXTURE_PROJECT="$fixture_project" "$tool_python" - <<'PY'
+          import os
+          from pathlib import Path
+          from sqlalchemy import text
+          from openagent.app import OpenAgentApp
+          from openagent.core.models import RuntimeType
+
+          root = Path(os.environ["FIXTURE_PROJECT"])
+          cases = {
+              "future": Path(os.environ["RUNNER_TEMP"]) / "installer-future",
+              "broken": Path(os.environ["RUNNER_TEMP"]) / "installer-broken",
+              "migration": Path(os.environ["RUNNER_TEMP"]) / "installer-migration",
+          }
+          for name, data in cases.items():
+              os.environ["OPENAGENT_DATA_DIR"] = str(data)
+              os.environ["OPENAGENT_CONFIG_DIR"] = str(data / "config")
+              app = OpenAgentApp.create(root / name)
+              if name in {"broken", "migration"}:
+                  app.agents.create(
+                      name=f"{name}-agent",
+                      runtime_type=RuntimeType.CLI,
+                      cli="codex",
+                  )
+                  with app.db.engine.begin() as conn:
+                      conn.execute(
+                          text("UPDATE agents SET data=:data WHERE name=:name"),
+                          {"data": '{"name":', "name": f"{name}-agent"},
+                      )
+              if name == "future":
+                  with app.db.engine.begin() as conn:
+                      conn.execute(
+                          text("UPDATE schema_meta SET value='999' WHERE key='version'")
+                      )
+              if name == "migration":
+                  with app.db.engine.begin() as conn:
+                      conn.execute(
+                          text("UPDATE schema_meta SET value='0010' WHERE key='revision'")
+                      )
+                      conn.execute(
+                          text("UPDATE schema_meta SET value='10' WHERE key='version'")
+                      )
+          PY
+          if OPENAGENT_DATA_DIR="$RUNNER_TEMP/installer-future" \
+             OPENAGENT_CONFIG_DIR="$RUNNER_TEMP/installer-future/config" \
+             bash setup.sh >"$RUNNER_TEMP/future.log" 2>&1; then
+            echo "future schema unexpectedly passed"; exit 1
+          fi
+          grep "stage : verify-database" "$RUNNER_TEMP/future.log"
+          if OPENAGENT_DATA_DIR="$RUNNER_TEMP/installer-broken" \
+             OPENAGENT_CONFIG_DIR="$RUNNER_TEMP/installer-broken/config" \
+             bash setup.sh >"$RUNNER_TEMP/broken.log" 2>&1; then
+            echo "broken JSON unexpectedly passed"; exit 1
+          fi
+          grep "stage : verify-database" "$RUNNER_TEMP/broken.log"
+          if OPENAGENT_DATA_DIR="$RUNNER_TEMP/installer-migration" \
+             OPENAGENT_CONFIG_DIR="$RUNNER_TEMP/installer-migration/config" \
+             bash setup.sh >"$RUNNER_TEMP/migration.log" 2>&1; then
+            echo "failed migration unexpectedly passed"; exit 1
+          fi
+          grep "database backup:" "$RUNNER_TEMP/migration.log"
+          grep "stage : verify-migration" "$RUNNER_TEMP/migration.log"
 
   installer-windows:
     name: installer (windows-latest, ${{ matrix.shell }})

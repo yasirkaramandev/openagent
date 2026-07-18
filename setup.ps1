@@ -34,6 +34,15 @@ function Find-Uv {
     return $null
 }
 
+function Test-SamePath([string]$Left, [string]$Right) {
+    if (-not $Left -or -not $Right) { return $false }
+    return [string]::Equals(
+        [IO.Path]::GetFullPath($Left).TrimEnd("\"),
+        [IO.Path]::GetFullPath($Right).TrimEnd("\"),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 try {
     $RepoRoot = Split-Path -Parent $PSCommandPath
     if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "pyproject.toml") -PathType Leaf)) {
@@ -42,6 +51,12 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "src\openagent") -PathType Container)) {
         Fail "locate-repo" "no src\openagent in $RepoRoot" "This does not look like the OpenAgent repository."
     }
+    $versionSource = Get-Content -LiteralPath (Join-Path $RepoRoot "src\openagent\__init__.py") -Raw
+    $versionMatch = [regex]::Match($versionSource, '(?m)^__version__\s*=\s*["'']([^"'']+)["'']\s*$')
+    if (-not $versionMatch.Success) {
+        Fail "locate-repo" "could not read the source OpenAgent version" "Restore src\openagent\__init__.py from the official repository."
+    }
+    $ExpectedVersion = $versionMatch.Groups[1].Value
     Write-Step "Installing OpenAgent from: $RepoRoot"
 
     $existing = Get-Command openagent -ErrorAction SilentlyContinue
@@ -91,13 +106,14 @@ try {
 
     Write-Step "[4/6] Persisting the tool directory on the user PATH"
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $parts = @($userPath -split ";" | Where-Object { $_ })
-    $present = $parts | Where-Object {
-        [string]::Equals($_.TrimEnd("\"), $ToolBin.TrimEnd("\"), [StringComparison]::OrdinalIgnoreCase)
-    }
-    if (-not $present) {
-        [Environment]::SetEnvironmentVariable("Path", (@($ToolBin) + $parts) -join ";", "User")
-    }
+    # Remove every existing copy, then prepend exactly once. Merely detecting ToolBin later in the
+    # user PATH would leave an older OpenAgent first and make the installer update the wrong binary.
+    $parts = @($userPath -split ";" | Where-Object {
+        $_ -and -not [string]::Equals(
+            $_.TrimEnd("\"), $ToolBin.TrimEnd("\"), [StringComparison]::OrdinalIgnoreCase
+        )
+    })
+    [Environment]::SetEnvironmentVariable("Path", (@($ToolBin) + $parts) -join ";", "User")
     $persisted = [Environment]::GetEnvironmentVariable("Path", "User")
     $verified = @($persisted -split ";" | Where-Object { $_ }) | Where-Object {
         [string]::Equals($_.TrimEnd("\"), $ToolBin.TrimEnd("\"), [StringComparison]::OrdinalIgnoreCase)
@@ -108,14 +124,50 @@ try {
     $env:Path = "$ToolBin;$env:Path"
 
     Write-Step "[5/6] Verifying the installed entrypoint and machine-readable doctor output"
-    & $OpenAgent version
-    if ($LASTEXITCODE -ne 0) {
+    $installedVersion = (& $OpenAgent version 2>$null | Out-String).Trim()
+    $versionExit = $LASTEXITCODE
+    if ($versionExit -ne 0) {
         Fail "verify" "openagent version failed" "Re-run setup.ps1 and report the output above."
     }
+    if ($installedVersion -cne "openagent $ExpectedVersion") {
+        Fail "verify-version" "installed binary reported '$installedVersion'; expected 'openagent $ExpectedVersion'" "The uv tool environment did not receive this checkout; re-run setup.ps1."
+    }
+    Write-Step "      version: $ExpectedVersion"
+
+    $currentCommand = Get-Command openagent -ErrorAction SilentlyContinue
+    if ($null -eq $currentCommand -or -not (Test-SamePath $currentCommand.Source $OpenAgent)) {
+        $actual = if ($null -eq $currentCommand) { "not found" } else { $currentCommand.Source }
+        Fail "verify-path" "PATH resolves '$actual' instead of '$OpenAgent'" "Remove or move the shadowing OpenAgent binary, then re-run setup.ps1."
+    }
+    Write-Step "      PATH: $($currentCommand.Source)"
+
     $doctorPath = Join-Path ([IO.Path]::GetTempPath()) ("openagent-doctor-" + [guid]::NewGuid() + ".json")
     try {
         & $OpenAgent doctor --json | Set-Content -LiteralPath $doctorPath -Encoding UTF8
-        Get-Content -LiteralPath $doctorPath -Raw | ConvertFrom-Json | Out-Null
+        $doctorExit = $LASTEXITCODE
+        try {
+            $doctor = Get-Content -LiteralPath $doctorPath -Raw | ConvertFrom-Json
+        } catch {
+            Fail "verify-doctor" "doctor did not emit valid JSON" "Run '$OpenAgent doctor --json' and inspect the database diagnostic."
+        }
+        if ($null -eq $doctor.exit_code -or [int]$doctor.exit_code -ne $doctorExit) {
+            Fail "verify-doctor" "doctor JSON exit_code does not match process exit $doctorExit" "Run '$OpenAgent doctor --json' and inspect the database diagnostic."
+        }
+        $backupPath = $null
+        foreach ($check in @($doctor.checks)) {
+            if ($null -ne $check.data -and $check.data.backup_path) {
+                $backupPath = [string]$check.data.backup_path
+                break
+            }
+        }
+        if ($backupPath) { Write-Step "      database backup: $backupPath" }
+        switch ($doctorExit) {
+            0 { Write-Step "      doctor: ok" }
+            1 { Write-Step "      doctor: warnings only (optional CLI/tool readiness may be incomplete)" }
+            2 { Fail "verify-database" "Doctor found an incompatible, corrupt, or invalid OpenAgent database" "Preserve the backup shown above and run '$OpenAgent doctor --json'." }
+            3 { Fail "verify-migration" "Doctor reports a failed or interrupted database migration" "Preserve the backup shown above; TUI launch has been blocked." }
+            default { Fail "verify-doctor" "Doctor exited with unsupported code $doctorExit" "Run '$OpenAgent doctor --json'." }
+        }
     } finally {
         Remove-Item -LiteralPath $doctorPath -Force -ErrorAction SilentlyContinue
     }
@@ -126,10 +178,18 @@ try {
     $oldPath = $env:Path
     try {
         $env:Path = $freshPath
-        & cmd.exe /d /c "openagent version"
-        if ($LASTEXITCODE -ne 0) { throw "fresh CMD could not resolve openagent" }
-        & powershell.exe -NoProfile -Command "openagent version"
-        if ($LASTEXITCODE -ne 0) { throw "fresh PowerShell could not resolve openagent" }
+        $env:OA_OPENAGENT_BIN = $OpenAgent
+        $env:OA_EXPECTED_VERSION = $ExpectedVersion
+        & powershell.exe -NoProfile -Command '$expected=[IO.Path]::GetFullPath($env:OA_OPENAGENT_BIN).TrimEnd("\"); $c=Get-Command openagent -ErrorAction SilentlyContinue; if($null -eq $c -or -not [string]::Equals([IO.Path]::GetFullPath($c.Source).TrimEnd("\"),$expected,[StringComparison]::OrdinalIgnoreCase)){exit 1}; $v=(& openagent version | Out-String).Trim(); if($LASTEXITCODE -ne 0 -or $v -cne ("openagent "+$env:OA_EXPECTED_VERSION)){exit 1}'
+        if ($LASTEXITCODE -ne 0) { throw "fresh PowerShell resolved a different OpenAgent" }
+        $cmdResolved = (& cmd.exe /d /c "where openagent" | Select-Object -First 1).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not (Test-SamePath $cmdResolved $OpenAgent)) {
+            throw "fresh CMD PATH resolves a different openagent"
+        }
+        $cmdVersion = (& cmd.exe /d /c "openagent version" | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $cmdVersion -cne "openagent $ExpectedVersion") {
+            throw "fresh CMD did not run the installed OpenAgent version"
+        }
     } finally {
         $env:Path = $oldPath
     }

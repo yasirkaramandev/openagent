@@ -29,6 +29,13 @@ if not exist "%REPO_ROOT%\src\openagent" (
     call :die "locate-repo" "no src\openagent in %REPO_ROOT%" "This does not look like the OpenAgent repository."
     goto :eof
 )
+set "OA_VERSION_SOURCE=%REPO_ROOT%\src\openagent\__init__.py"
+set "EXPECTED_VERSION="
+for /f "delims=" %%v in ('powershell -NoProfile -Command "$t=Get-Content -LiteralPath $env:OA_VERSION_SOURCE -Raw; $m=[regex]::Match($t,'(?m)^__version__\s*=\s*[\"'']([^\"'']+)[\"'']\s*$'); if(-not $m.Success){exit 1}; $m.Groups[1].Value"') do if not defined EXPECTED_VERSION set "EXPECTED_VERSION=%%v"
+if not defined EXPECTED_VERSION (
+    call :die "locate-repo" "could not read the source OpenAgent version" "Restore src\openagent\__init__.py from the official repository."
+    goto :eof
+)
 echo [openagent-setup] Installing OpenAgent from: %REPO_ROOT%
 
 rem Note any pre-existing openagent so a shadowed command is never a silent surprise (§4).
@@ -104,7 +111,7 @@ rem truncates long PATH values and can corrupt them. This never needs administra
 rem never touches the system PATH. The PowerShell script wraps the write in try/catch and exits
 rem non-zero on failure, and the exit code is REQUIRED to be checked (§7.1): a PATH write that fails
 rem must fail the install, not be silently ignored.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $d='%TOOL_BIN%'; $p=[Environment]::GetEnvironmentVariable('Path','User'); if($null -eq $p){$p=''}; $parts=@($p -split ';' | Where-Object {$_ -ne ''}); $has=$parts | Where-Object { [string]::Equals($_.TrimEnd('\'), $d.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) }; if(-not $has){ $np=(@($d)+$parts) -join ';'; [Environment]::SetEnvironmentVariable('Path',$np,'User'); Write-Host '[openagent-setup]       added to user PATH' } else { Write-Host '[openagent-setup]       already on user PATH' } } catch { Write-Error $_; exit 1 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $d='%TOOL_BIN%'; $p=[Environment]::GetEnvironmentVariable('Path','User'); if($null -eq $p){$p=''}; $parts=@($p -split ';' | Where-Object { $_ -and -not [string]::Equals($_.TrimEnd('\'),$d.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase) }); $np=(@($d)+$parts) -join ';'; [Environment]::SetEnvironmentVariable('Path',$np,'User'); Write-Host '[openagent-setup]       tool directory prepended exactly once on user PATH' } catch { Write-Error $_; exit 1 }"
 if errorlevel 1 (
     call :die "path" "failed to write the user PATH via PowerShell" "Check PowerShell execution policy / registry access, then re-run setup.bat."
     goto :eof
@@ -123,22 +130,61 @@ set "PATH=%TOOL_BIN%;%PATH%"
 
 rem --------------------------------------------------------------------- 5. verify
 echo [openagent-setup] [5/6] Verifying installation
-"%OPENAGENT_BIN%" version
+set "VERSION_FILE=%TEMP%\openagent-version-%RANDOM%-%RANDOM%.txt"
+"%OPENAGENT_BIN%" version >"!VERSION_FILE!" 2>nul
 if errorlevel 1 (
+    del /q "!VERSION_FILE!" >nul 2>&1
     call :die "verify" "openagent could not run - the entrypoint or an import is broken" "This is a real install failure; re-run setup.bat and report the output."
     goto :eof
 )
-"%OPENAGENT_BIN%" doctor --json >nul 2>&1
+set "INSTALLED_VERSION="
+set /p INSTALLED_VERSION=<"!VERSION_FILE!"
+del /q "!VERSION_FILE!" >nul 2>&1
+if not "!INSTALLED_VERSION!"=="openagent !EXPECTED_VERSION!" (
+    call :die "verify-version" "installed binary reported '!INSTALLED_VERSION!'; expected 'openagent !EXPECTED_VERSION!'" "The uv tool environment did not receive this checkout; re-run setup.bat."
+    goto :eof
+)
+echo [openagent-setup]       version: !EXPECTED_VERSION!
+
+set "OA_OPENAGENT_BIN=%OPENAGENT_BIN%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$expected=[IO.Path]::GetFullPath($env:OA_OPENAGENT_BIN).TrimEnd('\'); $c=Get-Command openagent -ErrorAction SilentlyContinue; if($null -eq $c -or -not [string]::Equals([IO.Path]::GetFullPath($c.Source).TrimEnd('\'),$expected,[StringComparison]::OrdinalIgnoreCase)){ Write-Error 'PATH resolves a different OpenAgent executable'; exit 1 }; Write-Host ('[openagent-setup]       PATH: '+$c.Source)"
 if errorlevel 1 (
-    echo [openagent-setup]       doctor reported warnings ^(e.g. optional Codex/Claude/agy CLIs not installed^) - not an install failure
-) else (
-    echo [openagent-setup]       doctor: ok
+    call :die "verify-path" "PATH does not resolve the OpenAgent binary just installed" "Remove or move the shadowing OpenAgent binary, then re-run setup.bat."
+    goto :eof
+)
+
+set "DOCTOR_JSON=%TEMP%\openagent-doctor-%RANDOM%-%RANDOM%.json"
+"%OPENAGENT_BIN%" doctor --json >"!DOCTOR_JSON!" 2>nul
+set "DOCTOR_EXIT=!ERRORLEVEL!"
+set "OA_DOCTOR_JSON=!DOCTOR_JSON!"
+set "OA_DOCTOR_EXIT=!DOCTOR_EXIT!"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $d=Get-Content -LiteralPath $env:OA_DOCTOR_JSON -Raw | ConvertFrom-Json; if($null -eq $d.exit_code -or [int]$d.exit_code -ne [int]$env:OA_DOCTOR_EXIT){ throw 'doctor JSON exit_code does not match process exit' }; foreach($c in @($d.checks)){ if($null -ne $c.data -and $c.data.backup_path){ Write-Host ('[openagent-setup]       database backup: '+[string]$c.data.backup_path); break } } } catch { Write-Error $_; exit 1 }"
+if errorlevel 1 (
+    del /q "!DOCTOR_JSON!" >nul 2>&1
+    call :die "verify-doctor" "doctor did not emit valid JSON matching exit code !DOCTOR_EXIT!" "Run '%OPENAGENT_BIN% doctor --json' and inspect the database diagnostic."
+    goto :eof
+)
+del /q "!DOCTOR_JSON!" >nul 2>&1
+if "!DOCTOR_EXIT!"=="0" echo [openagent-setup]       doctor: ok
+if "!DOCTOR_EXIT!"=="1" echo [openagent-setup]       doctor: warnings only ^(optional CLI/tool readiness may be incomplete^)
+if "!DOCTOR_EXIT!"=="2" (
+    call :die "verify-database" "Doctor found an incompatible, corrupt, or invalid OpenAgent database" "Preserve the backup shown above and run '%OPENAGENT_BIN% doctor --json'."
+    goto :eof
+)
+if "!DOCTOR_EXIT!"=="3" (
+    call :die "verify-migration" "Doctor reports a failed or interrupted database migration" "Preserve the backup shown above; TUI launch has been blocked."
+    goto :eof
+)
+if not "!DOCTOR_EXIT!"=="0" if not "!DOCTOR_EXIT!"=="1" if not "!DOCTOR_EXIT!"=="2" if not "!DOCTOR_EXIT!"=="3" (
+    call :die "verify-doctor" "Doctor exited with unsupported code !DOCTOR_EXIT!" "Run '%OPENAGENT_BIN% doctor --json'."
+    goto :eof
 )
 rem Prove a *fresh* shell finds openagent by name using the PERSISTED PATH (§7.3). This must NOT
 rem inject %TOOL_BIN% manually — that would pass even if the registry write had failed. Instead we
 rem reconstruct the environment a brand-new login shell gets (System PATH + User PATH, read straight
 rem from the registry) and run `openagent version` in a fresh CMD *and* a fresh PowerShell with it.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$m=[Environment]::GetEnvironmentVariable('Path','Machine'); $u=[Environment]::GetEnvironmentVariable('Path','User'); $env:Path=(@($m,$u) | Where-Object { $_ }) -join ';'; cmd /d /c 'openagent version'; if($LASTEXITCODE -ne 0){ Write-Error 'fresh CMD could not run openagent by name from the persisted PATH'; exit 1 }; & openagent version; if($LASTEXITCODE -ne 0){ Write-Error 'fresh PowerShell could not run openagent by name from the persisted PATH'; exit 1 }"
+set "OA_EXPECTED_VERSION=%EXPECTED_VERSION%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$m=[Environment]::GetEnvironmentVariable('Path','Machine'); $u=[Environment]::GetEnvironmentVariable('Path','User'); $env:Path=(@($m,$u) | Where-Object { $_ }) -join ';'; $expected=[IO.Path]::GetFullPath($env:OA_OPENAGENT_BIN).TrimEnd('\'); $c=Get-Command openagent -ErrorAction SilentlyContinue; if($null -eq $c -or -not [string]::Equals([IO.Path]::GetFullPath($c.Source).TrimEnd('\'),$expected,[StringComparison]::OrdinalIgnoreCase)){ Write-Error 'fresh PowerShell PATH resolves a different openagent'; exit 1 }; $pv=(& openagent version | Out-String).Trim(); if($LASTEXITCODE -ne 0 -or $pv -cne ('openagent '+$env:OA_EXPECTED_VERSION)){ Write-Error 'fresh PowerShell ran a different OpenAgent version'; exit 1 }; $first=(& cmd /d /c 'where openagent' | Select-Object -First 1).Trim(); if($LASTEXITCODE -ne 0 -or -not [string]::Equals([IO.Path]::GetFullPath($first).TrimEnd('\'),$expected,[StringComparison]::OrdinalIgnoreCase)){ Write-Error 'fresh CMD PATH resolves a different openagent'; exit 1 }; $cv=(& cmd /d /c 'openagent version' | Out-String).Trim(); if($LASTEXITCODE -ne 0 -or $cv -cne ('openagent '+$env:OA_EXPECTED_VERSION)){ Write-Error 'fresh CMD ran a different OpenAgent version'; exit 1 }"
 if errorlevel 1 (
     call :die "verify" "openagent is not runnable by name from a fresh shell using the persisted PATH" "Open a new terminal; if it persists, re-run setup.bat."
     goto :eof
