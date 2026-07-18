@@ -19,16 +19,29 @@ handful of escapes that did stop, stopped by accident: ``python -c "import os; .
 *shell*-metacharacter regex because of the ``;`` inside the quoted Python source. Remove the
 semicolon and it ran.
 
+v0.1.3 narrowed that list but kept its shape, and the shape was the bug. Screening ``argv[0]`` says
+nothing about what the process will do, so every one of these still ran unattended::
+
+    env python -c "..."             # env is "read-only"; python is what runs
+    find . -exec python -c "..." +  # find is "read-only"; -exec runs anything
+    find . -delete                  # a search tool that deletes
+    git branch -D release           # "branch" is read-only until -D
+    sort --output=../../outside f   # the clamp skipped tokens starting with "-"
+
 The model now:
 
-* **Auto-allow is a narrow, purpose-scoped list**, not "everything known". Under a guarded profile
-  only read-only *inspection* of the workspace runs unattended (``git status``, ``ls``, ``grep`` …).
-* **Anything that executes code** — interpreters, package/build scripts, test runners via
-  ``run_command`` — requires an explicit approval. ``run_tests`` has its own structured, bounded
-  runner list (spec §2.3), because "run the project's tests" inherently executes project code and
-  should be an explicit, named capability rather than a side effect of a generic command.
-* **Arguments that resolve outside the workspace are rejected outright** (spec §2.6), so an
-  allowlisted tool cannot be used as a file-exfiltration primitive.
+* **Under a guarded profile nothing runs unattended through a generic command string.** ``safe-edit``
+  auto-allows *no* command; the read-only work an agent needs is served by dedicated tools
+  (``read_file``, ``search_text``, ``git_status``, ``git_diff``) whose arguments are structured and
+  cannot name a second program. With nothing auto-allowed there is no allowlist left to trick.
+* **Where auto-allow does exist** (``development``), it is granted by an explicit per-executable
+  validator that must account for every option it accepts — see ``command_validators``. An unknown
+  option fails closed, and mutating or program-spawning options are named and refused.
+* **Anything that executes code** — interpreters, wrappers, package/build scripts — requires an
+  explicit approval. ``run_tests`` is separately gated by ``security.project_code``, because a
+  validated ``pytest -q`` argv still executes whatever test files the agent just wrote.
+* **Arguments that resolve outside the workspace are rejected outright** (spec §2.6), including
+  paths hidden inside an option value (``--output=/etc/x``, ``-o/etc/x``).
 * **Shell metacharacters and shell interpreters** still require approval — but they are now
   defense-in-depth, not the load-bearing check they accidentally were.
 
@@ -54,6 +67,12 @@ from ..core.permissions import (
     AUTO_ALLOW_INSPECT,
     AUTO_ALLOW_NONE,
     PermissionProfile,
+)
+from .command_validators import (
+    WRAPPER_EXECUTABLES,
+    get_validator,
+    option_value_candidates,
+    validate_argv,
 )
 
 
@@ -88,62 +107,9 @@ class PolicyResult:
 
 # --------------------------------------------------------------------------- narrow auto-allow sets
 
-#: Read-only inspection. These do not execute project or user code, and every path argument is
-#: clamped to the workspace before they are allowed. ``None`` = any subcommand; a set = only those.
-#: NOTE: ``git`` is restricted to genuinely read-only plumbing — `config` mutates global state and
-#: `-c` injects config (pagers/hooks) that can execute, so both fall through to approval.
-_INSPECT: dict[str, frozenset[str] | None] = {
-    "ls": None,
-    "pwd": None,
-    "echo": None,
-    "printf": None,
-    "cat": None,
-    "head": None,
-    "tail": None,
-    "wc": None,
-    "sort": None,
-    "uniq": None,
-    "cut": None,
-    "grep": None,
-    "egrep": None,
-    "fgrep": None,
-    "rg": None,
-    "ag": None,
-    "find": None,
-    "fd": None,
-    "tree": None,
-    "stat": None,
-    "file": None,
-    "diff": None,
-    "cmp": None,
-    "date": None,
-    "which": None,
-    "basename": None,
-    "dirname": None,
-    "realpath": None,
-    "readlink": None,
-    "true": None,
-    "false": None,
-    "test": None,
-    "env": None,
-    "printenv": None,
-    "git": frozenset(
-        {
-            "status",
-            "diff",
-            "log",
-            "show",
-            "branch",
-            "rev-parse",
-            "ls-files",
-            "describe",
-            "blame",
-            "shortlog",
-            "tag",
-        }
-    ),
-    "hg": frozenset({"status", "diff", "log"}),
-}
+#: Read-only inspection is no longer a name list. Which executables may run unattended, and with
+#: which options, is declared per executable in ``command_validators.VALIDATORS`` — a name on its
+#: own says nothing about whether ``find -delete`` or ``sort --output=/etc/x`` is about to happen.
 
 #: Structured test/build runners, reachable only through ``run_tests`` (spec §2.3). These DO execute
 #: the project's own code — that is the point of the capability — so they are a named, explicit
@@ -197,12 +163,11 @@ _BUILD_TOOLS: dict[str, frozenset[str] | None] = {
     "touch": None,
     "cp": None,
     "mv": None,
-    "sed": None,
-    "awk": None,
     "tr": None,
-    "tee": None,
-    "xargs": None,
 }
+# NOTE: ``sed``, ``awk``, ``tee``, ``env`` and ``xargs`` were removed from this table in v0.1.4.
+# Each of them either runs another program or writes to an arbitrary path, so no permission tier
+# auto-allows them any more — see ``WRAPPER_EXECUTABLES``.
 
 #: General-purpose language runtimes. These are NOT "known-safe executables" (spec §2.9): each one is
 #: a complete programming environment with unrestricted file and socket access. Naming them here is
@@ -326,10 +291,15 @@ def escapes_workspace(token: str, workspace_root: Path) -> bool:
 def _path_candidates(command: str, argv: tuple[str, ...]) -> list[str]:
     """Argument tokens to run the workspace clamp over.
 
-    Both the shlex-split argv **and** a raw whitespace split are checked, because POSIX shlex treats
-    ``\\`` as an escape character: on Linux/macOS it silently rewrites ``C:\\Windows\\System32`` into
-    ``C:WindowsSystem32``, which no longer looks absolute and would sail straight past the clamp. The
-    raw split preserves the backslashes, so a Windows-style escape is caught on every platform.
+    Three things have to be caught here, and each one was a real escape:
+
+    * Both the shlex-split argv **and** a raw whitespace split are checked, because POSIX shlex
+      treats ``\\`` as an escape character: on Linux/macOS it silently rewrites
+      ``C:\\Windows\\System32`` into ``C:WindowsSystem32``, which no longer looks absolute and would
+      sail straight past the clamp. The raw split preserves the backslashes.
+    * Values **embedded in an option token** (``--output=../../x``, ``-o/etc/passwd``) are extracted,
+      because the clamp used to skip anything starting with ``-`` — so writing the path into the
+      option itself walked straight through it.
     """
 
     tokens = list(argv[1:])
@@ -337,6 +307,9 @@ def _path_candidates(command: str, argv: tuple[str, ...]) -> list[str]:
         stripped = raw.strip("\"'")
         if stripped:
             tokens.append(stripped)
+    # An option's value is still a path even when it is glued to the option name.
+    for token in list(tokens):
+        tokens.extend(option_value_candidates(token))
     return tokens
 
 
@@ -345,6 +318,31 @@ def _first_subcommand(argv: tuple[str, ...]) -> str | None:
         if not token.startswith("-"):
             return token
     return None
+
+
+def _validate_inspection(
+    exe: str, argv: tuple[str, ...], *, clamp: bool, workspace_root: Path | None
+) -> PolicyResult | None:
+    """Auto-allow ``exe`` only if its validator accepts every argument it was given.
+
+    Returns ``None`` when there is no validator for ``exe`` (the caller keeps looking), an ``ALLOW``
+    when the whole argv checks out, and an ``APPROVAL`` carrying the validator's reason otherwise.
+    A validator that refuses never falls through to another auto-allow path.
+    """
+
+    spec = get_validator(exe)
+    if spec is None:
+        return None
+    outcome = validate_argv(
+        spec, argv, clamp=clamp, workspace_root=workspace_root, escapes=escapes_workspace
+    )
+    if outcome.ok:
+        return PolicyResult(Decision.ALLOW, argv=argv)
+    return PolicyResult(
+        Decision.APPROVAL,
+        f"{exe}: {outcome.reason}; running it requires approval",
+        argv=argv,
+    )
 
 
 def _in_table(exe: str, argv: tuple[str, ...], table: dict[str, frozenset[str] | None]) -> bool:
@@ -394,16 +392,10 @@ def evaluate(
             return PolicyResult(Decision.ALLOW, argv=argv, needs_shell=True)
         return PolicyResult(Decision.ALLOW, argv=argv)
 
-    # 3. No command execution at all for this profile.
-    if auto_allow == AUTO_ALLOW_NONE:
-        return PolicyResult(
-            Decision.APPROVAL,
-            "this profile does not run commands without approval",
-            argv=argv,
-        )
-
-    # 4. Out-of-workspace arguments are rejected outright — an allowlisted tool must not become a
-    #    read/write primitive for the rest of the filesystem (spec §2.6).
+    # 3. Out-of-workspace arguments are rejected outright — an allowlisted tool must not become a
+    #    read/write primitive for the rest of the filesystem (spec §2.6). This runs *before* the
+    #    per-profile gates so that an escaping path is refused rather than offered for approval:
+    #    "would you like to let the agent read /etc/shadow?" is not a question worth asking.
     if clamp and workspace_root is not None:
         for token in _path_candidates(normalized, argv):
             if escapes_workspace(token, workspace_root):
@@ -413,6 +405,17 @@ def evaluate(
                     f"{workspace_root}",
                     argv=argv,
                 )
+
+    # 4. No unattended command execution at all for this profile. ``safe-edit`` lives here: its
+    #    read-only inspection is served by dedicated tools (read_file, search_text, git_status,
+    #    git_diff) that take structured arguments, so a generic command string has nothing left to
+    #    auto-allow — and with nothing auto-allowed there is no allowlist to trick (spec §4.2).
+    if auto_allow == AUTO_ALLOW_NONE:
+        return PolicyResult(
+            Decision.APPROVAL,
+            "this profile does not run generic commands without approval",
+            argv=argv,
+        )
 
     # 5. Shell operators cannot run under shell=False (defense-in-depth, not the main boundary).
     if _SHELL_META.search(normalized):
@@ -438,6 +441,10 @@ def evaluate(
             "requires approval",
             argv=argv,
         )
+    # 6b. Wrappers exist to run *another* program, so screening their name screens nothing:
+    #     ``env python -c …`` and ``find … -exec python …`` were both auto-allowed before v0.1.4.
+    if exe in WRAPPER_EXECUTABLES:
+        return PolicyResult(Decision.APPROVAL, WRAPPER_EXECUTABLES[exe], argv=argv)
 
     # 7. git config / git -c mutate or inject configuration, including pagers and hooks that execute.
     if _GIT_CONFIG.match(normalized):
@@ -463,8 +470,11 @@ def evaluate(
             return PolicyResult(Decision.APPROVAL, reason, argv=argv)
 
     # 10. The narrow auto-allow sets. Everything else needs a human.
-    if _in_table(exe, argv, _INSPECT):
-        return PolicyResult(Decision.ALLOW, argv=argv)
+    #     Inspection is decided by an explicit per-executable validator that must account for every
+    #     option it accepts — not by membership in a name list (spec §4.2).
+    inspection = _validate_inspection(exe, argv, clamp=clamp, workspace_root=workspace_root)
+    if inspection is not None:
+        return inspection
     if purpose is Purpose.TEST and _in_table(exe, argv, _TEST_RUNNERS):
         return PolicyResult(Decision.ALLOW, argv=argv)
     if auto_allow == AUTO_ALLOW_BUILD and (

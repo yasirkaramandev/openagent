@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from openagent.core.permissions import SAFE_EDIT, get_profile
+from openagent.core.permissions import DEVELOPMENT, SAFE_EDIT, get_profile
 from openagent.security.command_policy import Decision, evaluate
 
 #: Every one of these auto-ran (Decision.ALLOW) under safe-edit before v0.1.3.
@@ -87,6 +87,17 @@ def _decide(command: str, workspace: Path):
     )
 
 
+def _decide_development(command: str, workspace: Path):
+    """The same question under ``development``, the profile that still has an auto-allow tier."""
+
+    return evaluate(
+        command,
+        network_allowed=False,
+        workspace_root=workspace,
+        profile=get_profile(DEVELOPMENT),
+    )
+
+
 @pytest.mark.parametrize("command", INTERPRETER_ESCAPES)
 def test_interpreter_escapes_are_not_auto_approved(command: str, tmp_path: Path) -> None:
     decision = _decide(command, tmp_path).decision
@@ -137,18 +148,30 @@ def test_the_semicolon_was_never_the_protection(tmp_path: Path) -> None:
 
 
 def test_read_only_inspection_inside_the_workspace_still_runs(tmp_path: Path) -> None:
-    """The policy must stay usable: workspace-relative, read-only inspection needs no approval."""
+    """The policy must stay usable: workspace-relative inspection needs no approval.
+
+    Checked under ``development``, because since v0.1.4 ``safe-edit`` auto-allows no generic command
+    at all (spec §4.2) — its read-only work goes through the dedicated tools instead. ``development``
+    is now the profile where "unattended inspection still works" is an observable property.
+    """
 
     for command in ("git status", "git diff", "ls -la", "pwd", "cat README.md", "grep -r TODO src"):
-        result = _decide(command, tmp_path)
+        result = _decide_development(command, tmp_path)
         assert result.decision is Decision.ALLOW, f"{command!r} should not need approval"
 
 
 def test_workspace_relative_paths_are_not_confused_with_escapes(tmp_path: Path) -> None:
-    """A relative path inside the workspace must not trip the out-of-workspace clamp."""
+    """A relative path inside the workspace must not trip the out-of-workspace clamp.
+
+    The property under test is that the *clamp* stays quiet, so it is asserted directly — a
+    ``DENY`` is the clamp firing. Auto-allow is a separate decision, checked under ``development``
+    where it exists; using ALLOW alone as the signal would silently stop testing the clamp the
+    moment a profile's auto-allow changed.
+    """
 
     for command in ("cat src/main.py", "find . -name '*.py'", "grep -rn TODO ./src"):
-        assert _decide(command, tmp_path).decision is Decision.ALLOW, command
+        assert _decide(command, tmp_path).decision is not Decision.DENY, command
+        assert _decide_development(command, tmp_path).decision is Decision.ALLOW, command
 
 
 def test_mutating_file_commands_need_approval_even_inside_the_workspace(tmp_path: Path) -> None:
@@ -220,8 +243,11 @@ def test_symlinked_workspace_root_is_not_a_false_escape(tmp_path: Path) -> None:
     (real / "a.txt").write_text("x")
     link = tmp_path / "link_ws"
     link.symlink_to(real, target_is_directory=True)
-    assert _decide("cat a.txt", link).decision is Decision.ALLOW
-    assert _decide("cat ./a.txt", link).decision is Decision.ALLOW
+    # "Not a false escape" means the clamp did not fire — assert that, not the auto-allow tier.
+    assert _decide("cat a.txt", link).decision is not Decision.DENY
+    assert _decide("cat ./a.txt", link).decision is not Decision.DENY
+    assert _decide_development("cat a.txt", link).decision is Decision.ALLOW
+    assert _decide_development("cat ./a.txt", link).decision is Decision.ALLOW
 
 
 def test_full_access_still_permits_absolute_paths(tmp_path: Path) -> None:

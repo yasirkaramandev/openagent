@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from openagent.core.events import ToolCall
-from openagent.core.permissions import READ_ONLY, SAFE_EDIT, get_profile
+from openagent.core.permissions import DEVELOPMENT, READ_ONLY, SAFE_EDIT, get_profile
 from openagent.security.approvals import ApprovalGate
 from openagent.tools.base import ToolContext, ToolError
 from openagent.tools.control import TaskFinished
@@ -96,7 +96,13 @@ def test_denied_command_not_run(tmp_path: Path):
 
 
 def test_run_command_executes(tmp_path: Path):
-    execu = ToolExecutor(make_ctx(tmp_path))
+    """A command the profile auto-allows runs and returns its output.
+
+    Uses ``development``: since v0.1.4 ``safe-edit`` auto-allows no generic command (spec §4.2), so
+    this is now the profile where unattended execution is the expected behaviour.
+    """
+
+    execu = ToolExecutor(make_ctx(tmp_path, DEVELOPMENT))
     result = execu.execute(
         ToolCall(
             id="1",
@@ -106,6 +112,24 @@ def test_run_command_executes(tmp_path: Path):
     )
     assert result.ok
     assert "hello-openagent" in result.content
+
+
+def test_run_command_under_safe_edit_needs_approval_then_executes(tmp_path: Path):
+    """Under safe-edit the same command is gated — and still works once a human agrees."""
+
+    denied = ToolExecutor(make_ctx(tmp_path)).execute(
+        ToolCall(id="1", name="run_command", arguments={"command": "echo hello-openagent"})
+    )
+    assert not denied.ok
+    assert "not approved" in denied.content
+
+    ctx = make_ctx(tmp_path)
+    ctx.approval_gate = ApprovalGate(callback=lambda _request: True)
+    approved = ToolExecutor(ctx).execute(
+        ToolCall(id="2", name="run_command", arguments={"command": "echo hello-openagent"})
+    )
+    assert approved.ok
+    assert "hello-openagent" in approved.content
 
 
 def test_schemas_filtered_by_profile():

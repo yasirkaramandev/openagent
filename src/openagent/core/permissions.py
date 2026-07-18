@@ -48,6 +48,11 @@ class PermissionProfile:
     command_auto_allow: str = AUTO_ALLOW_INSPECT
     #: Reject arguments that resolve outside the workspace outright (spec §2.6).
     restrict_to_workspace: bool = True
+    #: May ``run_tests`` execute the project's own code **on the host** with no approval (spec §3)?
+    #: Defaults to False because that is arbitrary code execution: the agent writes the test files.
+    #: Only profiles whose whole point is accepting host risk set this. Under a container-sandbox
+    #: backend the question does not arise — the sandbox is the containment.
+    auto_run_project_code_on_host: bool = False
     #: A short, honest statement of what this profile does NOT protect against (spec §2.5, §2.10).
     risk_note: str = ""
 
@@ -109,11 +114,21 @@ PROFILES: dict[str, PermissionProfile] = {
             "Bash(pytest *)",
             "Bash(npm test *)",
         ),
-        command_auto_allow=AUTO_ALLOW_INSPECT,
+        # Nothing runs unattended through the generic ``run_command`` string (spec §4.2). Screening
+        # an executable's *name* screens nothing — ``env python -c …``, ``find … -exec …`` and
+        # ``sort --output=…`` all used to sail through an allowlist of "read-only" tools. The
+        # inspection an agent genuinely needs is served by dedicated tools (read_file, search_text,
+        # git_status, git_diff) whose arguments are structured and cannot name another program.
+        command_auto_allow=AUTO_ALLOW_NONE,
         restrict_to_workspace=True,
+        # The agent may write test files and conftest.py, so "run the tests" on the host is
+        # arbitrary code execution. Under host-restricted it needs a human; under a container
+        # sandbox it runs unattended because the sandbox — not this flag — is the boundary.
+        auto_run_project_code_on_host=False,
         risk_note=(
             "POLICY boundary only — NOT an OS sandbox. Running the project's own tests executes "
-            "that project's code inside the workspace. Network is gated by policy, not by the "
+            "that project's code, so on this host it requires your explicit approval each time; "
+            "under container-sandbox it runs contained. Network is gated by policy, not by the "
             "kernel. Use a container/VM for untrusted code."
         ),
     ),
@@ -133,8 +148,11 @@ PROFILES: dict[str, PermissionProfile] = {
         claude_allowed_tools=("Read", "Edit", "Bash"),
         command_auto_allow=AUTO_ALLOW_BUILD,
         restrict_to_workspace=True,
+        # Explicitly riskier by design: this profile exists to run build/test tooling unattended.
+        auto_run_project_code_on_host=True,
         risk_note=(
-            "POLICY boundary only — NOT an OS sandbox. Package managers run arbitrary install "
+            "POLICY boundary only — NOT an OS sandbox. The project's tests and build scripts run "
+            "on this host without asking. Package managers run arbitrary install "
             "scripts from the network with no kernel-level restriction. Use a container/VM for "
             "untrusted dependencies."
         ),
@@ -152,6 +170,8 @@ PROFILES: dict[str, PermissionProfile] = {
         claude_allowed_tools=("Read", "Edit", "Bash"),
         command_auto_allow=AUTO_ALLOW_ALL,
         restrict_to_workspace=False,
+        # Choosing full-access *is* the explicit consent (spec §3.2).
+        auto_run_project_code_on_host=True,
         risk_note=(
             "NO restrictions beyond the categorical denylist: the agent may read and write ANY file "
             "your user account can, and use the network freely. Only run this against code you "

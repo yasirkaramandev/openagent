@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from ..security.command_policy import Decision, Purpose, evaluate, evaluate_test_argv
 from ..security.execution_backend import ExecutionBackendError, HostRestrictedBackend
 from ..security.process import OutputLimitExceeded, minimal_environment
+from ..security.project_code import approval_detail, decide_project_code_execution
 from .base import ToolContext, ToolError, ToolResult
 
 #: A hard **byte** cap on a single command's combined stdout+stderr (item 9.3). Enforced inside
@@ -101,9 +102,27 @@ def run_tests(
     if not ctx.profile.can_run_commands:
         raise ToolError("this permission profile does not allow running commands")
     # Purpose.TEST opens the structured test/build runner list (spec §2.3) — and only that list.
-    # "Run the project's tests" genuinely executes project code, so it is an explicit, named
-    # capability rather than something a generic run_command can reach unattended.
     test_argv = argv or ["pytest", "-q"]
+
+    # Shape is not containment. A validated ``pytest -q`` argv still imports whatever test files and
+    # conftest.py the agent just wrote, so *who contains it* is decided centrally (spec §3) before
+    # any subprocess exists. Under host-restricted + safe-edit this is a real approval, not a log
+    # line: deny means nothing starts.
+    backend_name = ctx.execution_backend.name if ctx.execution_backend else None
+    project_code = decide_project_code_execution(profile=ctx.profile, backend=backend_name)
+    if project_code.denied:
+        raise ToolError(f"running the project's tests is not allowed: {project_code.reason}")
+    if project_code.needs_approval:
+        command = " ".join(test_argv)
+        detail = approval_detail(command, project_code, str(ctx.workspace_root))
+        if not ctx.request_approval(
+            "run_tests", detail, command=command, reason=project_code.reason
+        ):
+            raise ToolError(
+                "running the project's tests was not approved: project code will not execute on "
+                "this host without your consent"
+            )
+
     proc = _run(ctx, test_argv, timeout, purpose=Purpose.TEST)
     command = " ".join(test_argv)
     output = ((proc.stdout or "") + (proc.stderr or ""))[:_MAX_OUTPUT_BYTES]
