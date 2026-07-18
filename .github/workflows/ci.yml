@@ -257,8 +257,6 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     env:
       OPENAGENT_SETUP_NO_LAUNCH: "1"
-      OPENAGENT_DATA_DIR: ${{ runner.temp }}/installer-data
-      OPENAGENT_CONFIG_DIR: ${{ runner.temp }}/installer-config
     steps:
       - uses: actions/checkout@v4
 
@@ -268,6 +266,8 @@ jobs:
             echo "UV_TOOL_DIR=$RUNNER_TEMP/uv/tools"
             echo "UV_TOOL_BIN_DIR=$RUNNER_TEMP/uv/bin"
             echo "UV_PYTHON_INSTALL_DIR=$RUNNER_TEMP/uv/py"
+            echo "OPENAGENT_DATA_DIR=$RUNNER_TEMP/installer-data"
+            echo "OPENAGENT_CONFIG_DIR=$RUNNER_TEMP/installer-config"
           } >> "$GITHUB_ENV"
 
       - name: First install (setup.sh, no TUI launch)
