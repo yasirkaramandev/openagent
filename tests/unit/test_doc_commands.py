@@ -24,8 +24,8 @@ _DOCS = [
     _ROOT / "skills" / "README.md",
 ]
 
-#: The two command *groups*; everything else is a single top-level command.
-_GROUPS = {"provider", "agent"}
+#: Command groups; everything else is a single top-level command.
+_GROUPS = {"provider", "agent", "cli"}
 _LINE = re.compile(r"^\s*openagent\s+(.+)$")
 _FLAG = re.compile(r"(?<![\w`-])--[a-z][a-z0-9-]*")
 

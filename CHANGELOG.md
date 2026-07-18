@@ -4,6 +4,68 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] — 2026-07-18
+
+Lifecycle/concurrency hardening, source-aware CLI and OpenAgent updates, truthful model discovery,
+cross-process monitoring, atomic domain migrations, and a completed container/installer audit.
+
+### Added
+
+- **`openagent update`** — DB-independent `--check`, `--dry-run`, interactive, `--yes`, and `--json`
+  flows. Clean official source checkouts fast-forward `main` and re-run the platform installer;
+  index installs use their owning uv-tool/pipx/exact Python environment. PATH, revision, expected
+  version, and Doctor health are verified after mutation.
+- **Coding CLI lifecycle framework** — cross-platform candidate enumeration, safe realpath/provenance
+  inspection, active-vs-shadowed installation reporting, cached official update metadata,
+  source-matched non-elevated updaters, active-run/conflict blocking, audit events, and post-update
+  rediscovery for Codex, Claude Code, and Antigravity.
+- **Source-specific model discovery** — Codex app-server `model/list`; layered Claude
+  API-key/config/alias discovery without scraping an interactive picker or claiming subscription
+  entitlement; and account-context `agy models`. Structured results distinguish a valid empty list,
+  partial catalog, auth/rate-limit/timeout/network/malformed response, and unsupported endpoint.
+- **Cross-process Run Console tailing** — one SQLite replay followed by bounded `seq > cursor`
+  queries, local/polled duplicate prevention, reopen handling, and terminal stop semantics.
+- **Revisions `0008`–`0011`** — real run foreign keys and turn leases, revision-consistent run JSON,
+  exact legacy NVIDIA Build normalization, and streaming Pydantic validation of all domain tables.
+
+### Changed
+
+- Run lifecycle writes are revision-aware compare-and-set operations. Relational status/phase/lease
+  fields and JSON payloads mutate together; live process leases cannot be stolen and dead owners are
+  recovered without leaving a permanent `running` state.
+- Event JSONL is explicitly an export/recovery surface: first event, batch boundary, terminal event,
+  explicit flush and shutdown are durable refresh points. SQLite is authoritative and no fixed
+  250 ms JSONL freshness claim is made.
+- Provider catalogs return structured discovery outcomes. Dashboard and Doctor isolate corrupt
+  provider/agent/CLI/event sources so one incompatible record does not remove the diagnostic route.
+- Tool execution converts documented operational exceptions into bounded redacted failures, while
+  unexpected invariant errors become a generic internal failure and cancellation/system exits are
+  never swallowed.
+- The container backend runs as UID/GID `65532`, keeps default seccomp, explicitly uses private
+  PID/IPC namespaces, never pulls/builds/falls back, performs all-file sync conflict preflight,
+  preserves executable bits, and cleans up on timeout/cancel.
+- Installers verify the exact source version and PATH winner, parse Doctor's exit-code contract,
+  display migration backups, and refuse TUI launch on database/migration/event integrity failures.
+  CI covers repeat/path-with-spaces/old-shadow installs, v0.1.2 and v0.1.3 wheel upgrades, future
+  schema, corrupt JSON, migration rollback, all supported OS/Python versions, and real Docker.
+
+### Fixed
+
+- Artifact-finalization failures can no longer emit or preserve a false completed terminal state;
+  every recovery path rebuilds a consistent failure bundle.
+- Event append handles short OS writes and Doctor accepts only the valid ordered terminal chains,
+  including `orphaned → cancelled`.
+- Legacy NVIDIA records retain provider/model/agent identities and credential references; unrelated
+  custom OpenAI endpoints are not reclassified.
+- TUI markup keeps `[REDACTED]` visible and inert, while all required screens/modals retain their
+  final action and focus/scroll behavior from 120×40 through 40×12.
+
+### Known limitations
+
+- Live paid-provider inference and live Codex/Claude/Agy audits remain opt-in and environment
+  dependent. Claude subscription/OAuth has no public scriptable entitlement catalog.
+- `container-sandbox` supports structured API-agent tools; long-lived CLI adapters remain refused.
+
 ## [0.1.3] — 2026-07-16
 
 Security, data-integrity, project-scoping, responsive-TUI, and release hardening.
@@ -212,3 +274,4 @@ First tagged release (alpha). Local-first control plane for AI APIs, coding CLIs
 [0.1.0]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.0
 [0.1.2]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.2
 [0.1.3]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.3
+[0.1.4]: https://github.com/yasirkaramandev/openagent/releases/tag/v0.1.4

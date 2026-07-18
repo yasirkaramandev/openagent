@@ -45,9 +45,9 @@ capture), **Offline contract tested** (mocked transport), **Experimental**, **Un
 | **Claude Code** | **Fixture validated** — the `stream-json` mapping and invocation are ready, but `claude` is not installed on this machine, so nothing here has been run against a live CLI. |
 | API agents (OpenAI Chat/Responses, Anthropic, OpenAI-compatible) | **Offline contract tested** end to end (mocked HTTP): tool loop, progress tools, cancellation, worktree diff, artifacts, redaction. **Not live-verified** against a paid key. Presets for DeepSeek/Qwen/Kimi/GLM/MiniMax/OpenRouter/Mistral/Together/Fireworks/Ollama/LM Studio share the compatible adapters and are **not individually live-verified**. |
 | **Run Console** (live reasoning/plan/commands/files/diff/tests/usage/raw events) | Pilot-tested on Textual 8.2.8 at 120×40, 100×30, 80×24, 70×20, 60×18, 50×14 and 40×12, including focus visibility, page/home/end, mouse wheel, resize, fixed actions, long modals and explicit follow-output behavior. |
-| TUI Add-Agent **wizard** | Pilot-tested with **real keyboard input** (Space selects, Enter advances): CLI and API paths, masked key cleared on every transition, connections filtered to the provider family, credentials validated on the connection step, `max_steps` bounded. **Model discovery** per backend — API providers via their models endpoint, Antigravity via `agy models`; CLIs that can't list models (Codex/Claude) fall back honestly to a manual id or the CLI's own default. |
+| TUI Add-Agent **wizard** | Pilot-tested with **real keyboard input** (Space selects, Enter advances): CLI and API paths, masked key cleared on every transition, connections filtered to the provider family, credentials validated on the connection step, `max_steps` bounded. **Model discovery** is source-specific: installed Codex app-server `model/list`, Claude config/aliases (not an entitlement claim), Anthropic `/v1/models` in an API-key context, and `agy models` in the current account context. Manual/default remains explicit when no reliable catalog exists. |
 | Security (minimal env, command allowlist, worktree/copy/in-place isolation, redaction, process-tree cancel, PID-identity recovery, sandboxed credential commands, streaming output bound, exact keychain rollback) | Unit + integration tested (see `tests/`). |
-| **Execution isolation** | `host-restricted` is a policy/approval boundary, **not** an OS sandbox. The opt-in `container-sandbox` gives API-agent tool commands a no-network, read-only-root Docker/Podman container with tmpfs workspace/resource limits and no host mount. Long-lived CLI adapters are currently refused under this backend rather than silently falling back to the host. |
+| **Execution isolation** | `host-restricted` is a policy/approval boundary, **not** an OS sandbox. The opt-in `container-sandbox` gives API-agent tool commands a non-root, no-network, read-only-root Docker/Podman container with default seccomp, private PID/IPC, tmpfs workspace/resource limits and no host mount. The real-container contract is exercised in the dedicated Docker CI job. Long-lived CLI adapters are refused rather than silently falling back to the host. |
 | **Gemini** | **Not part of v0.1.** |
 
 Everything except the live-CLI/live-API rows runs in the **offline test suite in CI**
@@ -111,21 +111,39 @@ CI/automation can set `OPENAGENT_SETUP_NO_LAUNCH=1` to verify the install withou
 
 ### Updating
 
-macOS/Linux:
+The normal update path is source-aware and verifies the exact active executable afterward:
+
+```bash
+openagent update --check       # network check only; no mutation
+openagent update --dry-run     # show the exact source-matched command(s)
+openagent update               # interactive confirmation
+openagent update --yes --json  # automation; structured result
+```
+
+An install created by `setup.sh` / `setup.ps1` / `setup.bat` is tied to its local checkout.
+`openagent update` updates it only when that checkout is clean, on `main`, and has the official
+OpenAgent Git origin; it then fast-forwards with `git pull --ff-only` and re-runs the platform
+installer with TUI launch disabled. Index installs use their owning `uv tool`, `pipx`, or exact
+environment Python. Remote direct-URL installs and ambiguous provenance fail closed. The command
+never chooses a different package manager merely because one happens to be on PATH.
+
+After mutation it verifies all of the following before reporting success:
+
+- PATH still resolves the same active `openagent` executable;
+- the executable reports the expected version;
+- source checkouts reached the previously verified `origin/main` revision;
+- `openagent doctor --json` returns healthy (`0`) or warnings-only (`1`).
+
+You can still update a checkout manually:
 
 ```bash
 git pull
-bash setup.sh
+bash setup.sh                  # Windows: setup.bat or .\setup.ps1
 ```
 
-Windows:
-
-```bat
-git pull
-setup.bat
-```
-
-PowerShell users can run `git pull; .\setup.ps1` instead.
+The installers verify the source version, exact PATH winner, parseable Doctor JSON, and migration
+health. They print any online-backup path. Doctor exit `2`, `3`, or `4` is a hard install failure and
+the TUI is not launched; missing optional coding CLIs normally produce exit `1` and remain a warning.
 
 ### Developer install (contributors only)
 
@@ -149,10 +167,15 @@ python -m pip install -e ".[dev]"
   `chmod +x setup.sh` first.
 - **Windows execution/path issue** — run `setup.bat` from CMD, `.\setup.bat` from PowerShell, or use
   the native `.\setup.ps1`; paths with spaces are handled.
-- **A different `openagent` is already on PATH** — the installer detects and reports the existing
-  command, and prints the path of the one it just installed.
+- **A different `openagent` is already on PATH** — the installer prepends its tool directory and
+  verifies the winner. If a machine-wide copy still shadows it, installation fails with both paths;
+  remove or move the old copy and re-run setup. A shadow is never accepted as a warning-only result.
 - **`doctor` warns about missing Codex/Claude/agy** — those are **optional** CLIs; their absence is a
   warning, **not** an install failure.
+- **Doctor exits `2` or `3` during install/update** — `2` means the database is incompatible,
+  corrupt, or contains invalid current-domain JSON; `3` means a pending migration failed and was
+  rolled back. Preserve the backup path printed by the installer. Exit `4` means event-store
+  integrity needs repair/investigation. None of these launches the TUI automatically.
 
 ## Quickstart
 
@@ -164,6 +187,9 @@ openagent
 openagent init                       # set up local state
 openagent discover                   # detect installed coding CLIs (codex, claude, …)
 openagent doctor                     # system diagnostics
+openagent update --check             # check OpenAgent itself for an update
+openagent cli list --json            # exact CLI paths, sources, conflicts, cached update state
+openagent cli check --refresh --json # refresh official update metadata explicitly
 
 # Register an installed CLI as an agent (codex | claude | antigravity)
 openagent add --name codex-coder --title "Codex Coder" --cli codex --tag coder
@@ -192,18 +218,84 @@ openagent add --name experimental --provider deepseek-main --model <model-id> \
   --allow-unverified-model --model-override-reason "manual compatibility review"
 ```
 
-### v0.1.3 integrity and isolation boundaries
+### Coding CLI discovery and update policy
+
+OpenAgent treats the active executable and its installation source as security-relevant facts:
+
+```bash
+openagent cli list --json
+openagent cli check --refresh --json
+openagent cli update codex --dry-run
+openagent cli update codex
+openagent cli update --all --yes --json
+```
+
+`cli list` and the TUI show the active path, resolved realpath, source, version, update state, and
+shadowed installations. An update uses only the updater matched to proven provenance (for example
+npm, Homebrew cask, WinGet, or a documented native updater), runs with bounded output/time and a
+credential-free environment, and verifies the exact executable afterward. Unknown sources,
+multiple independent copies, unwritable targets, active runs, and package-manager operations that
+would require elevation are blocked.
+
+The update policy is stored under `cli_updates` in the `config.json` directory printed by
+`openagent init`:
+
+```json
+{
+  "cli_updates": {
+    "policy": "ask",
+    "check_interval_hours": 6,
+    "check_before_run": true
+  }
+}
+```
+
+Policies are `notify`, `ask`, `auto`, and `never`. Metadata is cached; Doctor and normal TUI startup
+remain offline unless refresh is explicit. `auto` still obeys every provenance/conflict/live-run
+guard and never invokes `sudo`. In non-interactive environments an explicit `--yes` is required for
+mutating all-install updates.
+
+### Doctor exit codes
+
+`openagent doctor --json` always includes the same numeric `exit_code` as the process:
+
+| Code | Meaning |
+|---:|---|
+| `0` | All checks healthy. |
+| `1` | Advisory warnings, commonly a missing optional Codex/Claude/agy CLI. |
+| `2` | Core database/schema/domain incompatibility; do not launch or write further. |
+| `3` | Pending migration failed and rolled back; preserve the reported online backup. |
+| `4` | Event-store terminal/sequence/export integrity failure; inspect and repair before release work. |
+
+### v0.1.4 lifecycle, discovery, and integrity boundaries
 
 - **Project scope:** `.openagent/project.json` gives a project a stable UUID. Run listing, replay,
   output, cancel, resume and orphan recovery default to the active project; cross-project operations
   need explicit `--all-projects`. Use `openagent project list` and `openagent project relocate` for
   moved or missing roots.
-- **Authoritative events:** full event bodies and sequence allocation live in SQLite in one write
-  transaction. `events.jsonl` is an atomic export, not the source of truth. `openagent events repair`
-  regenerates it; Doctor reports gaps, duplicates, terminal-count errors and DB/export mismatches.
+- **Authoritative events and live monitoring:** full event bodies and sequence allocation live in
+  SQLite in one write transaction. Run Console replays once and then polls only rows after its last
+  sequence, so another OpenAgent process appears live without repeatedly reading the full history or
+  applying duplicates. `events.jsonl` is an atomic export updated on its first event, batch boundary,
+  terminal event, explicit flush, and shutdown; it is not the live source of truth and has no fixed
+  250 ms freshness promise. `openagent events repair` regenerates it.
 - **Migrations:** revisions are immutable and forward-only. Upgrades use `BEGIN IMMEDIATE`, create an
-  online SQLite backup, then run integrity, foreign-key and critical row-count checks. Unknown
-  revisions fail closed and an interrupted revision never advances the recorded version.
+  online SQLite backup, then run integrity, foreign-key, row-ID/count, schema-parity and current
+  Pydantic-domain validation across every JSON aggregate. The `0008`–`0011` revisions add real run
+  foreign keys/turn leases, revision-consistent run payloads, exact legacy NVIDIA Build
+  normalization, and domain validation. The whole pending chain is atomic; failure exits `3`, rolls
+  back every pending revision, and reports the backup. Current-schema corruption exits `2`.
+- **CLI lifecycle:** locator discovery enumerates PATH/native/npm/Homebrew/WinGet/legacy candidates,
+  resolves safe executable realpaths, records the actual PATH winner and every independent shadow,
+  and blocks update when provenance is unknown, another copy conflicts, or a live run uses the CLI.
+  Update checks are cached and offline by default; only `--refresh` performs network metadata calls.
+- **Model discovery:** Codex models are the catalog advertised by the installed Codex app-server's
+  `model/list`. Claude subscription/OAuth has no public scriptable entitlement-list command, so
+  OpenAgent exposes configured model names and aliases without calling them entitlement-verified;
+  an Anthropic `/v1/models` result is verified only in that API-key context. Antigravity models come
+  from `agy models` in the current signed-in account context. Partial catalogs remain partial and a
+  structured unauthorized/rate-limit/timeout/network/malformed error is never confused with a valid
+  empty catalog.
 - **Model probes:** verification is keyed by provider/model/endpoint/protocol/opaque credential
   revision/probe version and expires after 24 hours. Catalog membership is not capability evidence;
   expiry, key rotation or provider changes invalidate the verdict.
@@ -211,9 +303,12 @@ openagent add --name experimental --provider deepseek-main --model <model-id> \
   approval-gates unsafe paths/operators, but it is not a kernel sandbox. `container-sandbox`
   requires an explicitly named, already-local Linux image with `/bin/sh` and Docker or Podman. It
   never pulls/builds, mounts a host path or falls back to the host; it rejects `--worktree none` and
-  applies network `none`, read-only root, dropped capabilities, no-new-privileges, 2 CPU, 2 GiB
-  memory/swap, 256 PID, 1 GiB workspace and 256 MiB `/tmp` limits. In v0.1.3 this backend is for
-  API-agent tool commands; long-lived CLI adapters are refused under it.
+  applies network `none`, a read-only root, UID/GID `65532:65532`, default seccomp, private PID/IPC
+  namespaces, dropped capabilities, no-new-privileges, 2 CPU, 2 GiB memory/swap, 256 PID, 1 GiB
+  workspace and 256 MiB `/tmp` limits. Sync-back first verifies that no host file changed
+  concurrently, accepts only regular files, and preserves executable bits; timeout/cancel always
+  removes the container. This backend is for API-agent tool commands; long-lived CLI adapters are
+  refused under it.
 - **Git/index integrity:** diff/status reads use NUL-delimited porcelain without mutating the user's
   index. Cleanup only removes worktrees/branches carrying OpenAgent ownership metadata. Optional
   agent commits require a clean OpenAgent-created worktree; in-place user changes are never
@@ -464,6 +559,7 @@ artifact (prompt and diff included).
 ## Development
 
 ```bash
+.venv/bin/ruff format --check .
 .venv/bin/ruff check src tests
 .venv/bin/mypy src
 .venv/bin/python -m pytest -q
@@ -476,6 +572,13 @@ build, and a clean-venv wheel-install + entrypoint check, plus cross-platform sm
 Windows, real Unix/Windows installers, a v0.1.2 wheel/DB upgrade-and-backup-restore job, and a real
 Docker sandbox job. The offline suite requires **no API keys and no installed CLIs** — CLI runs are exercised
 with a real-subprocess fake, and providers with mocked HTTP.
+
+Optional, non-inference live CLI checks are explicitly opt-in. They run version probes, Codex
+app-server model discovery, `agy models`, and Claude Doctor only for CLIs installed on the machine:
+
+```bash
+OPENAGENT_LIVE_CLI_TESTS=1 .venv/bin/python -m pytest -q -m live_cli tests/live
+```
 
 ## License
 

@@ -28,10 +28,13 @@ adds a Docker/Podman boundary for structured API-agent tool commands. Concretely
 already-local Linux image containing `/bin/sh`, and OpenAgent never pulls, builds or falls back to
 the host. It rejects in-place workspaces, copies only no-follow regular files into a quota-limited
 `/workspace` tmpfs, mounts no host path, disables network, uses a read-only root filesystem, drops
-all capabilities, enables no-new-privileges, and limits the container to 2 CPU, 2 GiB memory/swap,
-256 PIDs, 1 GiB workspace and 256 MiB `/tmp`. In v0.1.3 long-lived streaming CLI adapters are
-refused under this backend; use it for API-agent tool execution or run OpenAgent itself in a
-separately managed container/VM.
+all capabilities, enables no-new-privileges, runs as UID/GID `65532:65532`, retains the runtime's
+default seccomp filter, uses private PID and IPC namespaces, and limits the container to 2 CPU,
+2 GiB memory/swap, 256 PIDs, 1 GiB workspace and 256 MiB `/tmp`. Sync-back performs a complete
+conflict preflight before changing any host file, accepts only regular files, and preserves the
+executable bit; a concurrent host edit aborts the whole sync. Timeout and cancellation remove the
+container. Long-lived streaming CLI adapters are refused under this backend; use it for API-agent
+tool execution or run OpenAgent itself in a separately managed container/VM.
 
 ## Credentials
 
@@ -110,12 +113,24 @@ remaining survivors are explicit outcomes. Cancelled/orphaned runs are terminal;
 ID. Startup orphan recovery is project-scoped and uses compare-and-set so racing processes produce
 one transition/terminal event.
 
+Coding CLI updates and OpenAgent self-updates use the same minimal-environment principle: provider
+credentials are removed while proxy/CA variables needed by the package manager are retained.
+Structured argv, output/time bounds, exact executable verification, provenance checks, shadowed-copy
+blocking, active-run blocking and non-elevated execution prevent an updater from silently mutating a
+different installation. A source-checkout self-update accepts only a clean `main` checkout with the
+official Git origin and uses `pull --ff-only`.
+
 ## Storage, Git, and output integrity
 
 - SQLite stores complete event JSON and allocates `(run_id, seq)` in the same write transaction.
-  JSONL is an atomic export; Doctor checks continuity, duplicates, terminal counts and export drift.
-- Immutable forward-only migrations use `BEGIN IMMEDIATE`, SQLite online backup, integrity/FK checks
-  and critical row-count verification. Unknown revisions and interrupted upgrades fail closed.
+  Run Console tails new SQLite rows after a monotonic sequence cursor, including cross-process
+  writers, and deduplicates local-vs-polled delivery. JSONL is an atomic recovery/export surface;
+  Doctor checks continuity, duplicates, terminal chains and export drift.
+- Immutable forward-only migrations use `BEGIN IMMEDIATE`, SQLite online backup, integrity/FK
+  checks, row-ID/count preservation, schema parity, and streaming Pydantic validation of every domain
+  JSON record. The complete pending chain commits or rolls back as one transaction. Unknown/future
+  revisions and current-domain corruption exit `2`; a pending-chain failure exits `3` with the
+  preserved backup path.
 - Git status/diff parsing is NUL-delimited and never stages, resets or otherwise mutates the user's
   index. Cleanup requires OpenAgent ownership metadata. Optional commits are limited to clean,
   OpenAgent-created worktrees; in-place user changes are never committed.

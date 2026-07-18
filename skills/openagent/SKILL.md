@@ -30,15 +30,17 @@ Always begin by reading state. Do not assume anything is installed or configured
 openagent version
 openagent doctor --json
 openagent discover
+openagent cli list --json
 openagent agent list --json
 openagent provider list --json
 ```
 
 - `version` confirms the CLI is on PATH and which build you are driving.
-- `doctor --json` is the health snapshot. A **non-zero** exit only because optional CLIs
-  (Codex/Claude/agy) are missing is **not** fatal — read the JSON and decide. A broken OpenAgent
-  install (import/entrypoint error) is fatal.
+- `doctor --json` is the health snapshot. Exit `1` is advisory (often missing optional CLIs). Exit
+  `2` is database/schema/domain incompatibility, exit `3` is a rolled-back migration with a backup
+  path, and exit `4` is event-store integrity failure; all three are fatal until repaired.
 - `discover` detects installed coding CLIs and whether they are authenticated.
+- `cli list --json` identifies the exact PATH winner, realpath, install source, and shadowed copies.
 - `agent list --json` / `provider list --json` show what already exists — reuse before creating.
 
 ## Prerequisite checks
@@ -52,11 +54,22 @@ Before creating an agent, confirm the backend it needs exists:
 
 ```bash
 openagent discover                 # human-readable
+openagent cli list --json          # paths, provenance, conflicts, cached update status
+openagent cli check --refresh --json
 openagent agent list --json        # existing agents (machine-readable)
 ```
 
 If a CLI is not installed, do **not** invent one — tell the user, or pick a CLI that `discover`
 reports as available.
+
+Never update a coding CLI with a guessed package manager. Use `openagent cli update <type>
+--dry-run`, inspect the source-matched plan, then request user authority before the mutating command.
+Unknown provenance, shadowed copies, and active runs are intentional blockers.
+
+To update OpenAgent itself, use `openagent update --check` / `--dry-run`, then `openagent update`
+(interactive) or `openagent update --yes --json` when the user explicitly authorized automation.
+This command remains available when application DB startup is unhealthy and verifies PATH, version,
+and Doctor after updating.
 
 ## Inspecting existing agents / providers
 
@@ -103,8 +116,12 @@ openagent add --name ds-coder --provider deepseek-main --model deepseek-chat --p
 
 ## Choosing models
 
-- CLI agents: some CLIs enumerate models (e.g. `agy models` via Antigravity); Codex/Claude expose
-  `--model` but no listing — do not fabricate a list.
+- Codex CLI: use the installed Codex app-server's advertised `model/list`; it is not a universal
+  hardcoded catalog.
+- Claude Code subscription/OAuth: there is no public scriptable entitlement-list command. Configured
+  names/aliases are candidates, not proof the account may use them. Do not scrape the interactive
+  picker. Anthropic `/v1/models` proves only that API credential context.
+- Antigravity: `agy models` is the current signed-in account context.
 - API agents: `openagent provider models <name>` lists what the connection reports (best-effort).
 - A manually typed model id is **not verified**. State that when you use one.
 - Using the CLI's default model (`--model` omitted) persists as "no pinned model" — call it out.
@@ -210,7 +227,8 @@ inspected.
   `openagent cancel --id <run-id>` (never with a manual `kill`). Start a fresh run if needed.
 - `artifacts_partial: true` in `status.json`/`result.json` → the bundle was rebuilt by failure
   recovery and is incomplete; read `artifact_failure.stage`. Never report such a run as completed.
-- Missing optional CLIs in `doctor` are warnings, not install failures.
+- Missing optional CLIs in Doctor normally produce exit `1` and are warnings. Exit `2`, `3`, or `4`
+  is a core integrity failure, not an optional-CLI warning; surface the reported backup/repair path.
 
 ## NVIDIA Build (hosted NIM APIs)
 
