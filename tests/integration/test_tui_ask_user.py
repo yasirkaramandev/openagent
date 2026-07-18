@@ -110,7 +110,14 @@ async def _wait_terminal(pilot, oa, run_id: str, timeout: int = 400):
     for _ in range(timeout):
         await pilot.pause(0.05)
         run = oa.runs.get(run_id)
-        if run and run.status.value in ("completed", "failed", "cancelled"):
+        # The DB row reserves the terminal status before final artifacts and the terminal event are
+        # flushed. Do not tear down the Textual worker in that small window: callers below inspect
+        # the durable event bundle, so both sides of the lifecycle contract must be visible.
+        if (
+            run
+            and run.status.value in ("completed", "failed", "cancelled")
+            and _terminal_events(oa, run_id)
+        ):
             return run
     raise AssertionError("run worker did not terminate (possible deadlock)")
 
