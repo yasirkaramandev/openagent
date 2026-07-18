@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,8 @@ SNAPSHOTS = Path(__file__).resolve().parents[1] / "snapshots" / "tui"
 
 def _oa(tmp_path: Path) -> OpenAgentApp:
     project = tmp_path / "project"
-    project.mkdir()
+    # Idempotent: some tests build the app twice under one tmp_path to compare two renders.
+    project.mkdir(exist_ok=True)
     app = OpenAgentApp(
         Paths(
             data_dir=tmp_path / "data",
@@ -113,6 +115,34 @@ async def test_critical_screen_matrix_has_scroll_body_and_fixed_action_bar(
             await pilot.pause()
 
 
+def _layout_only(svg: str) -> str:
+    """Strip presentation from an exported SVG, keeping geometry and text.
+
+    The snapshot exists to pin **layout** at a given terminal size — where each cell lands, how wide
+    it is, what text it holds. Colours and font weights come from the active theme and from Rich's
+    SVG exporter, and ``rich`` is an unpinned dependency (``>=13.7``), so a Rich release that
+    restyles the footer changes every byte of the file without moving a single character. Comparing
+    raw bytes made this gate fail on any machine whose Rich differed from the one that generated the
+    file — which is a broken gate, not a caught regression.
+
+    So the comparison drops three things and nothing else:
+
+    * ``terminal-<n>`` — a content hash of the render, so it changes whenever styling does;
+    * the ``<style>`` block — pure presentation;
+    * ``class`` attributes — style-slot numbers that get renumbered when styling changes;
+    * ``fill="#rrggbb"`` — the theme colour painted into each background rect.
+
+    Everything load-bearing (``x``, ``y``, ``width``, ``height``, ``textLength``, ``clip-path`` and
+    the text itself) is kept, so a real layout regression still fails.
+    """
+
+    svg = re.sub(r"terminal-\d+", "terminal-ID", svg)
+    svg = re.sub(r"<style>.*?</style>", "<style/>", svg, flags=re.DOTALL)
+    svg = re.sub(r'\sclass="[^"]*"', "", svg)
+    svg = re.sub(r'fill="#[0-9a-fA-F]{3,8}"', 'fill="COLOUR"', svg)
+    return svg.rstrip()
+
+
 @pytest.mark.parametrize("size", [(80, 24), (40, 12)])
 async def test_add_provider_svg_snapshot_is_deterministic(
     tmp_path: Path, size: tuple[int, int]
@@ -122,6 +152,26 @@ async def test_add_provider_svg_snapshot_is_deterministic(
         app.push_screen(AddProviderScreen())
         await pilot.pause()
         title = f"OpenAgent Add Provider {size[0]}x{size[1]}"
-        actual = app.export_screenshot(title=title, simplify=True).rstrip()
-        expected = (SNAPSHOTS / f"add_provider_{size[0]}x{size[1]}.svg").read_text().rstrip()
-        assert actual == expected
+        actual = app.export_screenshot(title=title, simplify=True)
+        expected = (SNAPSHOTS / f"add_provider_{size[0]}x{size[1]}.svg").read_text()
+        assert _layout_only(actual) == _layout_only(expected)
+
+
+@pytest.mark.parametrize("size", [(80, 24), (40, 12)])
+async def test_add_provider_render_is_reproducible_within_a_run(
+    tmp_path: Path, size: tuple[int, int]
+) -> None:
+    """The exporter itself must be deterministic — otherwise the snapshot proves nothing."""
+
+    async def render(slot: str) -> str:
+        # A fresh state directory per render: the app seeds an agent into its database, so reusing
+        # one would make the second call fail on "already exists" rather than compare two renders.
+        root = tmp_path / slot
+        root.mkdir()
+        app = OpenAgentTUI(_oa(root))
+        async with app.run_test(size=size) as pilot:
+            app.push_screen(AddProviderScreen())
+            await pilot.pause()
+            return app.export_screenshot(title="repeat", simplify=True)
+
+    assert await render("first") == await render("second")
