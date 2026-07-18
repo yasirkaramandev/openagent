@@ -77,7 +77,13 @@ def test_sequences_are_unique_under_concurrent_append(db: Database, tmp_path: Pa
 
 
 def test_the_index_and_the_log_agree_after_concurrent_append(db: Database, tmp_path: Path):
-    """events.jsonl is the source of truth; the index must have exactly one row per line."""
+    """SQLite is the source of truth; once flushed, the JSONL projection matches it exactly.
+
+    The flush is the point. Since v0.1.4 the export is batched, so during a run the file is allowed
+    to lag behind the database — what is never allowed is for them to *disagree* once the projection
+    is brought up to date. Six concurrent appends must produce six index rows and six lines, with no
+    duplicate and no orphan line left behind by a loser of the sequence race.
+    """
 
     index = EventIndexRepository(db)
     run_dir = tmp_path / "run"
@@ -94,10 +100,15 @@ def test_the_index_and_the_log_agree_after_concurrent_append(db: Database, tmp_p
         t.start()
     for t in threads:
         t.join(timeout=10)
+    log.flush()
 
-    lines = len(EventLog(run_dir).read_raw())
-    indexed = len(index.sequences_for(run_id))
-    assert lines == indexed == 6, f"log has {lines} lines but the index has {indexed} rows"
+    exported = EventLog(run_dir).read_raw()
+    indexed = index.sequences_for(run_id)
+    assert len(exported) == len(indexed) == 6, (
+        f"log has {len(exported)} lines but the index has {len(indexed)} rows"
+    )
+    assert sorted(indexed) == [1, 2, 3, 4, 5, 6]
+    assert len({event["id"] for event in exported}) == 6, "the export contains a duplicate line"
 
 
 def test_sequential_append_still_numbers_from_one(db: Database, tmp_path: Path):

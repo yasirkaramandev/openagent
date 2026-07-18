@@ -7,7 +7,7 @@ read, keeping indexed columns in sync for querying.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -551,6 +551,43 @@ class EventIndexRepository:
                 select(t.events.c.body).where(t.events.c.run_id == run_id).order_by(t.events.c.seq)
             ).all()
         return [NormalizedEvent.model_validate(row[0]) for row in rows]
+
+    def iter_event_rows(
+        self, run_id: str, *, after_seq: int = 0, batch_size: int = 500
+    ) -> Iterator[tuple[int, NormalizedEvent]]:
+        """Stream ``(seq, event)`` in ``seq`` order, optionally resuming after a known sequence.
+
+        Keyset pagination on ``seq`` rather than OFFSET: OFFSET makes SQLite re-scan the skipped rows
+        for every page, which would reintroduce the quadratic behaviour the streaming export exists
+        to remove. ``seq`` is unique per run and monotonic, so ``seq > last`` resumes in constant
+        time and cannot skip or repeat a row even if the run is still being appended to.
+
+        ``after_seq`` is what lets the JSONL export be incremental instead of rebuilding the whole
+        file: the projection is append-only, so everything up to ``after_seq`` is already on disk.
+        """
+
+        last_seq = after_seq
+        while True:
+            with self.db.engine.connect() as conn:
+                rows = conn.execute(
+                    select(t.events.c.seq, t.events.c.body)
+                    .where(t.events.c.run_id == run_id, t.events.c.seq > last_seq)
+                    .order_by(t.events.c.seq)
+                    .limit(batch_size)
+                ).all()
+            if not rows:
+                return
+            for seq, body in rows:
+                last_seq = int(seq)
+                yield last_seq, NormalizedEvent.model_validate(body)
+            if len(rows) < batch_size:
+                return
+
+    def iter_events(
+        self, run_id: str, *, after_seq: int = 0, batch_size: int = 500
+    ) -> Iterator[NormalizedEvent]:
+        for _seq, event in self.iter_event_rows(run_id, after_seq=after_seq, batch_size=batch_size):
+            yield event
 
     def read_raw(self, run_id: str) -> list[dict]:
         return [event.model_dump(mode="json") for event in self.read(run_id)]

@@ -26,6 +26,10 @@ class EventType(str, Enum):
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
+    #: The run's owning process vanished without recording an outcome (spec §7.3). Distinct from
+    #: ``run.failed``: the run did not fail, we *lost track of it*, and the two need different
+    #: recovery and different words in the UI. Folding it into run.failed erased that distinction.
+    RUN_ORPHANED = "run.orphaned"
     #: A backend subprocess was launched (carries pid/create_time). Distinct from ``run.started``,
     #: which OpenAgent alone owns — a CLI adapter must never claim to start the *run* (item 4).
     PROCESS_STARTED = "process.started"
@@ -151,6 +155,24 @@ class NormalizedEvent(BaseModel):
 
     def to_json_line(self) -> str:
         return self.model_dump_json()
+
+
+#: The event types that end a run. Defined here, next to ``EventType``, because several layers need
+#: the same answer — the event log (which must flush its export before the process may exit), the run
+#: service, the projection and the artifact writer. When each kept its own copy, adding
+#: ``run.orphaned`` meant finding all of them.
+TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.RUN_COMPLETED.value,
+        EventType.RUN_FAILED.value,
+        EventType.RUN_CANCELLED.value,
+        EventType.RUN_ORPHANED.value,
+    }
+)
+
+
+def is_terminal_event_type(event_type: EventType | str) -> bool:
+    return (event_type if isinstance(event_type, str) else event_type.value) in TERMINAL_EVENT_TYPES
 
 
 # --------------------------------------------------------------------------- model-level events

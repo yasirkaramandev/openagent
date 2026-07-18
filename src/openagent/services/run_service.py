@@ -1515,7 +1515,9 @@ class RunService:
 
     def repair_event_export(self, run_id: str, *, all_projects: bool = False) -> dict[str, Any]:
         run = self._require_run(run_id, all_projects=all_projects)
-        path = EventLog(self.run_dir_for(run), index=self.repos.event_index, run_id=run.id).export()
+        # ``repair`` forces a full rewrite from SQLite. A plain export would try to resume from the
+        # file, which is exactly what cannot be trusted when someone is asking for a repair.
+        path = EventLog(self.run_dir_for(run), index=self.repos.event_index, run_id=run.id).repair()
         return {
             "run_id": run.id,
             "events": self.repos.event_index.count(run.id),
