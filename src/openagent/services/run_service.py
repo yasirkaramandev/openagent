@@ -51,13 +51,16 @@ from ..security.execution_backend import (
 )
 from ..security.process import (
     PID_ALIVE,
+    PID_GONE,
+    PID_REUSED,
     TerminationOutcome,
     TerminationResult,
     capture_process_identity,
     process_identity_status,
+    run_process_status,
     terminate_pid_tree,
 )
-from ..storage.event_log import EventLog
+from ..storage.event_log import EventExportError, EventLog
 from ..storage.projects import canonical_root
 from ..tools.base import AskUserResolver, ToolContext
 from ..tools.registry import ToolExecutor
@@ -145,6 +148,18 @@ def _cancel_outcome(result: TerminationResult) -> CancelOutcome:
 
 class RunError(RuntimeError):
     pass
+
+
+class _ConcurrentRunUpdate(RunError):
+    """Another writer won the run revision; this worker must stop without terminal side effects."""
+
+
+class TerminalEventAppendError(RunError):
+    """The authoritative terminal event could not be appended."""
+
+
+class TerminalEventExportError(RunError):
+    """The event committed to SQLite but its JSONL projection could not be exported."""
 
 
 class PreflightFailed(RunError):
@@ -251,8 +266,16 @@ class RunService:
             container_image=container_image,
             commit_agent_changes=commit_agent_changes,
         )
-        self.repos.runs.upsert(run)
+        self.repos.runs.create_run(run)
         return run
+
+    def _save_progress(self, run: Run) -> None:
+        if not self.repos.runs.update_progress(run):
+            raise _ConcurrentRunUpdate(f"run {run.id} changed concurrently")
+
+    def _save_transition(self, run: Run, previous: RunStatus | str) -> None:
+        if not self.repos.runs.transition_run(run, expected_statuses={previous}):
+            raise _ConcurrentRunUpdate(f"run {run.id} lifecycle changed concurrently")
 
     # ------------------------------------------------------------------ project scope (§3)
 
@@ -367,11 +390,12 @@ class RunService:
                         data={"phase": new.value, **data},
                     )
                 )
-                self.repos.runs.upsert(run)
+                self._save_progress(run)
 
             # The one and only run.started for this run — OpenAgent's, never a backend's (item 4).
+            previous_status = run.status
             run.status = RunStatus.STARTING
-            self.repos.runs.upsert(run)
+            self._save_transition(run, previous_status)
             sink(
                 NormalizedEvent(
                     run_id=run.id,
@@ -427,7 +451,7 @@ class RunService:
                 run.in_place = workspace.in_place
                 run.source_path = str(workspace.source)
                 run.baseline_dir = str(workspace.baseline_dir) if workspace.baseline_dir else None
-                self.repos.runs.upsert(run)
+                self._save_progress(run)
                 if workspace.lower_safety:
                     art.warnings.append(_lower_safety_warning(workspace))
                 sink(
@@ -447,8 +471,9 @@ class RunService:
 
                 # ---- backend ----------------------------------------------------------------
                 phase(RunPhase.STARTING_BACKEND)
+                previous_status = run.status
                 run.status = RunStatus.RUNNING
-                self.repos.runs.upsert(run)
+                self._save_transition(run, previous_status)
                 phase(RunPhase.RUNNING)
 
                 rtype = agent.runtime.type
@@ -535,6 +560,7 @@ class RunService:
                         }
 
             final = self._resolve_final(run, state)
+            previous_status = run.status
             run.status = final
             run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
             run.completed_at = _now()
@@ -542,7 +568,7 @@ class RunService:
                 run.failure_type = None  # a completed run carries no failure type (item 18)
                 if not art.summary:
                     art.summary = projection.final_message or "Run completed."
-            self.repos.runs.upsert(run)
+            self._save_transition(run, previous_status)
 
             # Reuse the backend's own terminal event when it still matches the resolved outcome
             # (keeps its richer data); otherwise synthesize one for the reconciled status.
@@ -566,15 +592,48 @@ class RunService:
             projection.apply(terminal_event)
             writer.write_status(run)
             writer.write_results(run, art, projection)
+            writer.write_expected(run, art)
+            writer.write_auxiliary(art)
             writer.write_timeline(run, projection)
             writer.write_integrity(run)
-            self.repos.runs.upsert(run)
-            saved = event_log.append(terminal_event)
+            self._save_progress(run)
+            try:
+                saved = event_log.append(terminal_event)
+            except EventExportError:
+                # SQLite already contains the terminal event. Keep the real outcome and explicitly
+                # mark the file bundle as partial/repairable instead of inventing a contradictory
+                # run.failed solely because the non-authoritative JSONL projection is stale.
+                export_failure = {
+                    "stage": "event_export",
+                    "message": "terminal event committed; JSONL export requires repair",
+                }
+                art.warnings.append(
+                    "events.jsonl export failed; SQLite event store is authoritative"
+                )
+                writer.write_status(run, artifacts_partial=True, artifact_failure=export_failure)
+                writer.write_results(
+                    run,
+                    art,
+                    projection,
+                    artifacts_partial=True,
+                    artifact_failure=export_failure,
+                )
+                writer.write_integrity(run)
+                self._save_progress(run)
+                state["terminal_written"] = True
+                return run
+            except Exception as exc:  # noqa: BLE001 - classified separately from artifact writes
+                run.failure_type = "terminal_event_append_failed"
+                raise TerminalEventAppendError(
+                    "authoritative terminal event append failed"
+                ) from exc
             state["terminal_written"] = True
             if on_event is not None:
                 with contextlib.suppress(Exception):  # a UI-notify failure must not fail the run
                     on_event(saved)
             return run
+        except _ConcurrentRunUpdate:
+            return self.repos.runs.get(run.id) or run
         except Exception as exc:  # noqa: BLE001 - the outer lifecycle boundary (item 9.4)
             return self._finalize_failure(run, run_dir, art, state, exc)
         finally:
@@ -594,6 +653,7 @@ class RunService:
 
         prior = state.get("terminal")
         final = prior if prior in (RunStatus.CANCELLED, RunStatus.FAILED) else RunStatus.FAILED
+        previous_status = run.status
         if final is RunStatus.FAILED:
             run.failure_type = run.failure_type or "artifact_write_failed"
             if not art.error:
@@ -606,9 +666,22 @@ class RunService:
         run.status = final
         run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
         run.completed_at = _now()
-        # The DB is the source of truth for status — persist the terminal state above all else.
-        with contextlib.suppress(Exception):
-            self.repos.runs.upsert(run)
+        # The DB is the source of truth. If a completed outcome was already reserved before a
+        # mandatory artifact failed, correct that reservation to failed; otherwise use the ordinary
+        # revision-aware transition. Losing either CAS means another actor owns finalization and this
+        # worker must not append an event or touch its bundle.
+        if previous_status is RunStatus.COMPLETED and final is RunStatus.FAILED:
+            accepted = self.repos.runs.mark_artifact_failure(
+                run,
+                expected_status=previous_status,
+            )
+        else:
+            accepted = self.repos.runs.transition_run(
+                run,
+                expected_statuses={previous_status},
+            )
+        if not accepted:
+            return self.repos.runs.get(run.id) or run
         self._recover_artifacts(
             run,
             run_dir,
@@ -645,18 +718,6 @@ class RunService:
         is_cancelled = enum_value(final) == RunStatus.CANCELLED.value
         art_failure = {"stage": stage, "message": str(exc) or exc.__class__.__name__}
 
-        # Exactly one terminal event, and only if the normal path never wrote one (item 1).
-        if not wrote_terminal:
-            with contextlib.suppress(Exception):
-                EventLog(run_dir, index=self.repos.event_index).append(
-                    NormalizedEvent(
-                        run_id=run.id,
-                        type=_terminal_event_type(final),
-                        source="openagent",
-                        data={"status": enum_value(final), "error_type": run.failure_type},
-                    )
-                )
-
         # Rebuild cumulative artifacts + projection from whatever is on disk (best-effort). A live
         # ``art`` from execute() is preferred (it already carries this run's diff/summary/error).
         bundle = art
@@ -691,9 +752,27 @@ class RunService:
                 steps.append(lambda: writer.write_timeline(run, projection))
             if prompt is not None:
                 steps.append(lambda: writer.write_turn(run, prompt, bundle, None))
+            steps.append(lambda: writer.write_expected(run, bundle))
+            steps.append(lambda: writer.write_auxiliary(bundle))
             for step in steps:
                 with contextlib.suppress(Exception):
                     step()
+            with contextlib.suppress(Exception):
+                writer.write_integrity(run)
+
+        # Terminal event last, after every artifact attempt. A failed/cancelled outcome may still be
+        # recorded when a mandatory artifact is impossible, but a provisional success never reaches
+        # this recovery path: it was corrected to failed by the outer lifecycle boundary.
+        if not wrote_terminal:
+            with contextlib.suppress(Exception):
+                EventLog(run_dir, index=self.repos.event_index).append(
+                    NormalizedEvent(
+                        run_id=run.id,
+                        type=_terminal_event_type(final),
+                        source="openagent",
+                        data={"status": enum_value(final), "error_type": run.failure_type},
+                    )
+                )
 
     def _fail(self, run: Run, sink: EventHook, state: dict, exc: Exception) -> None:
         """Persist a runtime exception as a real ``run.failed`` event (item 13).
@@ -742,7 +821,7 @@ class RunService:
             EventType.PROCESS_STARTED.value,
             EventType.SESSION_CREATED.value,
         ):
-            self.repos.runs.upsert(run)
+            self._save_progress(run)
 
     async def _run_api(
         self,
@@ -910,6 +989,19 @@ class RunService:
         if lock.locked():
             raise RunError("a turn is already running for this run")
 
+        # A prior process may have committed the durable claim and died before its first ordinary
+        # domain update. The JSON payload now mirrors that claim, so inspect the lease before the
+        # generic "running is not resumable" policy. Conclusive owner death terminalizes the run as
+        # orphaned; a live or unverifiable owner remains protected and is never reattached/stolen.
+        if run.active_turn_id is not None:
+            recovered = self._reclaim_if_owner_is_dead(run.id)
+            if recovered:
+                raise RunError(
+                    "the previous turn owner died; this run was marked orphaned and its CLI "
+                    "session was not reattached. Start a new run for safe recovery"
+                )
+            raise RunError("a turn is already running for this run")
+
         # The service enforces the resume policy itself (§5, §22). This used to live only in
         # resume_support(), which just the TUI called — so any direct call (CLI, tests, another
         # screen) walked past every guard, including the one that stops a second process being
@@ -936,23 +1028,22 @@ class RunService:
             started_at=_now().isoformat(),
         )
         if not claimed:
-            self._reclaim_if_owner_is_dead(run.id)
-            claimed = self.repos.runs.claim_turn(
-                run.id,
-                turn_id=turn_id,
-                pid=os.getpid(),
-                create_time=identity.create_time if identity else 0.0,
-                started_at=_now().isoformat(),
-            )
+            recovered = self._reclaim_if_owner_is_dead(run.id)
+            if recovered:
+                raise RunError(
+                    "the previous turn owner died; this run was marked orphaned and its CLI "
+                    "session was not reattached. Start a new run for safe recovery"
+                )
         if not claimed:
             raise RunError("a turn is already running for this run")
 
+        result: Run | None = None
         try:
             async with lock:
                 # Re-read: the claim moved the row to running and bumped its revision, so the
                 # in-memory copy from before the claim is already stale.
                 current = self.repos.runs.get(run.id) or run
-                return await self._resume_locked(current, agent, prompt, on_event)
+                result = await self._resume_locked(current, agent, prompt, on_event)
         finally:
             with contextlib.suppress(Exception):
                 self.repos.runs.release_turn(run.id, turn_id=turn_id)
@@ -960,9 +1051,10 @@ class RunService:
             # a long-lived TUI/service grow without bound and retained stale event-loop objects.
             if not lock.locked():
                 self._resume_locks.pop(run.id, None)
+        return self.repos.runs.get(run.id) or result or run
 
-    def _reclaim_if_owner_is_dead(self, run_id: str) -> None:
-        """Drop a lease whose owning process no longer exists.
+    def _reclaim_if_owner_is_dead(self, run_id: str) -> bool:
+        """Orphan a turn whose owning process is conclusively gone or PID-reused.
 
         Deliberately not a timeout: elapsed time cannot tell a crashed owner from a model that is
         simply taking a long time, and stealing a live owner's turn is the failure mode worth
@@ -972,16 +1064,33 @@ class RunService:
 
         owner = self.repos.runs.turn_owner(run_id)
         if owner is None:
-            return
+            return False
         turn_id, pid, create_time = owner
         if pid <= 0 or pid == os.getpid():
-            return
-        identity = ProcessIdentity(
-            pid=pid, create_time=create_time, executable="", command_identity=""
-        )
-        if process_identity_status(identity) == PID_ALIVE:
-            return  # a live owner keeps its turn, however long it takes
-        self.repos.runs.clear_dead_turn(run_id, turn_id=turn_id)
+            return False
+        # A turn lease stores exactly PID + creation time. Validate exactly that evidence; building a
+        # fake full ProcessIdentity with empty executable/command hashes makes every live owner look
+        # mismatched and lets a second process steal its session.
+        status = run_process_status(pid, create_time)
+        if status == PID_ALIVE:
+            return False  # a live owner keeps its turn, however long it takes
+        if status not in {PID_GONE, PID_REUSED}:
+            return False  # unknown identity is fail-closed; never clear it automatically
+        if not self.repos.runs.clear_dead_turn(run_id, turn_id=turn_id):
+            return False
+        recovered = self.repos.runs.get(run_id)
+        if recovered is not None:
+            self.reconcile_terminal_bundle(
+                recovered,
+                target_status=RunStatus.ORPHANED,
+                expected={RunStatus.ORPHANED},
+                failure_type="turn_owner_pid_gone"
+                if status == PID_GONE
+                else "turn_owner_pid_reused",
+                reason="follow-up turn owner process was lost; session not reattached",
+                terminal_data={"pid_status": status, "turn_id": turn_id},
+            )
+        return True
 
     async def _resume_locked(
         self, run: Run, agent: AgentProfile, prompt: str, on_event: EventHook | None
@@ -1019,7 +1128,7 @@ class RunService:
             run.turns += 1
             run.completed_at = None
             run.failure_type = None
-            self.repos.runs.upsert(run)
+            self._save_progress(run)
 
             def sink(event: NormalizedEvent) -> None:
                 # Buffer the turn's terminal event (§4.2): it must be the LAST log entry for the turn,
@@ -1078,6 +1187,8 @@ class RunService:
                 run, prompt, turn_state, turn_art, event_start, event_log, on_event
             )
             return run
+        except _ConcurrentRunUpdate:
+            return self.repos.runs.get(run.id) or run
         except Exception as exc:  # noqa: BLE001 - the outer lifecycle boundary (§4.3)
             return self._finalize_resume_failure(run, run_dir, prompt, turn_state, exc)
         finally:
@@ -1129,6 +1240,7 @@ class RunService:
                     }
 
         final = self._resolve_final(run, turn_state)
+        previous_status = run.status
         run.status = final
         run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
         run.completed_at = _now()
@@ -1136,7 +1248,7 @@ class RunService:
             run.failure_type = None  # a successful new turn clears a prior turn's failure (item 18)
             if not turn_art.summary:
                 turn_art.summary = projection.final_message or "Turn completed."
-        self.repos.runs.upsert(run)
+        self._save_transition(run, previous_status)
 
         pending = turn_state.get("pending_terminal")
         if pending is not None and _status_of_terminal(pending) is final:
@@ -1159,10 +1271,34 @@ class RunService:
         writer.write_turn(run, prompt, turn_art, (event_start, event_end))
         writer.write_status(run)
         writer.write_results(run, art, projection)
+        writer.write_expected(run, art)
+        writer.write_auxiliary(art)
         writer.write_timeline(run, projection)
         writer.write_integrity(run)
-        self.repos.runs.upsert(run)
-        saved = event_log.append(terminal_event)  # LAST log entry for the turn (item 1)
+        self._save_progress(run)
+        try:
+            saved = event_log.append(terminal_event)  # LAST log entry for the turn (item 1)
+        except EventExportError:
+            export_failure = {
+                "stage": "event_export",
+                "message": "terminal event committed; JSONL export requires repair",
+            }
+            art.warnings.append("events.jsonl export failed; SQLite event store is authoritative")
+            writer.write_status(run, artifacts_partial=True, artifact_failure=export_failure)
+            writer.write_results(
+                run,
+                art,
+                projection,
+                artifacts_partial=True,
+                artifact_failure=export_failure,
+            )
+            writer.write_integrity(run)
+            self._save_progress(run)
+            turn_state["terminal_written"] = True
+            return
+        except Exception as exc:  # noqa: BLE001
+            run.failure_type = "terminal_event_append_failed"
+            raise TerminalEventAppendError("authoritative terminal event append failed") from exc
         turn_state["terminal_written"] = True
         if on_event is not None:
             with contextlib.suppress(Exception):
@@ -1179,13 +1315,24 @@ class RunService:
 
         prior = turn_state.get("terminal")
         final = prior if prior in (RunStatus.CANCELLED, RunStatus.FAILED) else RunStatus.FAILED
+        previous_status = run.status
         if final is RunStatus.FAILED:
             run.failure_type = run.failure_type or "artifact_write_failed"
         run.status = final
         run.phase = final.value if final.value in _PHASE_VALUES else RunPhase.FAILED.value
         run.completed_at = _now()
-        with contextlib.suppress(Exception):
-            self.repos.runs.upsert(run)
+        if previous_status is RunStatus.COMPLETED and final is RunStatus.FAILED:
+            accepted = self.repos.runs.mark_artifact_failure(
+                run,
+                expected_status=previous_status,
+            )
+        else:
+            accepted = self.repos.runs.transition_run(
+                run,
+                expected_statuses={previous_status},
+            )
+        if not accepted:
+            return self.repos.runs.get(run.id) or run
         self._recover_artifacts(
             run,
             run_dir,
@@ -1584,32 +1731,164 @@ class RunService:
             return False
 
         run_dir = self.run_dir_for(run)
-        if not run_dir.exists():
-            return True
-
         event_log = EventLog(run_dir, index=self.repos.event_index, run_id=run.id)
+        failures: list[dict[str, str]] = []
+        if artifact_failure is not None:
+            failures.append(
+                {
+                    "stage": str(artifact_failure.get("stage", "artifact")),
+                    "message": str(artifact_failure.get("message", "artifact write failed")),
+                    "class": "mandatory",
+                }
+            )
+
+        def record_failure(stage: str, classification: str, exc: Exception) -> None:
+            failures.append(
+                {
+                    "stage": stage,
+                    "message": str(exc) or exc.__class__.__name__,
+                    "class": classification,
+                }
+            )
 
         # Rebuild the cumulative bundle from the log, so the artifacts describe what actually
         # happened rather than being blanked by a recovery path that had no in-memory state.
         try:
             art, _state = self._rebuild_artifacts(run)
-        except Exception:  # noqa: BLE001 - an unreadable log must not block reconciliation
+        except Exception as exc:  # noqa: BLE001 - record a partial recovery rather than hiding it
+            record_failure("artifact_rebuild", "expected", exc)
             art = RunArtifacts()
         try:
             projection: RunProjection | None = self.projection(run.id)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            record_failure("projection_rebuild", "expected", exc)
             projection = None
+        writer = ArtifactWriter(run_dir)
 
-        # At most one terminal event *of each kind* (item 1). Reconciling the same outcome twice —
-        # orphan recovery running again on a restart — must not append a duplicate. But a run that
-        # was orphaned and is then explicitly cancelled by the user has genuinely changed state, and
-        # refusing to record run.cancelled there would leave the log ending on an audit note while
-        # the database said "cancelled".
-        event_type = terminal_event_type(target_status)
+        mandatory: list[tuple[str, Callable[[], Any]]] = [
+            ("write_status", lambda: writer.write_status(run)),
+            ("write_results", lambda: writer.write_results(run, art, projection)),
+        ]
+        mandatory_failed = artifact_failure is not None
+        for stage, step in mandatory:
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001 - classified and reconciled below
+                mandatory_failed = True
+                record_failure(stage, "mandatory", exc)
+
+        # A success reservation is invalid when either mandatory artifact could not be materialized.
+        # Correct the DB before constructing/appending a terminal event, so ``run.completed`` can
+        # never be emitted for a bundle without a parseable ``result.json``.
+        if mandatory_failed and run.status is RunStatus.COMPLETED:
+            reserved_status = run.status
+            run.status = RunStatus.FAILED
+            run.phase = RunPhase.FAILED.value
+            run.failure_type = "artifact_write_failed"
+            run.completed_at = _now()
+            if not self.repos.runs.mark_artifact_failure(
+                run,
+                expected_status=reserved_status,
+            ):
+                return False
+            art.error = art.error or {
+                "error_type": "artifact_write_failed",
+                "message": failures[0]["message"],
+                "phase": RunPhase.FAILED.value,
+                "source": "openagent",
+            }
+            # The old projection may contain the provisional success event. Rebuild before applying
+            # the real failed outcome; no terminal event has been appended yet.
+            try:
+                projection = self.projection(run.id)
+            except Exception as exc:  # noqa: BLE001
+                record_failure("projection_rebuild_failed_outcome", "expected", exc)
+                projection = None
+
+        first_failure = failures[0] if failures else None
+
+        # Expected and optional artifacts are independent: one failure must not prevent attempts at
+        # the rest. Any partial bundle gets an explicit marker in every mandatory file that can be
+        # written, with the failing stage redacted by ArtifactWriter.
+        expected_steps: list[tuple[str, Callable[[], Any]]] = [
+            ("write_expected", lambda: writer.write_expected(run, art)),
+        ]
+        if projection is not None:
+            expected_steps.append(
+                ("write_timeline", lambda: writer.write_timeline(run, projection))
+            )
+        for stage, step in expected_steps:
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001
+                record_failure(stage, "expected", exc)
+        try:
+            writer.write_auxiliary(art)
+        except Exception as exc:  # noqa: BLE001
+            record_failure("write_auxiliary", "optional", exc)
+
+        if failures:
+            first_failure = failures[0]
+            for stage, step in (
+                (
+                    "write_status_partial",
+                    lambda: writer.write_status(
+                        run,
+                        artifacts_partial=True,
+                        artifact_failure=first_failure,
+                    ),
+                ),
+                (
+                    "write_results_partial",
+                    lambda: writer.write_results(
+                        run,
+                        art,
+                        projection,
+                        artifacts_partial=True,
+                        artifact_failure=first_failure,
+                    ),
+                ),
+            ):
+                try:
+                    step()
+                except Exception as exc:  # noqa: BLE001
+                    record_failure(stage, "mandatory", exc)
+
+        # The manifest is expected and is written last so every recorded hash matches the shipped
+        # bundle. If it fails, restamp status/result as partial and never leave a stale manifest.
+        try:
+            writer.write_integrity(run)
+            self._save_progress(run)
+        except _ConcurrentRunUpdate:
+            return False
+        except Exception as exc:  # noqa: BLE001
+            record_failure("write_integrity", "expected", exc)
+            with contextlib.suppress(OSError):
+                (run_dir / "integrity.json").unlink()
+            first_failure = failures[0]
+            for step in (
+                lambda: writer.write_status(
+                    run, artifacts_partial=True, artifact_failure=first_failure
+                ),
+                lambda: writer.write_results(
+                    run,
+                    art,
+                    projection,
+                    artifacts_partial=True,
+                    artifact_failure=first_failure,
+                ),
+            ):
+                try:
+                    step()
+                except Exception as retry_exc:  # noqa: BLE001
+                    record_failure("partial_marker_after_integrity", "mandatory", retry_exc)
+
+        # At most one terminal event of each kind. ``orphaned -> cancelled`` remains a real second
+        # transition; reconciling the same outcome twice remains idempotent.
+        event_type = terminal_event_type(run.status)
         already_recorded = self.repos.event_index.has_event_type(run.id, event_type.value)
-        terminal_event: NormalizedEvent | None = None
         if not already_recorded:
-            data: dict[str, Any] = {"status": enum_value(target_status)}
+            data: dict[str, Any] = {"status": enum_value(run.status)}
             if run.failure_type:
                 data["error_type"] = run.failure_type
             if reason:
@@ -1624,38 +1903,42 @@ class RunService:
             )
             if projection is not None:
                 projection.apply(terminal_event)
-
-        # Artifacts first, terminal event last: a failed artifact write is then caught *before* the
-        # log claims the run is over, so result.json can never be missing while the log says done
-        # (item 9.4). Each write is individually suppressed — recording an outcome must not raise.
-        partial = artifact_failure is not None
-        writer = ArtifactWriter(run_dir)
-        steps: list[Callable[[], Any]] = [
-            lambda: writer.write_status(
-                run, artifacts_partial=partial, artifact_failure=artifact_failure
-            ),
-            lambda: writer.write_results(
-                run,
-                art,
-                projection,
-                artifacts_partial=partial,
-                artifact_failure=artifact_failure,
-            ),
-        ]
-        if projection is not None:
-            steps.append(lambda: writer.write_timeline(run, projection))
-        for step in steps:
-            with contextlib.suppress(Exception):
-                step()
-
-        if terminal_event is not None:
-            with contextlib.suppress(Exception):
+            try:
                 event_log.append(terminal_event)
-        with contextlib.suppress(Exception):
-            event_log.flush()
-        # The manifest is written last so it covers the bundle as finally shipped.
-        with contextlib.suppress(Exception):
-            writer.write_integrity(run)
+            except EventExportError as exc:
+                raise TerminalEventExportError(
+                    "terminal event committed to SQLite but JSONL export failed; run events repair"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - authoritative append failure is distinct
+                # If the reserved outcome was success, invalidate it and rewrite the mandatory
+                # bundle before reporting the append failure. Never attempt to label this as an
+                # artifact failure: it is a separate durability boundary.
+                if run.status is RunStatus.COMPLETED:
+                    reserved_status = run.status
+                    run.status = RunStatus.FAILED
+                    run.phase = RunPhase.FAILED.value
+                    run.failure_type = "terminal_event_append_failed"
+                    run.completed_at = _now()
+                    self.repos.runs.mark_artifact_failure(
+                        run,
+                        expected_status=reserved_status,
+                    )
+                    failure = {
+                        "stage": "terminal_event_append",
+                        "message": "authoritative terminal event append failed",
+                    }
+                    with contextlib.suppress(Exception):
+                        writer.write_status(run, artifacts_partial=True, artifact_failure=failure)
+                        writer.write_results(
+                            run,
+                            art,
+                            projection,
+                            artifacts_partial=True,
+                            artifact_failure=failure,
+                        )
+                raise TerminalEventAppendError(
+                    "authoritative terminal event append failed"
+                ) from exc
         return True
 
     def _record_orphan_event(self, run: Run, status: str, failure_type: str = "") -> None:

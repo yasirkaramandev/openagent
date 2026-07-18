@@ -148,11 +148,19 @@ class ArtifactWriter:
         result.update(_structured(projection))
         _mark_partial(result, artifacts_partial, artifact_failure)
         self._json("result.json", result)
+
+    def write_expected(self, run: Run, art: RunArtifacts) -> None:
+        """Write the human-facing expected outcome documents."""
+
+        self._text("output.md", redact(_render_output_md(run, art)))
+        self._text("handoff.md", redact(_render_handoff_md(run, art)))
+
+    def write_auxiliary(self, art: RunArtifacts) -> None:
+        """Write optional diagnostics whose failure cannot change a terminal outcome."""
+
         self._json("tests.json", art.tests.to_dict())
         self._text("changes.diff", redact(art.diff))
         self._text("logs.txt", redact("\n".join(art.log_lines)))
-        self._text("output.md", redact(_render_output_md(run, art)))
-        self._text("handoff.md", redact(_render_handoff_md(run, art)))
 
     def write_timeline(self, run: Run, projection: RunProjection) -> None:
         """The narrative of the run: what the agent said, planned, ran, and changed (item 23)."""

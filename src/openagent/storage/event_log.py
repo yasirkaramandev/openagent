@@ -57,6 +57,10 @@ EXPORT_LOCK_TIMEOUT_SECONDS = 30.0
 EXPORT_PAGE_SIZE = 500
 
 
+class EventExportError(OSError):
+    """SQLite append committed, but the non-authoritative JSONL projection could not be updated."""
+
+
 def write_all(fd: int, payload: bytes) -> None:
     """Write every byte in ``payload`` or raise without claiming progress.
 
@@ -128,7 +132,13 @@ class EventLog:
         self.index.append_event(safe)
         self._pending += 1
         if self._should_export(safe):
-            self.export()
+            try:
+                self.export()
+            except Exception as exc:
+                # The authoritative SQLite append already committed. Preserve that distinction so
+                # terminal reconciliation does not mistake a stale projection for an event-store
+                # append failure and attempt a contradictory second terminal outcome.
+                raise EventExportError("SQLite event committed but JSONL export failed") from exc
         return safe
 
     def _should_export(self, event: NormalizedEvent) -> bool:
