@@ -393,6 +393,30 @@ def capture_process_identity(pid: int | None) -> ProcessIdentity | None:
     return previous
 
 
+def _capture_owned_process_identity(
+    popen: subprocess.Popen[bytes], *, startup_timeout: float = 0.25
+) -> ProcessIdentity | None:
+    """Capture identity through transient ``psutil`` startup gaps for our exact child handle.
+
+    Linux can briefly expose a live PID before ``exe``/``cmdline`` are readable. Retrying the PID
+    alone would risk accepting a replacement if a tiny child exited and its PID were reused. The
+    Popen handle closes that race: an exit observed before or after every sample invalidates it.
+    """
+
+    deadline = time.monotonic() + startup_timeout
+    while True:
+        if popen.poll() is not None:
+            return None
+        identity = capture_process_identity(popen.pid)
+        if popen.poll() is not None:
+            return None
+        if identity is not None:
+            return identity
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
+
+
 def _verify_process(
     identity: ProcessIdentity,
 ) -> tuple[psutil.Process | None, TerminationResult | None]:
@@ -639,7 +663,7 @@ def run_capture(
         shell=shell,
         start_new_session=not IS_WINDOWS,
     )
-    identity = capture_process_identity(popen.pid)
+    identity = _capture_owned_process_identity(popen)
     if identity is None and popen.poll() is None:
         # Fail closed only while the unidentified process is still alive. Very short commands can
         # exit before psutil's first sample; once ``poll`` has reaped that exact child there is

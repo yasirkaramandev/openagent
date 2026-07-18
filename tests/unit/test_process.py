@@ -75,6 +75,33 @@ def test_identity_race_does_not_bypass_output_limit(tmp_path, monkeypatch):
         )
 
 
+def test_run_capture_retries_a_transient_identity_gap(tmp_path, monkeypatch):
+    from openagent.security import process as process_module
+
+    real_capture = process_module.capture_process_identity
+    attempts = 0
+
+    def transient_miss(pid):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return None
+        return real_capture(pid)
+
+    monkeypatch.setattr(process_module, "capture_process_identity", transient_miss)
+
+    result = run_capture(
+        [sys.executable, "-c", "import time; time.sleep(0.2); print('ready')"],
+        cwd=tmp_path,
+        env=minimal_environment(),
+        timeout=5,
+        max_output_bytes=1024,
+    )
+
+    assert attempts >= 2
+    assert result.stdout == "ready\n"
+
+
 # --------------------------------------------------------------------------- PID identity (item 11)
 
 
