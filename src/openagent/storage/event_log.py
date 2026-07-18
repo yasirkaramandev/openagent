@@ -13,8 +13,7 @@ finished file.
 
 The export is now:
 
-* **batched** — a dirty counter plus a short deadline, so a burst of deltas costs one rewrite rather
-  than one per event;
+* **batched** — a dirty counter, so a burst of deltas costs one export rather than one per event;
 * **mandatory at the end** — a terminal event always flushes, because that is the file a user opens
   once the run finishes. Batching may delay the projection; it must never truncate it;
 * **streamed** — events are pulled from SQLite in pages and written line by line to a temp file that
@@ -33,7 +32,6 @@ import contextlib
 import json
 import os
 import sys
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -48,13 +46,32 @@ _IS_WINDOWS = sys.platform.startswith("win")
 #: Flush after this many un-exported events. Sized so a streaming turn does a handful of rewrites
 #: instead of thousands, while a quiet run still exports promptly via the deadline below.
 DEFAULT_BATCH_SIZE = 64
-#: …or after this long, whichever comes first, so a slow trickle of events is not left unexported
-#: for an unbounded time. A live TUI reads the DB, not this file, so the delay is not user-visible.
+#: Kept as a constructor compatibility default for callers from v0.1.3. It is deliberately *not* a
+#: latency guarantee: without a scheduler no elapsed-time deadline can fire when no later event
+#: arrives. SQLite is authoritative and live readers tail it; JSONL is exported on the first event,
+#: a full batch, a terminal event, explicit ``flush``/``repair``, and orderly shutdown.
 DEFAULT_MAX_DELAY_SECONDS = 0.25
 #: How long an export waits for a competing exporter before giving up and reporting a timeout.
 EXPORT_LOCK_TIMEOUT_SECONDS = 30.0
 #: Rows fetched per page while streaming.
 EXPORT_PAGE_SIZE = 500
+
+
+def write_all(fd: int, payload: bytes) -> None:
+    """Write every byte in ``payload`` or raise without claiming progress.
+
+    ``os.write`` is permitted to accept only a prefix, even for regular files. Advancing the JSONL
+    export cursor after one such call would permanently skip the unwritten suffix on the next
+    incremental export. Keep writing the remaining memoryview and treat a zero/negative result as
+    an I/O failure rather than spinning forever.
+    """
+
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("short write made no progress")
+        remaining = remaining[written:]
 
 
 def _secure_dir(path: Path) -> None:
@@ -80,10 +97,11 @@ class EventLog:
         self.index = index
         self._run_id = run_id
         self._batch_size = max(1, batch_size)
-        self._max_delay = max(0.0, max_delay)
+        # ``max_delay`` remains accepted so third-party callers do not break, but it no longer makes
+        # a false timing promise. A real deadline would require an owned scheduler/timer lifecycle.
+        self._legacy_max_delay = max(0.0, max_delay)
         #: Events committed to SQLite but not yet reflected in the JSONL projection.
         self._pending = 0
-        self._last_export = time.monotonic()
         #: The highest sequence this instance has written to the file, and the file size it left
         #: behind. Together they are the evidence that appending is safe; see ``_resume_point``.
         self._exported_seq = 0
@@ -125,7 +143,7 @@ class EventLog:
             return True
         if self._pending >= self._batch_size:
             return True
-        return (time.monotonic() - self._last_export) >= self._max_delay
+        return False
 
     def export(self, *, full: bool = False) -> Path:
         """Bring the JSONL projection up to date with SQLite. Safe to call at any time.
@@ -149,7 +167,6 @@ class EventLog:
             else:
                 self._rewrite(run_id)
         self._pending = 0
-        self._last_export = time.monotonic()
         return self.path
 
     def flush(self) -> Path:
@@ -208,11 +225,11 @@ class EventLog:
                 buffer.append(event.to_json_line())
                 last_seq = seq
                 if len(buffer) >= EXPORT_PAGE_SIZE:
-                    os.write(fd, ("\n".join(buffer) + "\n").encode("utf-8"))
+                    write_all(fd, ("\n".join(buffer) + "\n").encode("utf-8"))
                     buffer.clear()
                     written = True
             if buffer:
-                os.write(fd, ("\n".join(buffer) + "\n").encode("utf-8"))
+                write_all(fd, ("\n".join(buffer) + "\n").encode("utf-8"))
                 written = True
             if written:
                 os.fsync(fd)
