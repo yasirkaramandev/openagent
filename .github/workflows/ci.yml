@@ -19,10 +19,10 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -62,7 +62,7 @@ jobs:
 
       - name: Upload coverage XML
         if: matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml
@@ -80,7 +80,7 @@ jobs:
 
       - name: Upload distributions
         if: matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/*
@@ -98,10 +98,10 @@ jobs:
       matrix:
         textual: ["8.2.8"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -132,9 +132,9 @@ jobs:
     name: container-sandbox (real Docker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -166,11 +166,11 @@ jobs:
           - legacy-name: v0.1.3
             legacy-ref: bb5a67a31d707fa947adbb5d6b192ed1138980cc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -242,10 +242,10 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -280,7 +280,7 @@ jobs:
     env:
       OPENAGENT_SETUP_NO_LAUNCH: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Isolate uv directories
         run: |
@@ -410,7 +410,7 @@ jobs:
     env:
       OPENAGENT_SETUP_NO_LAUNCH: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Isolate uv directories
         shell: cmd
@@ -483,7 +483,7 @@ jobs:
     env:
       OPENAGENT_SETUP_NO_LAUNCH: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No actions/setup-python: setup.ps1 must bootstrap uv's managed Python itself.
       - name: Isolate uv directories
