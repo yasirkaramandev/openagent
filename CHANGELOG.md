@@ -4,6 +4,68 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6rc1] — unreleased
+
+Release candidate covering the v0.1.5 (authentication, Git, updater) and v0.1.6 (provider/agent
+concurrency, generated-file locking) stabilization work. Every change ships with a regression test
+that fails against the unpatched code; the reproduction is recorded in each commit message.
+
+### Security
+
+- **Internal Git subprocesses are isolated.** Committing an agent's work no longer hands the parent
+  process's environment — every provider API key included — to a `.git/hooks/pre-commit` chosen by
+  the repository being worked on. All internal `git` calls route through `security/git_runner`,
+  which builds a minimal environment (allowlist, not denylist), disables hooks via an empty
+  `core.hooksPath` (not `--no-verify` alone), clears every configuration-named delegation point
+  (pager, credential helper, external diff, textconv, ssh command, `ext::` protocol), and
+  terminates the whole process tree on timeout. The user's own `git` is untouched.
+- **CLI credentials reach only the CLI they belong to.** A Claude run receives Anthropic variables,
+  a Codex run receives OpenAI variables, and neither receives the other's key or any unrelated
+  cloud credential. Values are registered for output redaction before the child starts and released
+  when the turn ends; they are resolved per turn and never persisted, so a rotated key takes effect
+  on resume.
+
+### Fixed
+
+- **Authentication detection was wrong in both directions.** An exported `ANTHROPIC_API_KEY` /
+  `CLAUDE_CODE_OAUTH_TOKEN` — the documented way to authenticate — no longer reports "not signed in"
+  and blocks the run, and a `~/.claude.json` config file is no longer mistaken for a credential.
+  Detection now asks `claude auth status` (JSON) under the environment the run will use; Codex
+  evidence is gathered from both `codex login status` and the environment because neither is
+  sufficient alone. "Could not determine" no longer blocks — only a known absence does.
+- **A failed update reported success.** `openagent cli update` no longer exits 0 when the binary is
+  unchanged or its version cannot be compared; both are `VERIFICATION_FAILED`. Version comparison
+  uses PEP 440 (`packaging`) instead of a regex that treated `1.2.0rc1` and `1.2.0` as equal. NPM
+  provenance fails closed when `npm prefix`/`root` cannot be read, rather than assuming ownership.
+  Concurrent updates of one CLI are excluded by a cross-process lock.
+- **`CliUpdatePolicy.ASK` now asks.** It previously behaved identically to `NOTIFY` — the default
+  policy never prompted. A non-interactive session degrades to `NOTIFY` rather than hanging; "don't
+  ask again" is scoped to the exact version and binary so it never silences a later update.
+- **Claude model discovery is project- and credential-aware.** `list_models` was called with no
+  context, discarding a project's `availableModels` policy and never performing the `/v1/models`
+  lookup. Doctor now runs real discovery instead of reporting OK because a method name exists.
+- **Provider and agent records no longer lose data under concurrency.** Agent names could be
+  silently overwritten (DELETE+INSERT), provider names collided on case and Unicode form, stale
+  writes clobbered newer ones, and an agent could outlive its provider. Uniqueness (case- and
+  Unicode-folded), the agent→provider foreign key, and `state_revision` compare-and-swap now live in
+  the database. Concurrent edits raise `ConcurrentModificationError` rather than winning silently.
+- **OPENAGENT.md no longer destroys hand-written prose.** A malformed marker block is refused with
+  an actionable `OpenAgentMdConflict` (and the new `openagent agent sync-document --dry-run`) rather
+  than replacing the whole file with boilerplate, and concurrent regeneration is serialized under a
+  cross-process lock with a preimage check. A conflicted document never blocks startup.
+
+### Added
+
+- **Revision `0012`** — `normalized_name`, `state_revision`, and `updated_at` on providers and
+  agents; a real `agents.provider_id` foreign key with `ON DELETE RESTRICT`, backfilled from the
+  provider name. Pre-existing duplicates block the migration (naming the rows) rather than being
+  resolved by guesswork; the pre-migration backup is retained.
+- **WAL journal mode with `synchronous=FULL`** on every connection.
+- **`openagent agent sync-document`** — regenerate OPENAGENT.md, with `--dry-run` to preview.
+- **Doctor checks** for model discovery, the operation journal, and provider/agent integrity.
+- **Quality infrastructure** — CodeQL (`security-extended`), Dependabot, branch-coverage measurement
+  with a per-module ratchet, issue/PR templates, and a v0.1.4 baseline report.
+
 ## [0.1.4] — 2026-07-18
 
 Lifecycle/concurrency hardening, source-aware CLI and OpenAgent updates, truthful model discovery,

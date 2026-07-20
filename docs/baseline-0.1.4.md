@@ -98,6 +98,23 @@ with gaps, because the gaps are visible and the invented numbers are not.
 
 ---
 
+## 0.1.6rc1 comparison
+
+Measured on the same machine after the full v0.1.5 + v0.1.6 program. Numbers moved as expected; none
+regressed in a way that matters.
+
+| Metric | 0.1.4 | 0.1.6rc1 | Note |
+|---|---:|---:|---|
+| Tests passed | 1209 | 1333 | +124, all new regressions |
+| Wheel size | 360 KB | 392 KB | +9%, the new modules |
+| `migrations.py` branch coverage | 66.3% | 71.1% | ratchet caught a dip to 61.1% mid-work; migration 0012 tests recovered it |
+| `updates.py` branch coverage | 54.6% | 57.7% | new verification/ASK tests |
+| Migration 0011→0012 (20 providers, 50 agents) | — | 41 ms | well under the < 10 s target |
+
+The coverage ratchet did its job once during this work: adding migration 0012 without tests dropped
+`migrations.py` below its floor and CI would have failed. The fix was to write the migration tests,
+not to lower the floor — which is the entire point of the mechanism.
+
 ## Reproducing
 
 ```bash

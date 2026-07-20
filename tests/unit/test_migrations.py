@@ -479,3 +479,191 @@ def test_latest_database_with_corrupt_json_fails_closed_on_reopen(tmp_path: Path
         Database.open(db_path)
     assert "cli_installations" in str(excinfo.value)
     assert "cli_private_name" not in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- revision 0012
+
+
+def _pre_0012_database(path: Path, providers, agents) -> None:
+    """A database at revision 0011: the provider/agent tables as they were before v0.1.6.
+
+    ``providers`` is ``[(id, name)]``; ``agents`` is ``[(name, runtime_type, provider_name)]`` where
+    ``provider_name`` is None for a CLI agent.
+    """
+
+    engine = create_engine(f"sqlite:///{path}", future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE provider_connections ("
+                " id VARCHAR PRIMARY KEY, name VARCHAR UNIQUE NOT NULL,"
+                " provider_type VARCHAR NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,"
+                " data JSON NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE agents ("
+                " name VARCHAR PRIMARY KEY, title VARCHAR NOT NULL DEFAULT '',"
+                " runtime_type VARCHAR NOT NULL, data JSON NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("CREATE TABLE schema_meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)")
+        )
+        conn.execute(text("INSERT INTO schema_meta (key, value) VALUES ('revision', '0011')"))
+        conn.execute(text("INSERT INTO schema_meta (key, value) VALUES ('version', '11')"))
+        for provider_id, name in providers:
+            payload = json.dumps(
+                {
+                    "id": provider_id,
+                    "name": name,
+                    "provider_type": "openai",
+                    "credential": {"type": "none"},
+                }
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO provider_connections (id, name, provider_type, data)"
+                    " VALUES (:id, :name, 'openai', :data)"
+                ),
+                {"id": provider_id, "name": name, "data": payload},
+            )
+        for name, runtime_type, provider_name in agents:
+            runtime: dict = {"type": runtime_type}
+            if runtime_type == "cli":
+                runtime["cli"] = "codex"
+            else:
+                runtime["provider"] = provider_name
+                runtime["model"] = "gpt-4"
+            payload = json.dumps({"name": name, "title": name, "runtime": runtime})
+            conn.execute(
+                text(
+                    "INSERT INTO agents (name, title, runtime_type, data)"
+                    " VALUES (:name, :name, :rt, :data)"
+                ),
+                {"name": name, "rt": runtime_type, "data": payload},
+            )
+    engine.dispose()
+
+
+def test_0012_adds_concurrency_columns_and_the_provider_foreign_key(tmp_path: Path):
+    db_path = tmp_path / "upgrade.db"
+    _pre_0012_database(db_path, [("prov_1", "OpenAI")], [("coder", "api-agent", "OpenAI")])
+
+    Database.open(db_path)
+
+    assert {"normalized_name", "state_revision", "updated_at"} <= _columns(
+        db_path, "provider_connections"
+    )
+    assert {"normalized_name", "provider_id", "state_revision", "updated_at"} <= _columns(
+        db_path, "agents"
+    )
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        # PRAGMA foreign_key_list columns: id, seq, table, from, to, on_update, on_delete, match.
+        fks = list(conn.execute(text("PRAGMA foreign_key_list(agents)")))
+        assert any(row[2] == "provider_connections" and row[6] == "RESTRICT" for row in fks)
+    engine.dispose()
+
+
+def test_0012_backfills_the_agent_provider_binding(tmp_path: Path):
+    db_path = tmp_path / "backfill.db"
+    _pre_0012_database(
+        db_path,
+        [("prov_1", "OpenAI"), ("prov_2", "Anthropic")],
+        [
+            ("coder", "api-agent", "OpenAI"),
+            ("writer", "api-agent", "Anthropic"),
+            ("cli-agent", "cli", None),
+        ],
+    )
+
+    Database.open(db_path)
+
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        bindings = {
+            row[0]: row[1] for row in conn.execute(text("SELECT name, provider_id FROM agents"))
+        }
+    engine.dispose()
+    assert bindings["coder"] == "prov_1"
+    assert bindings["writer"] == "prov_2"
+    assert bindings["cli-agent"] is None
+
+
+def test_0012_normalizes_names_for_case_insensitive_uniqueness(tmp_path: Path):
+    db_path = tmp_path / "normalize.db"
+    _pre_0012_database(db_path, [("prov_1", "OpenAI")], [("Coder", "cli", None)])
+
+    Database.open(db_path)
+
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        provider_norm = conn.execute(
+            text("SELECT normalized_name FROM provider_connections WHERE id='prov_1'")
+        ).scalar()
+        agent_norm = conn.execute(
+            text("SELECT normalized_name FROM agents WHERE name='Coder'")
+        ).scalar()
+    engine.dispose()
+    assert provider_norm == "openai"
+    assert agent_norm == "coder"
+
+
+def test_0012_blocks_on_case_colliding_providers_without_data_loss(tmp_path: Path):
+    """A duplicate that only differs by case must stop the upgrade, not be resolved by guessing."""
+
+    db_path = tmp_path / "dup.db"
+    _pre_0012_database(db_path, [("prov_1", "OpenAI"), ("prov_2", "openai")], [])
+
+    with pytest.raises(MigrationFailedError) as excinfo:
+        Database.open(db_path)
+    assert "collide" in str(excinfo.value)
+
+    # Records and revision untouched; the backup stands.
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        ids = {row[0] for row in conn.execute(text("SELECT id FROM provider_connections"))}
+        revision = conn.execute(text("SELECT value FROM schema_meta WHERE key='revision'")).scalar()
+    engine.dispose()
+    assert ids == {"prov_1", "prov_2"}, "a colliding row was dropped"
+    assert revision == "0011", "the schema was advanced despite the refusal"
+
+
+def test_0012_blocks_on_case_colliding_agents(tmp_path: Path):
+    db_path = tmp_path / "dup-agents.db"
+    _pre_0012_database(db_path, [], [("Coder", "cli", None), ("coder", "cli", None)])
+
+    with pytest.raises(MigrationFailedError) as excinfo:
+        Database.open(db_path)
+    assert "collide" in str(excinfo.value)
+
+
+def test_0012_leaves_a_dangling_binding_null_rather_than_blocking(tmp_path: Path):
+    """An agent naming a provider that does not exist is already broken; it must not block startup."""
+
+    db_path = tmp_path / "orphan.db"
+    _pre_0012_database(db_path, [("prov_1", "OpenAI")], [("orphan", "api-agent", "GoneProvider")])
+
+    Database.open(db_path)  # must not raise
+
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        binding = conn.execute(text("SELECT provider_id FROM agents WHERE name='orphan'")).scalar()
+    engine.dispose()
+    assert binding is None
+
+
+def test_0012_upgraded_schema_matches_a_fresh_database(tmp_path: Path):
+    """Schema parity: an upgraded database and a fresh one must have identical provider/agent shapes."""
+
+    upgraded = tmp_path / "upgraded.db"
+    _pre_0012_database(upgraded, [("prov_1", "OpenAI")], [("coder", "cli", None)])
+    Database.open(upgraded)
+
+    fresh = tmp_path / "fresh.db"
+    Database.open(fresh)
+
+    for table in ("provider_connections", "agents"):
+        assert _columns(upgraded, table) == _columns(fresh, table), f"{table} shape diverged"

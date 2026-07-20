@@ -17,7 +17,7 @@ from typer.testing import CliRunner
 import openagent
 from openagent.cli.app import app
 
-TARGET = "0.1.4"
+TARGET = "0.1.6rc1"
 _PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
 

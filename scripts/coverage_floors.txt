@@ -5,10 +5,10 @@
 # unreachable), say so in the pull request description.
 
 openagent/credentials = 79.7
-openagent/runtimes/cli/updates.py = 54.6
-openagent/security = 73.3
+openagent/runtimes/cli/updates.py = 57.7
+openagent/security = 75.5
 openagent/services/agent_service.py = 59.1
 openagent/services/provider_service.py = 73.4
-openagent/storage/migrations.py = 66.3
-openagent/storage/repositories.py = 75.0
+openagent/storage/migrations.py = 71.1
+openagent/storage/repositories.py = 76.9
 openagent/tui = 62.0
