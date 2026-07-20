@@ -56,7 +56,7 @@ dev = [
     # Pinned exactly: `ruff format --check .` is a CI gate, and formatting output changes between
     # ruff releases. An unpinned range would make the gate fail (or silently reformat) purely because
     # a new ruff shipped — the baseline must be reproducible (spec §8).
-    "ruff==0.15.21",
+    "ruff==0.15.22",
     "mypy>=1.10",
     "types-pyyaml",
     "types-psutil",
