@@ -70,6 +70,7 @@ from .base import (
     StreamOutcome,
     run_managed_cli,
 )
+from .cli_auth import build_child_environment, probe_codex_auth
 from .installations import inspect_installation
 from .locator import CliLocation
 from .locator import locate_candidates as locate_cli_candidates
@@ -151,11 +152,24 @@ class CodexAdapter:
         )
 
     async def inspect_auth(self) -> AuthStatus:
-        # Codex stores auth under ~/.codex; presence of auth.json indicates a login.
-        auth_file = Path.home() / ".codex" / "auth.json"
-        if auth_file.exists():
-            return AuthStatus(authenticated=True, detail="~/.codex/auth.json present")
-        return AuthStatus(authenticated=False, detail="run `codex login` (or set CODEX_API_KEY)")
+        """Gather Codex evidence from both the stored login and the environment.
+
+        Neither source is sufficient alone. ``codex login status`` reports only the *stored*
+        login — it prints the same thing whether or not ``OPENAI_API_KEY`` is set — so it can
+        confirm a login but never rule one out. The old check looked at ``~/.codex/auth.json``
+        alone and told users to set ``CODEX_API_KEY``, a variable the Codex CLI does not read.
+        """
+
+        plan = build_child_environment("codex")
+        evidence = await asyncio.to_thread(probe_codex_auth, self.executable or "codex", plan)
+        return AuthStatus(
+            authenticated=bool(evidence.authenticated),
+            detail=evidence.detail,
+            blocking=evidence.blocking,
+            environment_names=list(evidence.environment_names),
+            source=evidence.source.value,
+            conflicts=list(evidence.conflicts),
+        )
 
     async def capabilities(self) -> CliCapabilities:
         return CliCapabilities(

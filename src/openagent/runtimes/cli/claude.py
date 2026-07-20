@@ -2,8 +2,12 @@
 
 Runs ``claude -p --output-format stream-json --verbose`` and maps its JSONL events onto
 :class:`NormalizedEvent`s. Permission maps onto ``--allowedTools`` / ``--permission-mode`` from the
-profile. Claude is not installed on this machine, so the mapping is validated against recorded
-``stream-json`` fixtures (spec §40); the invocation is ready for live use once ``claude`` is present.
+profile.
+
+The event mapping is validated against recorded ``stream-json`` fixtures (spec §40) so the offline
+suite does not depend on a working installation or an API key. Authentication is a separate matter:
+``inspect_auth`` asks the installed CLI directly through ``claude auth status`` rather than
+inferring from the presence of a credentials file — see ``cli_auth``.
 """
 
 from __future__ import annotations
@@ -11,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 from ...core.events import EventType, NormalizedEvent
@@ -29,6 +32,7 @@ from .base import (
     CliRunRequest,
     run_managed_cli,
 )
+from .cli_auth import build_child_environment, probe_claude_auth
 from .installations import claude_update_preferences, inspect_installation
 from .locator import CliLocation
 from .locator import locate_candidates as locate_cli_candidates
@@ -87,12 +91,22 @@ class ClaudeAdapter:
         )
 
     async def inspect_auth(self) -> AuthStatus:
-        cfg = Path.home() / ".claude" / ".credentials.json"
-        legacy = Path.home() / ".claude.json"
-        if cfg.exists() or legacy.exists():
-            return AuthStatus(authenticated=True, detail="~/.claude credentials present")
+        """Ask Claude Code itself, under the environment the run will actually use.
+
+        The previous implementation checked only whether ``~/.claude/.credentials.json`` existed,
+        so a user authenticating through ``ANTHROPIC_API_KEY`` — documented and supported — was
+        reported as not signed in and the run was blocked by a mandatory preflight check.
+        """
+
+        plan = build_child_environment("claude")
+        evidence = await asyncio.to_thread(probe_claude_auth, self.executable or "claude", plan)
         return AuthStatus(
-            authenticated=False, detail="run `claude` to sign in, or set ANTHROPIC_API_KEY"
+            authenticated=bool(evidence.authenticated),
+            detail=evidence.detail,
+            blocking=evidence.blocking,
+            environment_names=list(evidence.environment_names),
+            source=evidence.source.value,
+            conflicts=list(evidence.conflicts),
         )
 
     async def capabilities(self) -> CliCapabilities:

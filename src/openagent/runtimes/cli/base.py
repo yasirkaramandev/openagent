@@ -38,8 +38,11 @@ class CliRunRequest:
     prompt: str
     workspace: Path
     permission_profile: str = "safe-edit"
-    #: Credentials to inject only into the child environment (spec §7), e.g. {"CODEX_API_KEY": ...}.
-    credential_env: dict[str, str] = field(default_factory=dict)
+    #: Credentials and endpoint configuration injected only into the child environment (spec §7).
+    #: Built by ``cli_auth.build_child_environment`` from the variables the target CLI documents;
+    #: never a pass-through of the parent environment, so a Claude run does not receive
+    #: ``OPENAI_API_KEY`` merely because the user has one exported.
+    credential_env: dict[str, str] = field(default_factory=dict, repr=False)
     session_id: str | None = None
     #: OpenAgent's private run directory. A CLI that must write a scratch file (Codex's
     #: ``--output-last-message``) puts it **here**, never in the workspace, so it can never show up
@@ -54,8 +57,25 @@ class CliRunRequest:
 
 @dataclass
 class AuthStatus:
+    """The preflight-facing summary of a CLI's authentication state.
+
+    ``authenticated`` stays a plain bool for callers that only need a yes/no, but it is derived
+    from :class:`~.cli_auth.CliAuthEvidence`, which distinguishes "definitely not authenticated"
+    from "could not determine". Only the former blocks a run — see ``blocking``.
+    """
+
     authenticated: bool
     detail: str = ""
+    #: ``False`` only when a credential is known to be absent. An indeterminate probe (no status
+    #: surface, a timeout, unparseable output) must not stop a run: the CLI's own error message is
+    #: more useful than OpenAgent's guess about why it might fail.
+    blocking: bool = False
+    #: Names of the credential variables found in the environment. Names only, never values.
+    environment_names: list[str] = field(default_factory=list)
+    #: Where the credential came from, as ``CliCredentialSource.value``.
+    source: str = "none"
+    #: Credentials that disagree with one another, phrased for the user.
+    conflicts: list[str] = field(default_factory=list)
 
 
 @dataclass

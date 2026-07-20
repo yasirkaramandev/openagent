@@ -41,6 +41,7 @@ from ..credentials.redaction import acquire_scoped_secret, release_secret_scope
 from ..reporting.artifacts import ArtifactWriter, RunArtifacts, TestSummary
 from ..runtimes.api_agent.loop import run_api_agent
 from ..runtimes.cli.base import CliAdapter, CliRunRequest
+from ..runtimes.cli.cli_auth import ChildEnvironmentPlan, build_child_environment
 from ..runtimes.cli.registry import build_cli_adapter
 from ..security.approvals import ApprovalCallback, ApprovalGate
 from ..security.execution_backend import (
@@ -937,16 +938,40 @@ class RunService:
                 )
             )
 
+    def _cli_credential_plan(self, cli_type: str, run_id: str) -> ChildEnvironmentPlan:
+        """Resolve the credentials a CLI child needs and register them for redaction.
+
+        ``CliRunRequest.credential_env`` existed since 0.1.x and every adapter forwarded it to
+        ``minimal_environment()``, but nothing ever filled it in — CLI children were started with
+        no credentials whatsoever. Runs only worked because the CLI re-read its own login file, so
+        an ``ANTHROPIC_API_KEY``-based setup silently had no way to succeed.
+
+        Resolution happens per turn rather than being stored on the run: a rotated key must take
+        effect on resume, and a run record that carried the value would be a secret at rest.
+
+        The values are registered under the run's redaction scope *before* the child starts, so
+        anything the CLI echoes back — an error message quoting the key, a debug line — is redacted
+        on the way into the event log. The scope is released in the caller's ``finally``.
+        """
+
+        plan = build_child_environment(cli_type)
+        for secret in plan.secret_values():
+            acquire_scoped_secret(run_id, secret)
+        return plan
+
     async def _run_cli(
         self, run, agent: AgentProfile, root: Path, sink, state, run_dir: Path
     ) -> None:
-        adapter = build_cli_adapter(agent.runtime.cli or "")
+        cli_type = agent.runtime.cli or ""
+        adapter = build_cli_adapter(cli_type)
         self._cli_adapters[run.id] = adapter
+        plan = self._cli_credential_plan(cli_type, run.id)
         request = CliRunRequest(
             run_id=run.id,
             prompt=run.prompt,
             workspace=root,
             permission_profile=run.permission_profile,
+            credential_env=plan.as_child_env(),
             # Scratch files a CLI needs (Codex's --output-last-message) belong to OpenAgent, not to
             # the user's project — keep them out of the workspace and out of the diff (item 6).
             artifacts_dir=run_dir,
@@ -958,6 +983,7 @@ class RunService:
                 sink(event)
         finally:
             self._cli_adapters.pop(run.id, None)
+            release_secret_scope(run.id)
 
     # ------------------------------------------------------------------ resume / cancel
 
@@ -1105,14 +1131,20 @@ class RunService:
         turn_state: dict[str, Any] = {"terminal": None}
         cancel = self.cancellations.create(run.id)
         cancel.bind()
-        adapter = build_cli_adapter(agent.runtime.cli or "")
+        cli_type = agent.runtime.cli or ""
+        adapter = build_cli_adapter(cli_type)
         self._cli_adapters[run.id] = adapter
         workspace_root = Path(run.worktree or run.workspace)
+        # Resolved fresh for this turn, never read back from the run record. A run stores the
+        # *reference* (which CLI, which variables) and never the value, so a key rotated between
+        # turns takes effect here and a stale secret cannot be resurrected from persisted state.
+        plan = self._cli_credential_plan(cli_type, run.id)
         request = CliRunRequest(
             run_id=run.id,
             prompt=prompt,
             workspace=workspace_root,
             permission_profile=run.permission_profile,
+            credential_env=plan.as_child_env(),
             session_id=session_id,
             artifacts_dir=run_dir,
             model=agent.runtime.model or None,
@@ -1196,6 +1228,10 @@ class RunService:
             self._cli_adapters.pop(run.id, None)
             self.cancellations.discard(run.id)
             self._cancelled.discard(run.id)
+            # The turn's credentials leave the redaction registry with the turn. Holding them for
+            # the life of the process would keep secrets resident long after the child that needed
+            # them exited, and would redact the next turn's output against a stale key.
+            release_secret_scope(run.id)
 
     def _finalize_resume(
         self,

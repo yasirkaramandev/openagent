@@ -267,18 +267,27 @@ class PreflightService:
 
         try:
             auth = await adapter.inspect_auth()
+            # Only a *known* absence of credentials blocks. A probe that could not reach an answer
+            # reports as a non-mandatory warning and the run proceeds: the CLI's own error is a
+            # better diagnosis than OpenAgent's guess, and treating "unknown" as "unauthenticated"
+            # is what blocked correctly-configured users before v0.1.5.
             report.add(
                 "Authentication detected",
-                bool(auth.authenticated),
+                auth.authenticated or not auth.blocking,
                 auth.detail,
                 error_type="authentication_failed",
+                mandatory=auth.blocking,
             )
+            for conflict in auth.conflicts:
+                report.add("Credential precedence", True, conflict, mandatory=False)
         except Exception as exc:  # noqa: BLE001 - auth probing is best-effort
+            # A probe that crashes is an OpenAgent problem, not evidence about the user's
+            # credentials, so it must not block the run either.
             report.add(
                 "Authentication detected",
                 False,
                 f"could not check auth: {exc}",
-                error_type="authentication_failed",
+                mandatory=False,
             )
 
         if cli_type == "codex":
