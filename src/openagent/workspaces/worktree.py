@@ -18,13 +18,30 @@ import difflib
 import json
 import os
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..core.limits import RUNTIME_LIMITS
 from ..security.atomic import atomic_write_text
 from ..security.filesystem import SafeWorkspaceWalker, UnsafeWorkspacePath, safe_rmtree
+from ..security.git_runner import GIT, GitError, GitMissing, GitTimeout
+
+# Re-exported so existing importers keep working. The classes are *defined* in security/git_runner
+# now, because that is where git subprocesses are executed — a caller catching GitError from either
+# module is catching the same class, not two that happen to share a name.
+__all__ = [
+    "AUTO",
+    "COPY",
+    "NONE",
+    "STRATEGIES",
+    "GitError",
+    "GitMissing",
+    "GitTimeout",
+    "Workspace",
+    "WorktreeManager",
+    "git_available",
+    "is_git_repo",
+]
 
 _IGNORE_DIRS = {
     ".git",
@@ -46,57 +63,26 @@ COPY = "copy"
 STRATEGIES = (AUTO, NONE, COPY)
 
 
-class GitError(RuntimeError):
-    pass
-
-
-class GitMissing(GitError):
-    """git is not installed / not on PATH (spec §10)."""
-
-
-class GitTimeout(GitError):
-    """A git subprocess exceeded its budget and its process tree was terminated (spec §10)."""
-
-
 #: Every git call is bounded (spec §10). git can block indefinitely — an index.lock held by another
-#: process, a credential/pager prompt, a network remote — and an unbounded subprocess.run() would
-#: hang the whole run with no diagnosis.
+#: process, a credential/pager prompt, a network remote — and an unbounded call would hang the whole
+#: run with no diagnosis.
 GIT_TIMEOUT = 60
 
 
 def _git(args: list[str], cwd: Path, *, timeout: int = GIT_TIMEOUT) -> str:
-    """Run a git command, bounded, with the environment pinned to non-interactive.
+    """Run a git command through the hardened runner and return its stdout.
 
-    ``GIT_TERMINAL_PROMPT=0`` / ``GIT_OPTIONAL_LOCKS=0`` stop git from blocking on a credential
-    prompt or taking the index lock for read-only queries. On timeout the whole process tree is
-    terminated — killing only the direct child can leave a git helper behind holding the lock.
+    Every property this function used to implement inline now comes from
+    :mod:`openagent.security.git_runner`: a bounded timeout with **process-tree** termination (the
+    old ``subprocess.run`` killed only the direct child, leaving helpers holding ``index.lock``
+    despite the docstring claiming otherwise), no inherited parent environment, and no
+    repository-supplied hook, pager, credential helper or diff driver.
+
+    The old implementation passed ``{**os.environ, ...}``, which handed every provider API key in
+    the parent process to a child that a checked-out ``.git/hooks/pre-commit`` could take over.
     """
 
-    env = {
-        **os.environ,
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_OPTIONAL_LOCKS": "0",
-        "GIT_PAGER": "cat",
-    }
-    try:
-        result = subprocess.run(  # noqa: S603 - fixed argv, never a shell
-            ["git", *args],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-            env=env,
-        )
-    except FileNotFoundError as exc:
-        # git is not installed. Callers decide what to do; is_git_repo() treats it as "not a repo"
-        # so `auto` degrades to a copy workspace instead of crashing the run (spec §10).
-        raise GitMissing("git is not installed or not on PATH") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GitTimeout(f"git {' '.join(args)} timed out after {timeout}s") from exc
-    if result.returncode != 0:
-        raise GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
-    return result.stdout
+    return GIT.inspect(args, cwd, timeout=timeout).stdout
 
 
 def git_available() -> bool:
@@ -154,19 +140,14 @@ def _untracked_diff(root: Path, rel: str) -> str:
         return ""
     try:
         # --no-index exits 1 when the files differ, which is the normal case here, so the non-zero
-        # return is expected rather than an error.
-        result = subprocess.run(  # noqa: S603 - fixed argv, never a shell
-            ["git", "diff", "--no-index", "--", os.devnull, rel],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=GIT_TIMEOUT,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"},
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # return is expected rather than an error. This path went through a second, separately
+        # written subprocess.run that also inherited os.environ — the isolation fix has to cover
+        # both call sites or it covers neither.
+        return GIT.diff(["--no-index", "--", os.devnull, rel], root, check=False)
+    except GitError:
+        # Includes GitMissing and GitTimeout. An untracked file we cannot diff contributes nothing
+        # to the report; it is never a reason to fail the run.
         return ""
-    return result.stdout
 
 
 def is_git_repo(path: Path) -> bool:
@@ -278,7 +259,9 @@ class WorktreeManager:
         base_commit = _git(["rev-parse", "HEAD"], self.project_root).strip()
         branch = f"openagent/{run_id}"
         target = self.worktrees_dir / run_id
-        _git(["worktree", "add", "-b", branch, str(target), base_commit], self.project_root)
+        GIT.mutate_worktree(
+            ["worktree", "add", "-b", branch, str(target), base_commit], self.project_root
+        )
         workspace = Workspace(
             run_id=run_id,
             root=target,
@@ -373,7 +356,10 @@ class WorktreeManager:
 
         if not self._uses_git_diff(ws):
             return self._text_diff(ws)
-        parts = [_git(["diff"], ws.root)]
+        # GIT.diff, not _git(["diff"]): it adds --no-ext-diff/--no-textconv. A textconv filter is
+        # bound through the repository's own .gitattributes, so clearing `diff.external` in config
+        # does not reach it — the flags are the only thing that does.
+        parts = [GIT.diff([], ws.root)]
         for rel in _untracked_files(ws.root):
             parts.append(_untracked_diff(ws.root, rel))
         return "".join(p for p in parts if p)
@@ -456,13 +442,13 @@ class WorktreeManager:
             marker.unlink(missing_ok=True)
             return
         try:
-            _git(["worktree", "remove", "--force", str(ws.root)], self.project_root)
+            GIT.mutate_worktree(["worktree", "remove", "--force", str(ws.root)], self.project_root)
         except GitError:
             if ws.root.exists():
                 safe_rmtree(ws.root, owner_root=self.worktrees_dir)
         if ws.branch:
             try:
-                _git(["branch", "-D", ws.branch], self.project_root)
+                GIT.mutate_worktree(["branch", "-D", ws.branch], self.project_root)
             except GitError:
                 pass
         marker.unlink(missing_ok=True)
@@ -473,11 +459,13 @@ class WorktreeManager:
         if not ws.is_git or ws.is_copy or ws.in_place:
             return None
         self._verify_ownership(ws)
-        _git(["add", "-A"], ws.root)
+        GIT.mutate_worktree(["add", "-A"], ws.root)
         status = _git(["status", "--porcelain"], ws.root)
         if not status.strip():
             return None
-        _git(["commit", "-m", message], ws.root)
+        # Pinned identity, no signing, no hooks. Previously a plain `git commit`, which ran the
+        # repository's commit-lifecycle hooks with the parent environment attached.
+        GIT.commit_agent_changes(message, ws.root)
         return _git(["rev-parse", "HEAD"], ws.root).strip()
 
     def revert_commit(self, ws: Workspace, commit_sha: str) -> str:
@@ -487,7 +475,7 @@ class WorktreeManager:
         actual = _git(["rev-parse", commit_sha], ws.root).strip()
         if actual != commit_sha:
             raise GitError("recorded agent commit does not resolve exactly")
-        _git(["revert", "--no-edit", commit_sha], ws.root)
+        GIT.mutate_worktree(["revert", "--no-edit", commit_sha], ws.root)
         return _git(["rev-parse", "HEAD"], ws.root).strip()
 
 

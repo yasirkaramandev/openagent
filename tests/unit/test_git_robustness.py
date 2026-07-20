@@ -154,47 +154,80 @@ def test_auto_strategy_falls_back_to_a_copy_without_git(
 
 
 def test_git_missing_is_a_typed_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from openagent.workspaces import worktree
+    """A machine without git raises GitMissing, not a bare FileNotFoundError.
+
+    Patched at ``git_runner.run_capture`` rather than at ``subprocess.run``: git execution moved
+    into ``security/git_runner`` in v0.1.5 so that hooks and the parent environment could be
+    stripped in one place. The invariant under test is unchanged — only where the boundary sits.
+    """
+
+    from openagent.security import git_runner
 
     def no_git(*_a, **_k):
         raise FileNotFoundError(2, "No such file or directory: 'git'")
 
-    monkeypatch.setattr(subprocess, "run", no_git)
+    monkeypatch.setattr(git_runner, "run_capture", no_git)
     with pytest.raises(GitMissing):
-        worktree._git(["status"], tmp_path)
+        git_runner.GIT.inspect(["status"], tmp_path)
 
 
 # --------------------------------------------------------------------------- §10 timeouts
 
 
 def test_git_timeout_is_typed_and_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from openagent.workspaces import worktree
+    from openagent.security import git_runner
 
     def hang(*_a, **kwargs):
         assert kwargs.get("timeout"), "git was invoked with no timeout — it can hang forever"
         raise subprocess.TimeoutExpired(cmd="git", timeout=kwargs["timeout"])
 
-    monkeypatch.setattr(subprocess, "run", hang)
+    monkeypatch.setattr(git_runner, "run_capture", hang)
     with pytest.raises(GitTimeout):
-        worktree._git(["status"], tmp_path)
+        git_runner.GIT.inspect(["status"], tmp_path)
 
 
 def test_every_git_call_passes_a_timeout(repo: Path, monkeypatch: pytest.MonkeyPatch):
-    from openagent.workspaces import worktree
+    """No git invocation reaches the OS without a timeout, on either the read or the diff path."""
+
+    from openagent.security import git_runner
 
     seen: list[object] = []
-    real_run = subprocess.run
+    real_capture = git_runner.run_capture
 
-    def record(args, *a, **kwargs):
-        if args and args[0] == "git":
+    def record(argv, *a, **kwargs):
+        if argv and argv[0] == "git":
             seen.append(kwargs.get("timeout"))
-        return real_run(args, *a, **kwargs)
+        return real_capture(argv, *a, **kwargs)
 
-    monkeypatch.setattr(worktree.subprocess, "run", record)
+    monkeypatch.setattr(git_runner, "run_capture", record)
     _manager(repo).changed_files(_in_place(repo))
     _manager(repo).diff(_in_place(repo))
     assert seen, "no git calls were observed"
     assert all(t for t in seen), f"a git call had no timeout: {seen}"
+
+
+def test_no_git_call_bypasses_the_hardened_runner(repo: Path, monkeypatch: pytest.MonkeyPatch):
+    """Every git process the workspace layer starts goes through the isolating runner.
+
+    A second, separately written ``subprocess.run(["git", ...])`` is exactly how the untracked-file
+    diff path kept inheriting ``os.environ`` after the main path had been fixed. This fails if any
+    such call is reintroduced anywhere in the workspace layer.
+    """
+
+    escaped: list[list[str]] = []
+    real_run = subprocess.run
+
+    def record(args, *a, **kwargs):
+        if isinstance(args, (list, tuple)) and args and args[0] == "git":
+            escaped.append(list(args))
+        return real_run(args, *a, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    (repo / "untracked.txt").write_text("new\n", encoding="utf-8")
+    _manager(repo).changed_files(_in_place(repo))
+    _manager(repo).diff(_in_place(repo))
+
+    assert escaped == [], f"git was invoked outside GitRunner: {escaped}"
 
 
 # --------------------------------------------------------------------------- §10 filename parsing
