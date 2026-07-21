@@ -11,6 +11,21 @@ from openagent.tui.app import LiveRun, OpenAgentTUI
 from openagent.tui.screens.run_console import RunConsoleScreen
 
 
+async def _settle(pilot, predicate, *, timeout: float = 3.0) -> None:
+    """Pump the Textual event loop until ``predicate`` holds or ``timeout`` elapses.
+
+    Layout/scroll changes settle over an unspecified number of refresh cycles, so a fixed pause is
+    a race. This waits for the actual condition instead — the assertion after it still verifies the
+    invariant, so a genuine regression fails rather than being masked.
+    """
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await pilot.pause(0.05)
+
+
 def _event(run_id: str, index: int) -> NormalizedEvent:
     return NormalizedEvent(
         run_id=run_id,
@@ -88,5 +103,7 @@ async def test_run_console_follows_only_while_user_is_at_end(tmp_path: Path) -> 
 
         screen.follow_output = True
         live.publish(_event(run.id, 82))
-        await pilot.pause(0.3)
+        # The follow-scroll settles over a Textual refresh cycle whose duration is not fixed — a
+        # bounded `pause(0.3)` flaked on slower CI runners (py3.11). Poll until the layout settles.
+        await _settle(pilot, lambda: timeline.scroll_y == timeline.max_scroll_y)
         assert timeline.scroll_y == timeline.max_scroll_y
