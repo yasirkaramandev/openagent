@@ -31,7 +31,7 @@ def test_full_prerelease_chain_orders_correctly() -> None:
     parsed = [parse_version(v) for v in chain]
     assert parsed == sorted(parsed), "dev < a < b < rc < final must hold"
     # And each adjacent pair strictly increases.
-    for older, newer in zip(chain, chain[1:]):
+    for older, newer in zip(chain, chain[1:], strict=False):
         assert is_newer(newer, older) is True
         assert is_newer(older, newer) is False
 

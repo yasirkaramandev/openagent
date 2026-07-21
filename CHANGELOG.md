@@ -4,6 +4,64 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6rc2] — unreleased
+
+Second release candidate. Closes release blockers found by independent audit and real GitHub Actions
+runs against `0.1.6rc1`. Every change ships with a regression test that fails against the unpatched
+code; the reproduction is recorded in each commit message. This is a release candidate, not a final
+release — the RC soak, remote governance application, and the remaining service-concurrency items
+(see *Known gaps* below) are still outstanding.
+
+### Updater
+
+- **A stale binary is repaired even when the source checkout is already current.** `openagent
+  update` decided a source-checkout install was up to date purely from
+  `local_revision != remote_revision`. A non-editable install is a *copy*: the checkout can be level
+  with `origin/main` while the binary on `PATH` is an old snapshot, so the installer never ran and
+  `openagent version` kept reporting the old number. The decision now rests on two independent axes —
+  a revision update *and* installation drift (active binary version vs. the checkout's declared
+  version) — and reinstalls on either. An unreadable active version is treated as drift, not silently
+  current; a checkout that cannot state its own version fails closed. Adds `openagent update
+  --repair`/`--force-reinstall` to force a reinstall from the proven source when versions already
+  match.
+- **Version comparison is unified behind one authority.** The self-updater still re-derived version
+  parsing with a regex and an integer tuple, so `0.1.6rc1` parsed to `0.1.6` and a release candidate
+  compared equal to its release — the same class of bug already fixed in the CLI updater. All version
+  decisions (self-update, CLI minimum-version policy, `version_verified`, update verification) now
+  route through `openagent.core.versioning`, built on PEP 440 (`packaging`). Anything unparseable is
+  reported as unknown and never silently treated as equal, newer, or at-least. A CLI minimum-version
+  policy that cannot be evaluated now fails closed instead of silently passing.
+
+### Fixed
+
+- **A fast backend process is no longer mistaken for a failed launch.** `ManagedProcess.start()`
+  sampled the child's identity synchronously, yielded the loop once, and — if the return code had not
+  been published yet — terminated the (already finished) child and raised, so a valid, fast command
+  that exited during the startup window was reported as a startup failure. Startup now runs a bounded
+  async handshake that races the child's exit against identity sampling (off the event loop, so it no
+  longer stalls other runs): a child that completes first is a success with no identity to capture; a
+  child still alive at the deadline with no readable identity is terminated fail-closed with a typed
+  `ProcessIdentityCaptureError`; a cancel arriving mid-capture waits for the capture to settle rather
+  than refusing to kill a process it owns.
+
+### Data integrity
+
+- **Provider and agent creation is insert-only and database-authoritative.** Both creations wrote
+  through `upsert`, which silently overwrote a colliding row, so two processes that each passed the
+  service-level `get(name) is None` pre-check could both "create" the same name and the second
+  clobbered the first. Both now go through the repositories' insert-only `create`, whose uniqueness
+  (including the case- and Unicode-folded form) is decided by the database. A duplicate surfaces as a
+  typed validation error, and the provider transaction's compensation removes only its own
+  revision-scoped secret, never a pre-existing row or another transaction's secret.
+
+### Known gaps
+
+- Compare-and-swap on agent *update*/*remove*, the committed-agent document-projection semantics
+  (DB as source of truth on a projection conflict), the OPENAGENT.md snapshot-under-lock change, the
+  provider-ownership / API-binding migration `0013`, the Claude auth-fallback and OAuth-header
+  hardening, the Git content-filter neutralization, and the Codex discovery cache/stderr work are
+  **not** in this candidate. They remain tracked release work.
+
 ## [0.1.6rc1] — unreleased
 
 Release candidate covering the v0.1.5 (authentication, Git, updater) and v0.1.6 (provider/agent
