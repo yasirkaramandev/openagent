@@ -139,6 +139,10 @@ class ManagedProcess:
         #: capture, ``wait``, and startup termination, so no two call sites race their own
         #: ``proc.wait()`` — and so a startup that fails never leaves an unobserved pending task.
         self._wait_task: asyncio.Task[int] | None = None
+        #: The in-flight startup identity capture. It runs asynchronously (yielding the loop), so
+        #: ``pid`` can become observable to another task before ``identity`` is set. ``cancel`` awaits
+        #: this so it never sees a half-started process as unkillable (§5).
+        self._startup_task: asyncio.Task[ProcessIdentity | None] | None = None
 
     @property
     def pid(self) -> int | None:
@@ -173,7 +177,10 @@ class ManagedProcess:
         # One wait task for the whole lifecycle. Identity capture races the child's exit against it,
         # rather than guessing from a single ``sleep(0)`` whether the return code has been published.
         self._wait_task = asyncio.create_task(self._proc.wait())
-        self._identity = await self._capture_startup_identity()
+        # Capture runs as an awaited task, not inline, so ``cancel`` (from another task) can wait for
+        # the same completion instead of racing a window where ``pid`` is set but ``identity`` is not.
+        self._startup_task = asyncio.ensure_future(self._capture_startup_identity())
+        self._identity = await self._startup_task
 
     async def _capture_startup_identity(self) -> ProcessIdentity | None:
         """Pin a stable identity, or return ``None`` for a child that has already completed (§5).
@@ -397,6 +404,12 @@ class ManagedProcess:
     async def cancel(self, grace: float = 3.0) -> TerminationResult:
         """Terminate the process and every descendant, returning verified evidence."""
 
+        # Startup identity capture yields the loop, so a cancel arriving mid-startup could otherwise
+        # see ``identity`` still ``None`` and refuse to kill a process it actually owns. Wait for the
+        # capture to settle first (bounded by the startup timeout), then decide (§5).
+        if self._startup_task is not None and not self._startup_task.done():
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._startup_task)
         if self._proc is None or self._proc.returncode is not None:
             return TerminationResult(TerminationOutcome.ALREADY_GONE)
         if self._identity is None:

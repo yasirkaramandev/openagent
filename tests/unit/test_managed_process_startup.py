@@ -194,6 +194,41 @@ async def test_completed_process_is_not_mistaken_for_reused_pid(tmp_path, monkey
     assert await proc.wait() == 0
 
 
+async def test_cancel_during_identity_capture_still_terminates(tmp_path, monkeypatch) -> None:
+    """A cancel that arrives while identity is still being captured must still kill the process.
+
+    Regression: async capture yields the loop, so ``pid`` becomes observable before ``identity`` is
+    set. A cancel racing that window used to see ``identity is None`` and refuse to terminate, so the
+    process ran to completion and the run finalized FAILED instead of CANCELLED.
+    """
+
+    real = process_module._capture_process_identity_once
+
+    def slow(pid: int) -> ProcessIdentity | None:
+        time.sleep(0.05)  # widen the pid-live-but-identity-unset window
+        return real(pid)
+
+    monkeypatch.setattr(process_module, "_capture_process_identity_once", slow)
+
+    proc = _mp(tmp_path, "import time; print('up', flush=True); time.sleep(120)")
+    start_task = asyncio.create_task(proc.start())
+    # Mirror how a canceller finds the process: it becomes visible by pid before identity is set.
+    while not (proc.pid and is_pid_alive(proc.pid)):
+        await asyncio.sleep(0.002)
+    identity_was_unset = proc.identity is None
+
+    result = await proc.cancel()
+    await start_task
+
+    assert identity_was_unset, "test did not exercise the mid-capture window"
+    assert result.verified_terminated
+    deadline = time.monotonic() + 5.0
+    pid = proc.pid
+    while time.monotonic() < deadline and is_pid_alive(pid):
+        await asyncio.sleep(0.02)
+    assert not is_pid_alive(pid)
+
+
 @pytest.mark.slow
 async def test_many_fast_processes_start_without_false_identity_failure(tmp_path) -> None:
     """Stress the exact race: many short-lived children, no spurious startup failure, output kept."""
