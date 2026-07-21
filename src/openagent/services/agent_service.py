@@ -15,6 +15,7 @@ from ..core.models import (
 )
 from ..core.permissions import get_profile
 from ..reporting.openagent_md import write_openagent_md
+from ..storage.repositories import DuplicateNameError
 
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
@@ -121,13 +122,22 @@ class AgentService:
         operation = self.app.journal.begin(
             "agent_document_sync", {"path": str(self.app.paths.openagent_md())}
         )
-        self.repos.agents.upsert(agent)
+        try:
+            # Insert-only: the database decides uniqueness, closing the check-then-act window that
+            # let two processes both pass the ``get`` above and both create the name (spec §8). The
+            # service pre-check stays only to produce a friendlier message on the common path.
+            self.repos.agents.create(agent)
+        except DuplicateNameError as exc:
+            operation.complete()
+            raise AgentError(f"agent {name!r} already exists") from exc
         operation.advance("db_written")
         try:
             self.sync_openagent_md()
         except Exception:
-            # Keep the agent row and OPENAGENT.md consistent: if the doc write fails, don't leave a
-            # persisted agent the file doesn't mention (item 3).
+            # The row was just created by this operation, so deleting it here rolls back only our own
+            # write. (The committed-agent projection semantics for update/remove — where the DB is
+            # source of truth and a projection conflict is deferred, not rolled back — are tracked
+            # separately; this create path owns the row it removes.)
             self.repos.agents.delete(name)
             operation.complete()
             raise

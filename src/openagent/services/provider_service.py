@@ -32,7 +32,7 @@ from ..providers.discovery import (
     probe_agent_model,
 )
 from ..providers.factory import build_adapter, get_preset, resolve_base_url
-from ..storage.repositories import ProviderInUseByAgentError
+from ..storage.repositories import DuplicateNameError, ProviderInUseByAgentError
 
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
@@ -125,7 +125,20 @@ class ProviderTransaction:
             self._credentials.set_secret(credential, self._api_key)
             self._operation.advance("secret_written")
         try:
-            self._repos.providers.upsert(self.provider)
+            # Insert-only, so uniqueness is the database's decision, not a preceding SELECT that
+            # another process can race between (spec §7). ``upsert`` silently overwrote a colliding
+            # provider — including one a concurrent process had just written.
+            self._repos.providers.create(self.provider)
+        except DuplicateNameError as exc:
+            # Compensate only this operation's own writes: the new revision-scoped secret is removed
+            # by ``_restore`` (its previous value is None because the account is fresh), and the
+            # pre-existing provider row and any other transaction's secret are left untouched.
+            self._restore()
+            self._forget()
+            self._operation.complete()
+            raise ProviderValidationError(
+                f"provider {self.provider.name!r} already exists", field="name"
+            ) from exc
         except Exception:
             self._restore()
             self._forget()

@@ -67,6 +67,60 @@ def test_duplicate_agent_name_leaves_no_provider(tmp_path: Path) -> None:
     assert oa.providers.get("ds") is None
 
 
+def test_provider_create_is_db_authoritative_not_the_service_precheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The uniqueness decision is the database's, not the service's check-then-act (spec §7).
+
+    Simulate the race window by forcing the service pre-check to see no provider (as a second
+    process would, having read before the first committed). The insert-only ``create`` must still
+    reject the duplicate at the database, surface it as a validation error, and leave the existing
+    provider row and its secret untouched.
+    """
+
+    from openagent.services.provider_service import ProviderValidationError
+
+    oa = _app(tmp_path)
+    oa.providers.add(
+        name="acme", provider_type="custom", base_url="https://api.test/v1", api_key="first-key"
+    )
+    winner = oa.providers.get("acme")
+    assert winner is not None
+
+    # The pre-check now lies (returns None), exactly as it would in a lost check-then-act race.
+    monkeypatch.setattr(oa.providers, "get", lambda _name: None)
+    with pytest.raises(ProviderValidationError):
+        oa.providers.add(
+            name="acme",
+            provider_type="custom",
+            base_url="https://api.test/v1",
+            api_key="second-key",
+        )
+
+    monkeypatch.undo()
+    # The first writer is untouched: one row, and its original secret survives.
+    still = oa.providers.get("acme")
+    assert still is not None
+    assert still.credential_revision == winner.credential_revision
+    assert oa.credentials.resolve(winner.credential) == "first-key"
+
+
+def test_agent_create_is_db_authoritative_not_the_service_precheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same insert-only guarantee for agents (spec §8): the DB rejects the duplicate name."""
+
+    oa = _app(tmp_path)
+    oa.agents.create(name="bot", runtime_type=RuntimeType.CLI, cli="codex")
+
+    monkeypatch.setattr(oa.repos.agents, "get", lambda _name: None)
+    with pytest.raises(AgentError):
+        oa.agents.create(name="bot", runtime_type=RuntimeType.CLI, cli="codex")
+
+    monkeypatch.undo()
+    assert len([a for a in oa.agents.list() if a.name == "bot"]) == 1
+
+
 def test_agent_validation_failure_leaves_no_provider(tmp_path: Path) -> None:
     oa = _app(tmp_path)
     with pytest.raises(AgentError):
@@ -137,7 +191,7 @@ def test_provider_repository_failure_persists_no_agent(
     def boom(*_a: object, **_k: object) -> None:
         raise RuntimeError("db is locked")
 
-    monkeypatch.setattr(oa.repos.providers, "upsert", boom)
+    monkeypatch.setattr(oa.repos.providers, "create", boom)
     with pytest.raises(RuntimeError):
         oa.agents.create_with_new_provider(
             provider_name="ds",
@@ -179,7 +233,7 @@ def test_failed_provider_write_restores_the_previous_secret_exactly(
     def boom(_provider):
         raise RuntimeError("db is down")
 
-    monkeypatch.setattr(oa.repos.providers, "upsert", boom)
+    monkeypatch.setattr(oa.repos.providers, "create", boom)
 
     with pytest.raises(RuntimeError, match="db is down"):
         oa.providers.add(
@@ -201,7 +255,7 @@ def test_failed_provider_write_removes_a_secret_that_did_not_exist(
     assert oa.credentials.resolve(ref) is None
 
     monkeypatch.setattr(
-        oa.repos.providers, "upsert", lambda _p: (_ for _ in ()).throw(RuntimeError("db is down"))
+        oa.repos.providers, "create", lambda _p: (_ for _ in ()).throw(RuntimeError("db is down"))
     )
 
     with pytest.raises(RuntimeError):
@@ -226,7 +280,7 @@ def test_agent_transaction_rollback_restores_the_previous_secret(
 
     monkeypatch.setattr(
         oa.repos.agents,
-        "upsert",
+        "create",
         lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")),
     )
 
@@ -295,7 +349,7 @@ def test_new_key_with_no_previous_value_is_deleted_on_rollback(
     assert oa.credentials.resolve(ref) is None
     monkeypatch.setattr(
         oa.repos.agents,
-        "upsert",
+        "create",
         lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")),
     )
     with pytest.raises(RuntimeError):
@@ -324,7 +378,7 @@ def test_stale_rollback_cannot_affect_a_later_provider(
     # 2) A later, unrelated provider whose agent creation fails and rolls the provider back.
     monkeypatch.setattr(
         oa.repos.agents,
-        "upsert",
+        "create",
         lambda _a: (_ for _ in ()).throw(RuntimeError("agent write failed")),
     )
     with pytest.raises(RuntimeError):

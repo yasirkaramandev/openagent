@@ -181,7 +181,7 @@ def test_add_rolls_back_keychain_secret_when_row_write_fails(
     def _boom(_provider: object) -> None:  # 2. provider row write raises
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(oa.repos.providers, "upsert", _boom)
+    monkeypatch.setattr(oa.repos.providers, "create", _boom)
 
     with pytest.raises(RuntimeError, match="simulated DB failure"):
         oa.providers.add(
@@ -210,7 +210,7 @@ def test_add_rollback_does_not_delete_a_preexisting_secret(
     oa.credentials.set_secret(ref, "old-secret")
 
     monkeypatch.setattr(
-        oa.repos.providers, "upsert", lambda _p: (_ for _ in ()).throw(RuntimeError("db down"))
+        oa.repos.providers, "create", lambda _p: (_ for _ in ()).throw(RuntimeError("db down"))
     )
     with pytest.raises(RuntimeError):
         oa.providers.add(
