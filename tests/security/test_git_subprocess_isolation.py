@@ -428,10 +428,16 @@ def test_content_filter_smudge_does_not_run_on_checkout(repo: Path) -> None:
     marker = repo / "filter-ran.txt"
     (repo / "tracked.txt").write_text("v1\n", encoding="utf-8")
     # Commit the file *before* the filter exists, so the checkout below is the only filter trigger.
+    # A committer identity is set explicitly (matching _init_repo): the config is pinned at /dev/null,
+    # and a CI runner has no ambient user.name/user.email, so git commit would otherwise exit 128.
     user_env = {
         **os.environ,
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
     }
     subprocess.run(["git", "add", "tracked.txt"], cwd=repo, env=user_env, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "add tracked"], cwd=repo, env=user_env, check=True)
