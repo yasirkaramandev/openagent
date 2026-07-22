@@ -113,7 +113,9 @@ def test_operational_error_detail_is_redacted(monkeypatch, capsys) -> None:
 
 
 def test_redact_secrets_scrubs_common_key_shapes() -> None:
-    scrubbed = redact_secrets("key sk-ant-abc123def456 and nvapi-zzz999yyy888 and Bearer tok12345678")
+    scrubbed = redact_secrets(
+        "key sk-ant-abc123def456 and nvapi-zzz999yyy888 and Bearer tok12345678"
+    )
     assert "sk-ant-abc123def456" not in scrubbed
     assert "nvapi-zzz999yyy888" not in scrubbed
     assert "tok12345678" not in scrubbed
