@@ -6,7 +6,22 @@ pipeline can decide retry/no-retry uniformly.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
+
+#: Key-shaped tokens redacted before an error message reaches a terminal, log or test (spec §17.4).
+#: Conservative on purpose: it targets the well-known credential prefixes rather than trying to
+#: recognise every possible secret, so it never mangles ordinary diagnostic text.
+_SECRET_TOKEN_RE = re.compile(
+    r"(sk-[A-Za-z0-9._\-]{6,}|nvapi-[A-Za-z0-9._\-]{6,}|"
+    r"Bearer\s+[A-Za-z0-9._\-]{6,}|xox[baprs]-[A-Za-z0-9-]{6,})"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Replace key-shaped tokens with ``[redacted]``. Used at every boundary that renders an error."""
+
+    return _SECRET_TOKEN_RE.sub("[redacted]", text)
 
 
 class ErrorType(str, Enum):

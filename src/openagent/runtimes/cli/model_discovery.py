@@ -20,6 +20,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from ... import __version__
+from ...core.errors import redact_secrets
 from ...security.process import (
     capture_process_identity,
     minimal_environment,
@@ -210,16 +211,6 @@ async def _read_json_line(
 #: How much of a chatty app-server's stderr to keep for diagnostics. Small: it is a tail for an
 #: error message, not a log.
 _STDERR_TAIL_LIMIT = 8 * 1024
-#: Redact anything key-shaped before stderr ever reaches an error string. ``minimal_environment``
-#: already keeps OpenAgent's own secrets out of the child, so this guards against a token the child
-#: prints from its *own* configuration.
-_SECRET_TAIL_RE = re.compile(
-    r"(sk-[A-Za-z0-9._\-]{6,}|nvapi-[A-Za-z0-9._\-]{6,}|Bearer\s+[A-Za-z0-9._\-]{6,})"
-)
-
-
-def _redact_secrets(text: str) -> str:
-    return _SECRET_TAIL_RE.sub("[redacted]", text)
 
 
 async def _drain_stderr(
@@ -368,7 +359,7 @@ async def discover_codex_models(
         )
     except Exception as exc:
         detail = str(exc)[:400]
-        tail = _redact_secrets(bytes(stderr_tail).decode("utf-8", "replace")).strip()
+        tail = redact_secrets(bytes(stderr_tail).decode("utf-8", "replace")).strip()
         if tail:
             detail = f"{detail}; app-server stderr (tail): {tail[-200:]}"
         return CliModelDiscoveryResult(
