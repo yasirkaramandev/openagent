@@ -4,6 +4,86 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6rc3] — unreleased
+
+Third release candidate. Closes the release blockers left open in rc2 (see rc2's *Known gaps*), plus
+the reader/writer compatibility work that turns the "stale binary reads a newer database" failure —
+a raw Pydantic `ValidationError` from `ProviderConnection.model_validate` — into a clean, actionable
+error. Every change ships with a regression test that fails against the unpatched code. Still a
+release candidate: the RC soak, remote governance application, and a full Textual recovery screen /
+interactive update-failure prompt (the underlying invariants hold; only the richer UI is deferred)
+remain outstanding.
+
+### Recovery & compatibility
+
+- **A too-new database is refused from metadata alone, before any model loads.** An older binary
+  opening a database a newer OpenAgent wrote died with a raw `ValidationError` deep in
+  `ProviderConnection.model_validate` — a JSON-blob field (`credential_revision`, added in v0.1.4)
+  the old domain model did not know. The integer schema number was identical in both builds, so the
+  schema-version guard never fired. `schema_meta` now records `last_writer_version` and a monotonic
+  `minimum_reader_version`, and `Database.open` gates on it from metadata alone, raising a typed
+  `DatabaseReaderCompatibilityError` with the active binary, its version, the required version and
+  the exact repair command. `version`/`update` never open the DB, so the repair path still runs on
+  the old binary.
+- **An undecodable provider row is quarantined, not fatal.** `ProviderRepository.list`/`get` decode
+  through a boundary that raises a typed, redacted `DataValidationError` naming the record — never a
+  raw traceback that also prints the payload (which can hold a credential ref, header or URL). A new
+  `decode_report()` lets doctor survey the store and report every bad row without dying on the first.
+- **The console entrypoint renders operational errors as clean messages.** `DatabaseReaderCompatibilityError`,
+  `DataValidationError`, blocked migrations and schema-too-new all reach the user as a short,
+  secret-redacted line with a stable exit code — or a structured `doctor --json` check — never a
+  traceback. `OPENAGENT_DEBUG` re-raises for developers.
+
+### Data integrity
+
+- **Migration 0013 makes an API agent's provider binding a hard invariant.** 0012 gave `agents` a
+  real `provider_id` foreign key (no *dangling* binding) but left a *missing* one as NULL — the
+  "agent exists, provider missing" state. 0013 adds a named `CHECK (runtime_type != 'api-agent' OR
+  provider_id IS NOT NULL)`; a legacy row already in the forbidden state blocks the upgrade, named
+  and with the backup retained, never silently nulled or deleted. `_provider_id_for` fails closed
+  with `ProviderNotFoundError` for an API agent whose provider is missing or unset.
+- **Agent update/remove are compare-and-swap with a committed document projection.** They read the
+  profile together with its revision and write through a CAS (`get_with_revision` + `delete_checked`),
+  so a stale writer loses cleanly with `ConcurrentModificationError` instead of clobbering. The DB is
+  the source of truth: a projection conflict is never rolled back, the journal entry stays pending
+  for retry, and doctor reports it.
+- **OPENAGENT.md samples its snapshot inside the document lock.** The committed agent set is read
+  after the cross-process lock is held, so a snapshot taken before the lock cannot be regenerated
+  over a document another process wrote from a newer commit.
+- **Model/CLI upserts use native `INSERT … ON CONFLICT`,** not DELETE-then-INSERT, so the row is
+  never transiently absent and a failure cannot leave it deleted.
+
+### Security
+
+- **Git content filters are neutralized.** A `.gitattributes` binds paths to a named filter whose
+  clean/smudge/process commands git runs on checkout and `git add`. Each filter that could execute is
+  discovered per call and overridden to an identity (`clean=cat`, `smudge=cat`, `process=`,
+  `required=false`) on every invocation.
+- **Claude auth no longer trusts a config file, and OAuth tokens are never sent as `x-api-key`.**
+  `~/.claude.json`/`settings.json` are configuration, not credentials, so their mere presence now
+  reports UNKNOWN (never `true`); only `~/.claude/.credentials.json` counts as a login. Direct
+  Anthropic `/v1/models` discovery uses `x-api-key` with `ANTHROPIC_API_KEY` only — an OAuth/session
+  token is never sent there; a gateway authenticates through a dedicated `GatewayAuthPlan`.
+
+### Reliability
+
+- **Codex discovery has an expiring capability cache and a continuous stderr drain.** A transient
+  probe failure no longer disables `model/list` for the whole process (short TTL, `refresh` bypass),
+  and the app-server's stderr is drained to EOF with a bounded, redacted tail so a chatty server
+  cannot fill the pipe and deadlock the handshake; past a hard limit the runaway process is
+  terminated.
+- **Update-prompt suppressions are cross-process safe and expire by age.** The read-modify-write runs
+  under a file lock and re-reads inside it (no lost entry under concurrent dismissals), records carry
+  `{fingerprint, created_at, expires_at}`, and eviction is by age rather than hash-alphabetical order.
+
+### Known gaps
+
+- The RC soak (real-use burn-in) and remote governance application (branch ruleset, labels,
+  milestones via `gh`) are still outstanding, and gate the final `0.1.6`.
+- A full Textual recovery screen and the interactive "update failed → continue / cancel / doctor"
+  prompt are deferred; the underlying invariants (compat error rendered cleanly at startup, an
+  unverifiable self-update treated as not-ok, a below-minimum version blocking a run) already hold.
+
 ## [0.1.6rc2] — unreleased
 
 Second release candidate. Closes release blockers found by independent audit and real GitHub Actions
