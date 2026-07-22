@@ -221,3 +221,90 @@ def test_unreadable_suppression_file_is_not_fatal(installation, status, tmp_path
     )
 
     assert decision.choice is UpdateChoice.CONTINUE_WITHOUT_UPDATING
+
+
+# --------------------------------------------------------------------------- multi-process safety
+
+
+def test_concurrent_suppression_adds_do_not_lose_entries(tmp_path: Path) -> None:
+    """The read-modify-write is locked and re-reads inside the lock, so parallel dismissals of
+    different prompts all survive rather than the last writer winning (spec §14)."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    suppressions = UpdatePromptSuppressions(tmp_path / "prompts.json")
+    keys = [f"fingerprint-{i}" for i in range(24)]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(suppressions.add, keys))
+
+    assert all(suppressions.contains(key) for key in keys)
+
+
+def test_expired_suppression_is_asked_again(tmp_path: Path) -> None:
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    path = tmp_path / "prompts.json"
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "fingerprint": "old",
+                    "created_at": (past - timedelta(days=1)).isoformat(),
+                    "expires_at": past.isoformat(),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    suppressions = UpdatePromptSuppressions(path)
+
+    assert suppressions.contains("old") is False  # expired -> not suppressed
+
+
+def test_eviction_is_by_age_not_hash_order(tmp_path: Path) -> None:
+    """The oldest entries fall off, not the alphabetically-smallest fingerprints."""
+
+    import json
+    from datetime import datetime, timezone
+
+    from openagent.runtimes.cli.update_policy import _SUPPRESSION_MAX_ENTRIES
+
+    path = tmp_path / "prompts.json"
+    base = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    # Pre-seed a full file whose *oldest* record has a hash-large fingerprint, so age-based and
+    # alphabetical eviction would drop different entries.
+    records = []
+    for i in range(_SUPPRESSION_MAX_ENTRIES):
+        created = base.replace(year=2020 + i // 365, day=1)  # ascending age
+        records.append(
+            {
+                "fingerprint": "zzz-oldest" if i == 0 else f"key-{i:04d}",
+                "created_at": created.isoformat(),
+                "expires_at": "2999-01-01T00:00:00+00:00",
+            }
+        )
+    path.write_text(json.dumps(records), encoding="utf-8")
+    suppressions = UpdatePromptSuppressions(path)
+
+    suppressions.add("newest")  # over the cap: the single oldest must be evicted
+
+    assert suppressions.contains("newest")
+    assert suppressions.contains("zzz-oldest") is False  # the oldest went, despite its hash order
+
+
+def test_legacy_flat_string_format_is_migrated(tmp_path: Path) -> None:
+    import json
+
+    path = tmp_path / "prompts.json"
+    path.write_text(json.dumps(["legacy-key-a", "legacy-key-b"]), encoding="utf-8")
+    suppressions = UpdatePromptSuppressions(path)
+
+    assert suppressions.contains("legacy-key-a")
+    suppressions.add("new-key")
+    # After a write the file is the new record shape, and the legacy answers are preserved.
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert all(isinstance(entry, dict) and "fingerprint" in entry for entry in reloaded)
+    assert {e["fingerprint"] for e in reloaded} >= {"legacy-key-a", "legacy-key-b", "new-key"}

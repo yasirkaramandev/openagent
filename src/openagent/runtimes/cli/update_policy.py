@@ -25,11 +25,13 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
 from ...core.models import CliInstallation, CliUpdateStatus
 from ...security.atomic import atomic_write_text
+from ...security.file_lock import LockTimeout, file_lock
 
 
 class UpdateChoice(str, Enum):
@@ -99,34 +101,95 @@ def suppression_key(installation: CliInstallation, status: CliUpdateStatus) -> s
     )
 
 
+#: How long a "do not ask again" answer stays in effect before it is asked again. Long enough to be
+#: useful across a project, short enough that a stale suppression for a version the user has since
+#: moved past does not linger forever.
+_SUPPRESSION_TTL = timedelta(days=90)
+#: Bounded so the file cannot grow without limit; eviction is by age, not by hash order.
+_SUPPRESSION_MAX_ENTRIES = 256
+#: Brief, because the critical section is a few KiB of JSON. A wait means another process is mid-write.
+_SUPPRESSION_LOCK_TIMEOUT = 5.0
+
+
 class UpdatePromptSuppressions:
     """Persisted "do not ask again for this version" answers.
 
-    Stored as a flat list of opaque keys. No version numbers or paths are recorded in a readable
-    form — the file is a set of answered-question identities, not a description of the user's
-    machine.
+    Each record is ``{fingerprint, created_at, expires_at}`` — the fingerprint is an opaque answered-
+    question identity (no version or path in readable form), the timestamps drive expiry and bounded
+    eviction. The read-modify-write runs under a cross-process lock and re-reads inside it, so two
+    ``openagent`` processes dismissing prompts at once cannot lose each other's entry (spec §14). A
+    malformed file resets to empty rather than crashing, and its raw content is never echoed.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def _load(self) -> set[str]:
+    def _lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
+    def _load(self) -> list[dict[str, str]]:
+        """Every record on disk, migrating the pre-timestamp flat-string format forward."""
+
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
-            return set()
-        return set(raw) if isinstance(raw, list) else set()
+            # Malformed or missing: treat as empty. Never surface the raw bytes — they are opaque
+            # fingerprints, and echoing a corrupt config is both useless and a disclosure risk.
+            return []
+        if not isinstance(raw, list):
+            return []
+        now = datetime.now(timezone.utc)
+        records: list[dict[str, str]] = []
+        for item in raw:
+            if isinstance(item, str):
+                # Legacy flat key: adopt it with a fresh window rather than dropping the user's answer.
+                records.append(_suppression_record(item, now))
+            elif isinstance(item, dict) and isinstance(item.get("fingerprint"), str):
+                records.append({str(k): str(v) for k, v in item.items()})
+        return records
+
+    def _active(self, records: list[dict[str, str]], now: datetime) -> list[dict[str, str]]:
+        active: list[dict[str, str]] = []
+        for record in records:
+            expires = record.get("expires_at")
+            if expires:
+                try:
+                    if datetime.fromisoformat(expires) <= now:
+                        continue  # expired: it will be asked again
+                except ValueError:
+                    pass
+            active.append(record)
+        return active
 
     def contains(self, key: str) -> bool:
-        return key in self._load()
+        now = datetime.now(timezone.utc)
+        return any(r.get("fingerprint") == key for r in self._active(self._load(), now))
 
     def add(self, key: str) -> None:
-        keys = self._load()
-        keys.add(key)
-        # Bounded: a user who dismisses many prompts over a long time should not accumulate an
-        # unbounded file, and the oldest entries are for versions long since superseded.
-        trimmed = sorted(keys)[-256:]
-        atomic_write_text(self.path, json.dumps(trimmed, indent=2), mode=0o600)
+        try:
+            with file_lock(self._lock_path(), timeout=_SUPPRESSION_LOCK_TIMEOUT):
+                now = datetime.now(timezone.utc)
+                # Re-read *inside* the lock so a concurrent add is not lost, and drop expired entries.
+                records = self._active(self._load(), now)
+                records = [r for r in records if r.get("fingerprint") != key]
+                records.append(_suppression_record(key, now))
+                # Bounded eviction by age: keep the most-recently-created, not the hash-alphabetical
+                # tail the old ``sorted(keys)[-256:]`` produced.
+                records.sort(key=lambda r: r.get("created_at") or "")
+                records = records[-_SUPPRESSION_MAX_ENTRIES:]
+                atomic_write_text(self.path, json.dumps(records, indent=2), mode=0o600)
+        except LockTimeout:
+            # A suppression is a convenience, not a correctness guarantee: if another process holds
+            # the lock, the worst case is that this prompt is asked again. Never block the run on it.
+            return
+
+
+def _suppression_record(fingerprint: str, now: datetime) -> dict[str, str]:
+    return {
+        "fingerprint": fingerprint,
+        "created_at": now.isoformat(),
+        "expires_at": (now + _SUPPRESSION_TTL).isoformat(),
+    }
 
 
 def is_non_interactive(environ: dict[str, str] | None = None) -> bool:
