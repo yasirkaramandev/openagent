@@ -667,3 +667,91 @@ def test_0012_upgraded_schema_matches_a_fresh_database(tmp_path: Path):
 
     for table in ("provider_connections", "agents"):
         assert _columns(upgraded, table) == _columns(fresh, table), f"{table} shape diverged"
+
+
+def _meta(path: Path, key: str) -> str | None:
+    engine = create_engine(f"sqlite:///{path}", future=True)
+    try:
+        with engine.connect() as conn:
+            row = conn.exec_driver_sql(
+                "SELECT value FROM schema_meta WHERE key=:k", {"k": key}
+            ).first()
+            return None if row is None else str(row[0])
+    finally:
+        engine.dispose()
+
+
+def test_open_stamps_writer_and_reader_metadata(tmp_path: Path):
+    """Every open records who wrote and the domain-reader floor it implies (§6)."""
+
+    from openagent import __version__
+    from openagent.storage.migrations import MINIMUM_READER_VERSION
+
+    db_path = tmp_path / "stamp.db"
+    Database.open(db_path)
+
+    assert _meta(db_path, "last_writer_version") == __version__
+    assert _meta(db_path, "minimum_reader_version") == MINIMUM_READER_VERSION
+
+
+def test_old_binary_reading_a_newer_database_gets_typed_error_not_traceback(tmp_path: Path):
+    """The failure the user hit: an older reader must be refused from metadata, before any model load.
+
+    Simulated by recording a ``minimum_reader_version`` this binary cannot satisfy — exactly what a
+    future build would stamp. The gate must raise the typed, actionable error rather than letting the
+    open reach ``ProviderConnection.model_validate`` and blow up with a raw ValidationError (§6).
+    """
+
+    from openagent.core.errors import DatabaseReaderCompatibilityError
+
+    db_path = tmp_path / "newer.db"
+    Database.open(db_path)
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO schema_meta (key, value) VALUES "
+                "('minimum_reader_version', '99.0.0'), ('last_writer_version', '99.0.0') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+        )
+    engine.dispose()
+
+    with pytest.raises(DatabaseReaderCompatibilityError) as excinfo:
+        Database.open(db_path)
+    error = excinfo.value
+    assert error.minimum_reader_version == "99.0.0"
+    assert error.database_writer_version == "99.0.0"
+    assert error.repair_commands == ["openagent update --repair"]
+    assert "cannot safely read it" in str(error)
+    assert "openagent update --repair" in str(error)
+
+
+def test_compat_gate_fires_before_any_domain_row_is_decoded(tmp_path: Path):
+    """A too-new DB is refused even when a domain row is itself undecodable — metadata only (§6)."""
+
+    from openagent.core.errors import DatabaseReaderCompatibilityError
+
+    db_path = tmp_path / "poison.db"
+    Database.open(db_path)
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    with engine.begin() as conn:
+        # A row that would raise a raw ValidationError if the gate did not run first.
+        conn.execute(
+            text(
+                "INSERT INTO provider_connections "
+                "(id, name, normalized_name, provider_type, enabled, state_revision, updated_at, data) "
+                "VALUES ('p', 'p', 'p', 'openai', 1, 0, '', :d)"
+            ),
+            {"d": '{"totally": "not a provider"}'},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO schema_meta (key, value) VALUES ('minimum_reader_version', '99.0.0') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+        )
+    engine.dispose()
+
+    with pytest.raises(DatabaseReaderCompatibilityError):
+        Database.open(db_path)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -14,6 +15,9 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+
+from ..core.errors import DatabaseReaderCompatibilityError
+from ..core.versioning import compare_versions, version_at_least
 
 
 class SchemaTooNewError(RuntimeError):
@@ -919,6 +923,114 @@ LATEST_REVISION = MIGRATIONS[-1].revision
 LATEST_VERSION = MIGRATIONS[-1].version
 _BY_REVISION = {migration.revision: migration for migration in MIGRATIONS}
 
+#: The oldest OpenAgent whose **domain model** can safely parse the JSON aggregates this build
+#: writes. This is deliberately *not* the integer schema version: fields like
+#: ``ProviderConnection.credential_revision`` live inside the ``data`` blob and were added without a
+#: schema migration (it landed in the v0.1.4 hardening pass), so the integer schema number stayed
+#: identical while the domain shape changed. An older reader passed the schema guard and then died
+#: with a raw ``ValidationError`` — the exact failure this constant closes. Bump it only when a
+#: change makes strictly older readers unsafe; it is monotonic across releases.
+MINIMUM_READER_VERSION = "0.1.4"
+
+#: The lowest schema this build can read. Migrations are forward-only and every historical revision
+#: is still applied on top of a fresh DB, so any recorded schema at or below ``LATEST_VERSION`` is
+#: readable; the floor exists only to make the compatibility report explicit.
+MINIMUM_SUPPORTED_SCHEMA = 1
+
+
+def _binary_version() -> str:
+    from .. import __version__
+
+    return __version__
+
+
+def _active_binary_path() -> str:
+    argv0 = sys.argv[0] if sys.argv else ""
+    try:
+        return str(Path(argv0).resolve()) if argv0 else sys.executable
+    except OSError:
+        return argv0 or sys.executable
+
+
+def _repair_commands() -> list[str]:
+    # The universal, DB-independent repair: ``openagent update`` never instantiates the app or opens
+    # the database (see cli/app.py), so an old binary that cannot read the DB can still run it.
+    return ["openagent update --repair"]
+
+
+def _read_meta(conn: Connection, key: str) -> str | None:
+    row = conn.exec_driver_sql("SELECT value FROM schema_meta WHERE key=:key", {"key": key}).first()
+    return None if row is None else str(row[0])
+
+
+def _check_reader_compatibility(conn: Connection) -> None:
+    """Refuse a database a newer OpenAgent wrote, from metadata alone, before any model load (§6).
+
+    Reads only ``schema_meta`` — never a domain row — so it cannot itself trip the ValidationError it
+    exists to pre-empt. The gate fires when the database records a ``minimum_reader_version`` this
+    binary does not satisfy (domain drift within one schema number). The integer schema-too-new case
+    is left to :func:`current_revision`'s :class:`SchemaTooNewError`, which predates this and has its
+    own contract; both are rendered cleanly by the callers (spec §17).
+    """
+
+    recorded_min_reader = _read_meta(conn, "minimum_reader_version")
+    if recorded_min_reader is None:
+        # A fresh DB, or one last written before this feature existed. Nothing to gate on: the
+        # per-record decode boundary (spec §7.3) still catches a genuinely unreadable row.
+        return
+    binary_version = _binary_version()
+    if version_at_least(binary_version, recorded_min_reader) is not False:
+        # True (satisfied) or None (unparseable) — do not brick on an unparseable version string;
+        # ``__version__`` and the constant are always PEP 440, so None does not occur in practice.
+        return
+    schema_row = _read_meta(conn, "version")
+    raise DatabaseReaderCompatibilityError(
+        database_schema=int(schema_row) if schema_row and schema_row.isdigit() else None,
+        supported_schema_min=MINIMUM_SUPPORTED_SCHEMA,
+        supported_schema_max=LATEST_VERSION,
+        database_writer_version=_read_meta(conn, "last_writer_version"),
+        minimum_reader_version=recorded_min_reader,
+        binary_version=binary_version,
+        binary_path=_active_binary_path(),
+        repair_commands=_repair_commands(),
+    )
+
+
+def _stamp_writer_metadata(conn: Connection) -> None:
+    """Record which build last wrote, and the reader floor it implies (§6).
+
+    ``minimum_reader_version`` is only ever raised, never lowered: an older build that predates this
+    feature leaves it absent, and no build writes a value below :data:`MINIMUM_READER_VERSION`, so a
+    DB carried forward monotonically declares the newest floor any writer required.
+    """
+
+    binary_version = _binary_version()
+    conn.execute(
+        text(
+            "INSERT INTO schema_meta (key, value) VALUES ('last_writer_version', :v) "
+            "ON CONFLICT(key) DO UPDATE SET value=:v"
+        ),
+        {"v": binary_version},
+    )
+    existing_floor = _read_meta(conn, "minimum_reader_version")
+    if existing_floor is None or compare_versions(MINIMUM_READER_VERSION, existing_floor) == 1:
+        conn.execute(
+            text(
+                "INSERT INTO schema_meta (key, value) VALUES ('minimum_reader_version', :v) "
+                "ON CONFLICT(key) DO UPDATE SET value=:v"
+            ),
+            {"v": MINIMUM_READER_VERSION},
+        )
+
+
+def _writer_metadata_stale(conn: Connection) -> bool:
+    """Whether stamping would actually change something — so a steady-state open stays read-only."""
+
+    if _read_meta(conn, "last_writer_version") != _binary_version():
+        return True
+    floor = _read_meta(conn, "minimum_reader_version")
+    return floor is None or compare_versions(MINIMUM_READER_VERSION, floor) == 1
+
 
 def _ensure_meta(conn: Connection) -> None:
     conn.exec_driver_sql(
@@ -1247,6 +1359,9 @@ def run_migrations(engine: Engine, *, db_path: Path | None = None) -> MigrationR
         conn.exec_driver_sql("BEGIN IMMEDIATE")
         try:
             _ensure_meta(conn)
+            # Refuse a DB a newer OpenAgent wrote before touching a single domain row, so an old
+            # binary reports "binary too old" instead of a raw ValidationError deep in a model (§6).
+            _check_reader_compatibility(conn)
             revision = current_revision(conn)
             minimum_counts = _row_counts(conn)
             minimum_ids = _row_ids(conn)
@@ -1266,6 +1381,17 @@ def run_migrations(engine: Engine, *, db_path: Path | None = None) -> MigrationR
         with engine.connect() as conn:
             integrity, violations = _verify(conn, minimum_counts, minimum_ids, validate_domain=True)
             counts = _row_counts(conn)
+            # Stamp which build last read/wrote this DB even when no migration ran, so the reader
+            # floor is present for the next opener. Skipped when nothing would change, so a stable
+            # DB opened repeatedly by the same build stays read-only.
+            if _writer_metadata_stale(conn):
+                conn.exec_driver_sql("BEGIN IMMEDIATE")
+                try:
+                    _stamp_writer_metadata(conn)
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
         return MigrationReport(
             revision,
             revision or LATEST_REVISION,
@@ -1289,6 +1415,7 @@ def run_migrations(engine: Engine, *, db_path: Path | None = None) -> MigrationR
                 migration.upgrade(conn)
                 _write_revision(conn, migration.revision)
                 applied.append(migration.revision)
+            _stamp_writer_metadata(conn)
             _verify(conn, minimum_counts, minimum_ids, validate_domain=True)
             conn.commit()
         except Exception as exc:
