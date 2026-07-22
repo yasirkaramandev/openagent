@@ -135,7 +135,7 @@ class OpenAgentApp:
             elif operation.kind == "agent_document_sync":
                 path = Path(str(operation.payload["path"]))
                 try:
-                    write_openagent_md(path, self.repos.agents.list())
+                    write_openagent_md(path, self.repos.agents.list)
                 except OpenAgentMdConflict:
                     # A document the user must fix by hand must not make OpenAgent unstartable —
                     # the interface that can fix it is the thing being blocked. The journal entry

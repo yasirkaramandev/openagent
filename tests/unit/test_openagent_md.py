@@ -34,6 +34,26 @@ def test_write_creates_file(tmp_path: Path):
     assert "`a`" in text
 
 
+def test_snapshot_callable_is_sampled_at_write_time_under_the_lock(tmp_path: Path):
+    """The committed snapshot must be read when the write runs (inside the lock), not captured
+    earlier by the caller (spec §10). A callable that reads a mutable source proves the timing: the
+    source is changed after the callable is built but before the write, and the document reflects
+    the later value."""
+
+    path = tmp_path / "OPENAGENT.md"
+    source = [_agent("first")]
+
+    def snapshot():
+        return list(source)
+
+    source[:] = [_agent("second")]  # commit lands after scheduling, before the write executes
+    write_openagent_md(path, snapshot)
+
+    text = path.read_text()
+    assert "`second`" in text
+    assert "`first`" not in text
+
+
 def test_write_preserves_prose_outside_markers(tmp_path: Path):
     path = tmp_path / "OPENAGENT.md"
     write_openagent_md(path, [_agent("a")])

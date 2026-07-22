@@ -23,7 +23,7 @@ the problem and the user decides.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ..config import OPENAGENT_MD_END, OPENAGENT_MD_START
@@ -185,7 +185,9 @@ def plan_openagent_md(path: Path, agents: Sequence[AgentProfile]) -> str:
     return before + block + after
 
 
-def write_openagent_md(path: Path, agents: Sequence[AgentProfile]) -> None:
+def write_openagent_md(
+    path: Path, snapshot: Callable[[], Sequence[AgentProfile]] | Sequence[AgentProfile]
+) -> None:
     """Create or update ``OPENAGENT.md`` in place, preserving prose outside the markers.
 
     Held under a cross-process lock, and guarded by a compare-and-swap on the file's own state: the
@@ -194,6 +196,13 @@ def write_openagent_md(path: Path, agents: Sequence[AgentProfile]) -> None:
     editor — the write is abandoned and retried against the new content rather than applied over a
     stale read.
 
+    ``snapshot`` is a callable read **inside** the lock, not a pre-fetched list (spec §10). The DB is
+    the source of truth, so the committed agent set the document reflects must be sampled after the
+    document lock is held — otherwise a snapshot taken before the lock could be regenerated over a
+    document another process wrote from a newer commit, resurrecting agents the DB no longer has. A
+    plain sequence is still accepted for callers (like ``--dry-run``) that already hold their own
+    consistent read.
+
     Raises :class:`OpenAgentMdConflict` when the document is in a shape that cannot be regenerated
     without guessing. Nothing is written in that case.
     """
@@ -201,6 +210,8 @@ def write_openagent_md(path: Path, agents: Sequence[AgentProfile]) -> None:
     lock = document_lock_path(path)
     try:
         with file_lock(lock, timeout=DOCUMENT_LOCK_TIMEOUT):
+            # Sample the committed DB snapshot only now that the lock is held (spec §10 ordering).
+            agents = snapshot() if callable(snapshot) else snapshot
             for _attempt in range(3):
                 before = _preimage(path)
                 content = plan_openagent_md(path, agents)

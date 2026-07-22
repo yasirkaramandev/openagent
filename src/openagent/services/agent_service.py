@@ -301,7 +301,9 @@ class AgentService:
         operation.complete()
 
     def sync_openagent_md(self) -> None:
-        write_openagent_md(self.app.paths.openagent_md(), self.list())
+        # Pass the repository read itself, not its result: write_openagent_md samples the committed
+        # agent set *inside* the document lock so the projection reflects the latest commit (spec §10).
+        write_openagent_md(self.app.paths.openagent_md(), self.repos.agents.list)
 
 
 def _fingerprint(value: str) -> str:
