@@ -14,11 +14,12 @@ from ..core.models import (
     RuntimeType,
 )
 from ..core.permissions import get_profile
-from ..reporting.openagent_md import write_openagent_md
-from ..storage.repositories import DuplicateNameError
+from ..reporting.openagent_md import OpenAgentMdConflict, write_openagent_md
+from ..storage.repositories import ConcurrentModificationError, DuplicateNameError
 
 if TYPE_CHECKING:
     from ..app import OpenAgentApp
+    from ..security.journal import JournalOperation
 
 
 class AgentError(ValueError):
@@ -218,11 +219,20 @@ class AgentService:
         system_prompt: str | None = None,
         permission_profile: str | None = None,
     ) -> AgentProfile:
-        """Update mutable fields of an existing agent (runtime/name are immutable)."""
+        """Update mutable fields of an existing agent (runtime/name are immutable).
 
-        agent = self.repos.agents.get(name)
-        if not agent:
+        Compare-and-swap on the revision read alongside the profile: if another process modified the
+        agent in between, the update raises :class:`ConcurrentModificationError` rather than writing
+        this caller's fields over the newer state (spec §8). The document projection is a *committed*
+        projection (spec §9): once the DB write lands it is authoritative and is never rolled back to
+        satisfy the file, because that would clobber whatever another writer committed. A projection
+        conflict leaves the journal entry pending — retried at next startup, surfaced by doctor.
+        """
+
+        read = self.repos.agents.get_with_revision(name)
+        if read is None:
             raise AgentError(f"agent {name!r} not found")
+        agent, revision = read
         if permission_profile is not None:
             get_profile(permission_profile)  # validate
         updates = {
@@ -240,15 +250,13 @@ class AgentService:
         operation = self.app.journal.begin(
             "agent_document_sync", {"path": str(self.app.paths.openagent_md())}
         )
-        self.repos.agents.upsert(updated)
-        operation.advance("db_written")
         try:
-            self.sync_openagent_md()
-        except Exception:
-            self.repos.agents.upsert(agent)
+            self.repos.agents.update(updated, expected_revision=revision)
+        except ConcurrentModificationError:
             operation.complete()
             raise
-        operation.complete()
+        operation.advance("db_written")
+        self._project_committed(operation)
         return updated
 
     def list(self) -> Sequence[AgentProfile]:
@@ -258,23 +266,39 @@ class AgentService:
         return self.repos.agents.get(name)
 
     def remove(self, name: str) -> bool:
-        existing = self.repos.agents.get(name)
-        if existing is None:
+        read = self.repos.agents.get_with_revision(name)
+        if read is None:
             return False
+        _agent, revision = read
         operation = self.app.journal.begin(
             "agent_document_sync", {"path": str(self.app.paths.openagent_md())}
         )
-        removed = self.repos.agents.delete(name)
-        if removed:
-            operation.advance("db_deleted")
-            try:
-                self.sync_openagent_md()
-            except Exception:
-                self.repos.agents.upsert(existing)
-                operation.complete()
-                raise
+        try:
+            self.repos.agents.delete_checked(name, expected_revision=revision)
+        except ConcurrentModificationError:
+            operation.complete()
+            raise
+        operation.advance("db_deleted")
+        self._project_committed(operation)
+        return True
+
+    def _project_committed(self, operation: JournalOperation) -> None:
+        """Regenerate OPENAGENT.md after a committed DB change, deferring on a projection conflict.
+
+        The DB change is already durable and authoritative (spec §9). If the document cannot be
+        regenerated right now — a malformed marker the user must fix, a lock another process holds —
+        the journal entry is left pending so ``_recover_operations`` retries it, and doctor reports
+        the pending sync. The DB is never rolled back to match the file: another process may have
+        committed a still-newer state, and undoing our own committed write could discard it.
+        """
+
+        try:
+            self.sync_openagent_md()
+        except OpenAgentMdConflict:
+            # Committed-with-projection-warning: leave the journal entry pending (do not complete),
+            # so the retry path and doctor own the follow-up. The caller's operation still succeeded.
+            return
         operation.complete()
-        return removed
 
     def sync_openagent_md(self) -> None:
         write_openagent_md(self.app.paths.openagent_md(), self.list())

@@ -491,15 +491,50 @@ class AgentRepository:
             row = conn.execute(select(t.agents.c.data).where(t.agents.c.name == name)).first()
         return AgentProfile.model_validate(row[0]) if row else None
 
+    def get_with_revision(self, name: str) -> tuple[AgentProfile, int] | None:
+        """The profile *and* the revision to compare-and-swap against, read together (spec §8).
+
+        Reading them in one statement is what makes the CAS honest: a caller that read the profile
+        and then separately read the revision could see a value from after another writer landed.
+        """
+
+        with self.db.engine.connect() as conn:
+            row = conn.execute(
+                select(t.agents.c.data, t.agents.c.state_revision).where(t.agents.c.name == name)
+            ).first()
+        return (AgentProfile.model_validate(row[0]), int(row[1])) if row else None
+
     def list(self) -> Sequence[AgentProfile]:
         with self.db.engine.connect() as conn:
             rows = conn.execute(select(t.agents.c.data).order_by(t.agents.c.name)).all()
         return [AgentProfile.model_validate(r[0]) for r in rows]
 
     def delete(self, name: str) -> bool:
+        """Unconditional delete. Only for the create path rolling back a row it just inserted and
+        owns; a concurrent remove must use :meth:`delete_checked` so a stale caller cannot delete a
+        row another process has since re-created or modified."""
+
         with self.db.engine.begin() as conn:
             result = conn.execute(sa_delete(t.agents).where(t.agents.c.name == name))
         return bool(result.rowcount)
+
+    def delete_checked(self, name: str, *, expected_revision: int) -> None:
+        """Compare-and-swap delete: remove the row only if it still carries ``expected_revision``.
+
+        Raises :class:`ConcurrentModificationError` when it does not — another process modified or
+        replaced the agent after this caller read it, and deleting anyway would discard that newer
+        state unseen (spec §8).
+        """
+
+        with self.db.engine.begin() as conn:
+            result = conn.execute(
+                sa_delete(t.agents).where(
+                    t.agents.c.name == name,
+                    t.agents.c.state_revision == expected_revision,
+                )
+            )
+        if not result.rowcount:
+            raise ConcurrentModificationError("agent", name)
 
 
 class CliRepository:
