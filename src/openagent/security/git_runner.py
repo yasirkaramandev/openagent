@@ -34,6 +34,7 @@ wrong:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -178,9 +179,109 @@ def git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def _hardened_argv(args: Sequence[str]) -> list[str]:
+#: A ``.gitattributes`` binds paths to a *named* filter; the filter's ``clean``/``smudge``/``process``
+#: commands live in configuration. ``diff.external`` and textconv are already covered, but a content
+#: filter is a third executable git runs on checkout and on ``git add``, and there is no flag that
+#: turns them off wholesale — each named filter must be neutralised individually. The name is what we
+#: have to discover; the command it would run is the thing we override to a harmless identity.
+_FILTER_ATTR_RE = re.compile(r"(?:^|\s)filter=([^\s]+)")
+_FILTER_SECTION_RE = re.compile(r'^\s*\[\s*filter\s+"([^"]+)"\s*\]', re.MULTILINE)
+#: A filter name we are willing to emit on a ``-c`` line. Git config keys are dot-delimited, so a
+#: name containing a dot, whitespace, ``=`` or a control character could smuggle extra config or a
+#: value separator into the override. Such a name cannot be a real registered filter anyway.
+_SAFE_FILTER_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+#: Cap on any single attributes/config file we parse for names. A pathological multi-megabyte file is
+#: not going to hold a legitimate filter binding, and reading it on every git call would be the cost.
+_ATTR_READ_LIMIT = 1024 * 1024
+
+
+def _read_text_capped(path: Path, limit: int = _ATTR_READ_LIMIT) -> str:
+    try:
+        if path.is_file() and path.stat().st_size <= limit:
+            return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return ""
+
+
+def _git_dirs(cwd: Path) -> list[Path]:
+    """The gitdir(s) whose ``config`` and ``info/attributes`` govern this working tree.
+
+    For a normal repo that is ``<cwd>/.git``. For a linked worktree ``.git`` is a file pointing at
+    the per-worktree gitdir, and the shared ``[filter ...]`` sections live in the common dir it names
+    via ``commondir`` — both are returned so neither source of a filter command is missed.
+    """
+
+    dot_git = cwd / ".git"
+    if dot_git.is_dir():
+        return [dot_git]
+    if not dot_git.is_file():
+        return []
+    match = re.search(r"gitdir:\s*(.+)", _read_text_capped(dot_git))
+    if not match:
+        return []
+    gitdir = Path(match.group(1).strip())
+    if not gitdir.is_absolute():
+        gitdir = cwd / gitdir
+    try:
+        gitdir = gitdir.resolve()
+    except OSError:
+        return []
+    dirs = [gitdir]
+    common = _read_text_capped(gitdir / "commondir").strip()
+    if common:
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = gitdir / common_path
+        try:
+            dirs.append(common_path.resolve())
+        except OSError:
+            pass
+    return dirs
+
+
+def _discover_filter_names(cwd: Path) -> set[str]:
+    """Every content-filter name that could actually run against this working tree.
+
+    A filter only executes if its command is *defined* — in the repository's own ``.git/config``,
+    since the global and system configs are pointed at nothing (see ``_config_isolation_env``). So
+    the config's ``[filter "name"]`` sections are the authoritative set. The ``.gitattributes`` at the
+    worktree root and ``info/attributes`` are unioned in as well, so a name that binds a path is
+    neutralised even if the definition is reached by a path this narrow scan does not; neutralising a
+    name that turns out to have no command is harmless.
+    """
+
+    names: set[str] = set()
+    attr_sources = [_read_text_capped(cwd / ".gitattributes")]
+    for gitdir in _git_dirs(cwd):
+        for section in _FILTER_SECTION_RE.findall(_read_text_capped(gitdir / "config")):
+            names.add(section)
+        attr_sources.append(_read_text_capped(gitdir / "info" / "attributes"))
+    for text in attr_sources:
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            names.update(_FILTER_ATTR_RE.findall(line))
+    return {name for name in names if _SAFE_FILTER_NAME_RE.match(name)}
+
+
+def _filter_neutralization_config(names: set[str]) -> list[str]:
+    settings: list[str] = []
+    for name in sorted(names):
+        settings += [
+            f"filter.{name}.clean=cat",  # identity: repo bytes pass through unchanged
+            f"filter.{name}.smudge=cat",
+            f"filter.{name}.process=",  # override any long-running process command with nothing
+            f"filter.{name}.required=false",  # a neutralised filter must not fail the operation
+        ]
+    return settings
+
+
+def _hardened_argv(args: Sequence[str], *, filter_names: set[str] | None = None) -> list[str]:
     argv = ["git", "--no-pager", "-c", f"core.hooksPath={_empty_hooks_dir()}"]
     for setting in _GIT_SAFE_CONFIG:
+        argv += ["-c", setting]
+    for setting in _filter_neutralization_config(filter_names or set()):
         argv += ["-c", setting]
     argv += list(args)
     return argv
@@ -206,7 +307,10 @@ class GitRunner:
         timeout: int | None = None,
         check: bool = True,
     ) -> GitResult:
-        argv = _hardened_argv(args)
+        # Discover and neutralise content filters per call, from cwd: the shared read/mutate path
+        # means a checkout and a ``git add`` both get the override, so neither can run a clean,
+        # smudge or process filter the repository configured.
+        argv = _hardened_argv(args, filter_names=_discover_filter_names(cwd))
         effective_timeout = self.timeout if timeout is None else timeout
         try:
             completed = run_capture(

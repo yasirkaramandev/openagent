@@ -374,3 +374,81 @@ def test_timeout_terminates_the_process_tree(repo: Path) -> None:
         runner.inspect(["-c", "alias.sleep=!sleep 30", "sleep"], repo, check=False)
 
     assert "timed out" in str(excinfo.value).lower()
+
+
+# --------------------------------------------------------------------------- content filters
+
+
+def _install_evil_filter(root: Path, marker: Path) -> None:
+    """A repo that binds *.txt to a ``filter`` whose clean/smudge/process all run a script that
+    exfiltrates the environment. ``required=true`` means git would normally *fail* the operation
+    rather than skip the filter — so neutralisation has to make it a no-op, not merely optional."""
+
+    (root / ".gitattributes").write_text("*.txt filter=evil\n", encoding="utf-8")
+    script = root / "evil-filter.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "RAN:%s" "${{ANTHROPIC_API_KEY}}${{OPENAI_API_KEY}}" > "{marker}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    config = root / ".git" / "config"
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write(
+            '[filter "evil"]\n'
+            f"\tclean = {script}\n"
+            f"\tsmudge = {script}\n"
+            f"\tprocess = {script}\n"
+            "\trequired = true\n"
+        )
+
+
+@requires_git
+@posix_only
+def test_content_filter_clean_does_not_run_on_git_add(repo: Path) -> None:
+    """``git add`` cleans the working-tree copy through the configured filter. A repository-supplied
+    filter must not run, and the add must still succeed despite ``required=true`` (spec §12)."""
+
+    marker = repo / "filter-ran.txt"
+    _install_evil_filter(repo, marker)
+    (repo / "payload.txt").write_text("some content\n", encoding="utf-8")
+
+    result = GIT.mutate_worktree(["add", "-A"], repo, check=False)
+
+    assert not marker.exists(), "a repository content filter ran during git add"
+    assert result.returncode == 0, "neutralised required filter must not fail the add"
+
+
+@requires_git
+@posix_only
+def test_content_filter_smudge_does_not_run_on_checkout(repo: Path) -> None:
+    """``git checkout`` smudges the checked-out copy through the filter; it too must be neutralised."""
+
+    marker = repo / "filter-ran.txt"
+    (repo / "tracked.txt").write_text("v1\n", encoding="utf-8")
+    # Commit the file *before* the filter exists, so the checkout below is the only filter trigger.
+    user_env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, env=user_env, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add tracked"], cwd=repo, env=user_env, check=True)
+    _install_evil_filter(repo, marker)
+    (repo / "tracked.txt").unlink()
+
+    result = GIT.mutate_worktree(["checkout", "--", "tracked.txt"], repo, check=False)
+
+    assert not marker.exists(), "a repository content filter ran during checkout"
+    assert result.returncode == 0
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+@requires_git
+def test_discover_filter_names_finds_attribute_and_config_bindings(repo: Path) -> None:
+    from openagent.security.git_runner import _discover_filter_names
+
+    _install_evil_filter(repo, repo / "unused-marker")
+    names = _discover_filter_names(repo)
+    assert "evil" in names
