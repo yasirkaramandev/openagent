@@ -22,6 +22,20 @@ remote CI across the supported OS/Python matrix and the RC soak remain release g
   `credential_revision` from validated provider JSON without dropping or rewriting domain data.
   Create, update, upsert, rollback and startup recovery compare that revision before deleting a row
   or its probes. Stale operations may clean only their own revision-scoped secret.
+- **A committed provider is never deleted by recovery.** `ProviderTransaction.commit()` wrote no
+  durable post-commit marker: it forgot the previous secret, ran a *fallible* legacy-secret cleanup,
+  then unlinked the journal. A committed provider whose journal was not yet unlinked — a crash, or
+  that legacy `delete_secret` raising — left a pending operation at stage `db_written`,
+  indistinguishable from a never-committed add, and startup recovery deleted the committed row (and
+  its probes and new secret) on the next start. Commit now writes a durable `commit_durable` stage
+  **before** the legacy cleanup, the rollback path marks `rollback_pending` before compensating, and
+  recovery decides keep-vs-compensate from the stage — preserving the provider and its credential on
+  any ambiguity (`db_written`, unknown or unverifiable legacy stages) rather than guessing. Legacy
+  cleanup is no longer part of the atomic commit: when it fails the provider is kept and the
+  operation is left `legacy_cleanup_pending` for recovery/Doctor to retry. Doctor reports each
+  pending operation by a redacted recovery state (`provider rollback pending`, `provider legacy
+  credential cleanup pending`, `provider recovery ownership ambiguous`, `provider generation
+  superseded`). See [docs/recovery-provider-transaction.md](docs/recovery-provider-transaction.md).
 - **Live journal operations carry PID/start-time ownership.** A second process does not mistake a
   paused operation for a crashed one; PID reuse and unverifiable live identity are handled
   fail-closed.
