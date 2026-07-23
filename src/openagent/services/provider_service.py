@@ -197,8 +197,10 @@ class ProviderTransaction:
 
         self._committed = True
         self._forget()
-        if self._operation is not None:
-            self._operation.advance(STAGE_COMMIT_DURABLE)
+        operation = self._operation
+        if operation is None:  # pragma: no cover - __enter__ always sets the operation first
+            return
+        operation.advance(STAGE_COMMIT_DURABLE)
         if self._legacy_credential is not None:
             try:
                 self._credentials.delete_secret(self._legacy_credential, strict=True)
@@ -206,11 +208,9 @@ class ProviderTransaction:
                 # The provider is already durable; a failed legacy-secret cleanup must not undo it.
                 # Leave the operation pending at a stage recovery treats as "committed, finish the
                 # legacy cleanup", never as "roll back".
-                if self._operation is not None:
-                    self._operation.advance(STAGE_LEGACY_CLEANUP_PENDING)
+                operation.advance(STAGE_LEGACY_CLEANUP_PENDING)
                 return
-        if self._operation is not None:
-            self._operation.complete()
+        operation.complete()
 
     def __exit__(
         self,
@@ -221,11 +221,13 @@ class ProviderTransaction:
         # Returns None → never suppresses the in-flight exception; an uncommitted transaction is
         # rolled back exactly (keychain restored, half-written provider row removed).
         if not self._committed:
+            operation = self._operation
+            if operation is None:  # pragma: no cover - __enter__ always sets the operation first
+                return
             # Durably record that this generation entered the rollback path *before* touching the
             # keychain or the row. Recovery deletes an owned generation only on this proof; a bare
             # ``db_written`` (a crash before __exit__ ever ran) stays ambiguous and is preserved.
-            if self._operation is not None:
-                self._operation.advance(STAGE_ROLLBACK_PENDING)
+            operation.advance(STAGE_ROLLBACK_PENDING)
             restore_error: BaseException | None = None
             compensation_error: BaseException | None = None
             try:
@@ -241,16 +243,15 @@ class ProviderTransaction:
                 deleted = self._repos.providers.delete_owned_with_probes(
                     self.provider.id, self.provider.credential_revision
                 )
-                if self._operation is not None:
-                    self._operation.advance(
-                        "owned_compensation" if deleted else "superseded_generation"
-                    )
+                operation.advance(
+                    STAGE_OWNED_COMPENSATION if deleted else STAGE_SUPERSEDED_GENERATION
+                )
             except Exception as delete_exc:
                 # Keep the original partner-write exception authoritative. The durable journal has
                 # all immutable ownership fields startup recovery needs to retry safely.
                 compensation_error = delete_exc
-            if self._operation is not None and restore_error is None and compensation_error is None:
-                self._operation.complete()
+            if restore_error is None and compensation_error is None:
+                operation.complete()
             if restore_error is not None:
                 raise restore_error
 
