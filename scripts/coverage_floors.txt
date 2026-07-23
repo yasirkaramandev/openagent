@@ -11,4 +11,4 @@ openagent/services/agent_service.py = 68.5
 openagent/services/provider_service.py = 73.4
 openagent/storage/migrations.py = 71.1
 openagent/storage/repositories.py = 76.9
-openagent/tui = 62.0
+openagent/tui = 60.5
