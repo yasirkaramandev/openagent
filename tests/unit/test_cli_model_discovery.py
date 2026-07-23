@@ -225,7 +225,10 @@ def test_schema_capability_negative_cache_expires_and_refresh_bypasses(tmp_path:
     key = (str(executable.resolve()), "v1")
     entry = _SCHEMA_CACHE[key]
     assert entry.supported is False
-    assert entry.expires_at - entry.checked_at == _CAPABILITY_NEGATIVE_TTL  # short, not forever
+    # Short TTL, not the "forever" the old cache used. Recompute the sum rather than subtracting:
+    # ``expires_at`` is stored as ``checked_at + ttl``, so ``checked_at + ttl`` reproduces the exact
+    # float, whereas ``expires_at - checked_at`` of two large monotonic values is not exactly the ttl.
+    assert entry.expires_at == entry.checked_at + _CAPABILITY_NEGATIVE_TTL
 
     # Within the TTL the negative is reused without a re-probe.
     assert _schema_supports_model_list(str(executable), "v1", flaky_runner) is False

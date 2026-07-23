@@ -99,10 +99,20 @@ async def _start_run(pilot, app) -> str:
 
 
 async def _wait_for_question(pilot, timeout: int = 200) -> QuestionModal:
+    from textual.css.query import NoMatches
+
     for _ in range(timeout):
         await pilot.pause(0.05)
-        if isinstance(pilot.app.screen, QuestionModal):
-            return pilot.app.screen
+        screen = pilot.app.screen
+        if isinstance(screen, QuestionModal):
+            # A screen becomes ``app.screen`` when it is pushed, before ``compose`` has finished
+            # mounting its widgets. Wait until the question label is actually queryable, so callers
+            # never race the mount and hit ``NoMatches`` on ``#q`` (observed flaky on CI).
+            try:
+                screen.query_one("#q")
+            except NoMatches:
+                continue
+            return screen
     raise AssertionError("QuestionModal never appeared")
 
 
