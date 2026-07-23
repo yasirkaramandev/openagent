@@ -191,7 +191,10 @@ def test_rollback_keeps_owned_journal_when_database_compensation_fails(
     tx.__exit__(RuntimeError, RuntimeError("partner write failed"), None)
 
     assert app.providers.get("acme") is not None
-    assert [op.stage for op in app.journal.pending()] == ["db_written"]
+    # The rollback path durably marks itself before compensating, so a retry after a failed DB
+    # compensation is provably a rollback (not an ambiguous ``db_written``) and recovery may finish
+    # deleting the owned generation.
+    assert [op.stage for op in app.journal.pending()] == ["rollback_pending"]
 
 
 def test_rollback_still_deletes_owned_row_when_secret_cleanup_fails(
