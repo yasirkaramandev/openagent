@@ -1,0 +1,126 @@
+# Live provider smoke (spec §28).
+#
+# Deliberately NOT part of the PR gate. Two reasons, and both are load-bearing:
+#
+#   1. It spends money and provider quota on every run, so it is triggered on purpose or on a slow
+#      schedule — never on every push.
+#   2. It needs API keys. A workflow that exposes secrets to `pull_request` runs hands them to any
+#      fork that opens a PR, so this file has no `pull_request` trigger at all. That is the fix;
+#      `if: github.event.pull_request.head.repo.full_name == github.repository` guards are a
+#      weaker version of the same idea and are easy to weaken further by accident.
+#
+# A provider whose key is absent SKIPS. A skip is BLOCKED_BY_CREDENTIAL, which is not a pass — the
+# summary step below says so in as many words, because a green check mark on a job that tested
+# nothing is exactly the outcome spec §28.4 forbids.
+
+name: Provider live smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: "Comma-separated provider ids to smoke, or 'all'"
+        required: false
+        default: "all"
+  schedule:
+    # Weekly, Mondays 04:00 UTC. Often enough to notice a provider changing its wire format,
+    # rarely enough that the bill stays negligible.
+    - cron: "0 4 * * 1"
+
+concurrency:
+  # Never two live runs at once: concurrent runs multiply spend and can trip provider rate limits,
+  # which then look like adapter failures.
+  group: provider-live-smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: live smoke (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    # Only ever runs against this repository's own keys.
+    if: github.repository == 'yasirkaramandev/openagent'
+    timeout-minutes: 15
+    strategy:
+      # One provider's outage must not hide another's regression.
+      fail-fast: false
+      matrix:
+        include:
+          - provider: gemini-api
+            path: tests/live/test_gemini_live_smoke.py
+            key_env: OPENAGENT_LIVE_GEMINI_API_KEY
+            secret_name: OPENAGENT_LIVE_GEMINI_API_KEY
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install (editable, with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Check for a credential
+        id: credential
+        env:
+          KEY: ${{ secrets[matrix.secret_name] }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=${{ matrix.provider }}::BLOCKED_BY_CREDENTIAL — no ${{ matrix.secret_name }} configured; this is NOT a pass"
+          fi
+
+      - name: Run live smoke
+        if: steps.credential.outputs.present == 'true'
+        env:
+          ${{ matrix.key_env }}: ${{ secrets[matrix.secret_name] }}
+        # Bounded in three independent places rather than by a pytest plugin the dev extras do not
+        # carry: every request is wrapped in asyncio.wait_for, the transport enforces its own
+        # wall-clock budget per call, and the job has timeout-minutes above.
+        run: |
+          python -m pytest "${{ matrix.path }}" \
+            -m integration \
+            --maxfail=3 \
+            -q
+
+      - name: Record verification status
+        if: always()
+        run: |
+          if [ "${{ steps.credential.outputs.present }}" != "true" ]; then
+            status="BLOCKED_BY_CREDENTIAL (not a pass — nothing ran)"
+          elif [ "${{ job.status }}" = "success" ]; then
+            status="LIVE_VERIFIED"
+          else
+            status="FAILED — see the step log"
+          fi
+          {
+            echo "### ${{ matrix.provider }}"
+            echo ""
+            echo "**Status:** $status"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Nothing is uploaded as an artifact on purpose. Provider request/response bodies can carry the
+  # prompt, the reply and occasionally an echoed credential; the assertions in the test file are
+  # the record, and the step log is redacted by TransportError before anything is printed.
+  summary:
+    name: summary
+    needs: smoke
+    if: always() && github.repository == 'yasirkaramandev/openagent'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restate what a skip means
+        run: |
+          {
+            echo "### How to read this run"
+            echo ""
+            echo "- **LIVE_VERIFIED** — a real request reached the provider and behaved as expected."
+            echo "- **BLOCKED_BY_CREDENTIAL** — no key was configured, so nothing ran. This is *not* a pass."
+            echo "- **FAILED** — the provider was reached and the adapter's expectations did not hold."
+          } >> "$GITHUB_STEP_SUMMARY"
