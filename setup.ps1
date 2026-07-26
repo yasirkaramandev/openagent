@@ -85,7 +85,12 @@ try {
     }
 
     Write-Step "[2/6] Installing managed Python 3.12 (system/Store Python is untouched)"
-    & $Uv python install 3.12
+    # `2>&1 |` merges uv's stderr into the success stream. Without it, re-running setup.ps1 fails:
+    # $ErrorActionPreference = "Stop" makes Windows PowerShell 5.1 treat *any* native stderr output
+    # as a terminating error, and uv writes "Python 3.12 is already installed" to stderr when it has
+    # nothing to do. So the second run of the installer died at step 2 with a message saying the
+    # thing it wanted was already true. The exit code is still what decides success.
+    & $Uv python install 3.12 2>&1 | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) {
         Fail "install-python" "uv could not install managed Python 3.12" "Check network/proxy access, then re-run setup.ps1."
     }

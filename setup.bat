@@ -178,13 +178,17 @@ if not defined OPENAGENT_BIN (
 rem Persist install provenance so `openagent update` is channel-aware from the first run (spec §8,
 rem §20.1). Written at %OPENAGENT_HOME%\install.json; never contains a secret. Non-fatal on failure,
 rem but reported — an install that cannot record its channel will have to be repaired later.
+rem Quoting a literal `"` inside a batch `set` is a trap: `\"` is a backslash followed by a quote,
+rem not an escaped quote, so the first version of this block emitted `\"release-candidate\"` and
+rem produced invalid JSON. `set "A="B""` is the correct form — the outermost quote pair is stripped
+rem and the inner quotes survive into the value.
 set "OA_HOME=%OPENAGENT_HOME%"
 if not defined OA_HOME set "OA_HOME=%USERPROFILE%\.openagent"
 set "OA_CHANNEL_REF=null"
-if /I "!INSTALL_CHANNEL!"=="candidate" set "OA_CHANNEL_REF=\"release-candidate\""
-if /I "!INSTALL_CHANNEL!"=="dev" set "OA_CHANNEL_REF=\"main\""
+if /I "!INSTALL_CHANNEL!"=="candidate" set "OA_CHANNEL_REF="release-candidate""
+if /I "!INSTALL_CHANNEL!"=="dev" set "OA_CHANNEL_REF="main""
 set "OA_COMMIT_JSON=null"
-if defined INSTALL_COMMIT set "OA_COMMIT_JSON=\"!INSTALL_COMMIT!\""
+if defined INSTALL_COMMIT set "OA_COMMIT_JSON="!INSTALL_COMMIT!""
 if not exist "!OA_HOME!" mkdir "!OA_HOME!" 2>nul
 (
     echo {

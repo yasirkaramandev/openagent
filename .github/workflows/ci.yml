@@ -602,7 +602,9 @@ jobs:
           if ($payload.vcs_info.commit_id -ne $env:CANDIDATE_SHA) { Write-Error "commit $($payload.vcs_info.commit_id) != $env:CANDIDATE_SHA"; exit 1 }
           Write-Host "direct_url.json: official repository at the exact target commit"
 
-          $meta = Get-Content "$env:OPENAGENT_HOME\install.json" -Raw | ConvertFrom-Json
+          $metaRaw = Get-Content "$env:OPENAGENT_HOME\install.json" -Raw
+          Write-Host "--- install.json ---"; Write-Host $metaRaw; Write-Host "--- end ---"
+          $meta = $metaRaw | ConvertFrom-Json
           if ($meta.source -ne "official-github-vcs") { Write-Error "source $($meta.source)"; exit 1 }
           if ($meta.installed_commit -ne $env:CANDIDATE_SHA) { Write-Error "installed_commit $($meta.installed_commit)"; exit 1 }
           if ($meta.last_accepted_commit -ne $env:CANDIDATE_SHA) { Write-Error "last_accepted_commit $($meta.last_accepted_commit)"; exit 1 }
