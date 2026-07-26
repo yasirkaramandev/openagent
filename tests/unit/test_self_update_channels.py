@@ -292,6 +292,16 @@ def test_stable_ignores_prerelease_release() -> None:
 # ---------------------------------------------------------------------- channel plan logic (spec §12)
 
 
+def _ahead(_base, _head):
+    """Default ancestry oracle: the target is a descendant of what is installed.
+
+    Injected explicitly so unit tests never reach the network for the compare API, and so a test
+    that cares about ancestry has to say so.
+    """
+
+    return "ahead"
+
+
 def _channel_check(active, *, current, installed_commit, target, **kw):
     return check_self_update(
         current_version=current,
@@ -299,6 +309,7 @@ def _channel_check(active, *, current, installed_commit, target, **kw):
         direct_url=_vcs_direct_url(installed_commit),
         metadata=kw.pop("metadata", None),
         target_resolver=lambda ch: target,
+        compare=kw.pop("compare", _ahead),
         **kw,
     )
 

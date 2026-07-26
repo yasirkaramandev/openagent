@@ -296,7 +296,15 @@ def update_openagent(
     if json_out:
         emit_json(result.model_dump(mode="json"))
     else:
-        mark = "[green]✓[/green]" if result.ok else "[red]✗[/red]"
+        # A metadata write failure is a successful install with lost provenance — neither a plain
+        # ✓ nor a ✗ tells the truth about it, so it gets its own mark (spec §3.3).
+        mark = (
+            "[yellow]![/yellow]"
+            if result.ok and not result.metadata_persisted
+            else "[green]✓[/green]"
+            if result.ok
+            else "[red]✗[/red]"
+        )
         console.print(f"{mark} {safe_markup(result.detail)}")
         if result.rolled_back:
             console.print("  [yellow]rolled back to the previous installation[/yellow]")

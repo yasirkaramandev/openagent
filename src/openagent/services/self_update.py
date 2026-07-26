@@ -39,6 +39,18 @@ from ..runtimes.cli.updates import (
 )
 from ..security.atomic import atomic_write_text
 from ..security.file_lock import LockTimeout, file_lock
+from .update_safety import (
+    AncestryOracle,
+    CommitRelation,
+    ProcessSafety,
+    ProcessSafetyState,
+    classify_commit_relation,
+    describe_process_block,
+    describe_relation_block,
+    probe_process_safety,
+    relation_permits_install,
+    update_permitted,
+)
 
 OFFICIAL_REPOSITORY = "yasirkaramandev/openagent"
 PYPI_METADATA_URL = "https://pypi.org/pypi/openagent/json"
@@ -128,6 +140,9 @@ class SelfUpdatePlan(BaseModel):
     package_url: str | None = None
     #: True when the resolved target orders *below* the installed version; blocked without override.
     is_downgrade: bool = False
+    #: Where the target commit sits on the commit graph relative to the last accepted commit. This,
+    #: not the version string, is what decides whether an install moves forward (spec §3.2).
+    commit_relation: CommitRelation = CommitRelation.SAME
     #: True when this plan migrates a legacy local-checkout install onto an official channel.
     migrating: bool = False
     #: A stable, machine-readable reason for ``update_available``/``can_update`` (spec §19.5).
@@ -151,6 +166,12 @@ class SelfUpdateResult(BaseModel):
     verified_commit: str | None = None
     #: True when a failed install was reverted to the previously-installed exact source (spec §17).
     rolled_back: bool = False
+    #: Whether ``install.json`` was written. False means the binary is correct but this installation
+    #: can no longer prove its channel or its last accepted commit (spec §3.3).
+    metadata_persisted: bool = True
+    #: Machine-readable outcome. ``installed_with_metadata_warning`` is deliberately distinct from
+    #: ``installed``: the binary is good, but provenance was lost and needs ``update --repair``.
+    status: str = "installed"
     detail: str = ""
 
 
@@ -213,8 +234,9 @@ ExecutableResolver = Callable[[str], str | None]
 TargetResolver = Callable[[OpenAgentUpdateChannel], "SelfUpdateTarget | None"]
 #: Reads the exact VCS commit an installed OpenAgent distribution was built from, given its binary.
 CommitReader = Callable[[Path], "str | None"]
-#: Returns identities of other live OpenAgent processes (empty when only this updater is running).
-ProcessProbe = Callable[[], "list[str]"]
+#: Classifies what is currently using this installation (spec §3.1). May also return a bare list of
+#: process identities, which :func:`_coerce_safety` reads as "an idle second process".
+ProcessProbe = Callable[[], "ProcessSafety | list[str]"]
 #: Persists install metadata (defaults to :func:`write_install_metadata`).
 MetadataWriter = Callable[..., None]
 
@@ -646,6 +668,7 @@ def check_self_update(
     repair: bool = False,
     allow_downgrade: bool = False,
     local_dev: bool = False,
+    compare: AncestryOracle | None = None,
 ) -> SelfUpdatePlan:
     """Resolve provenance and check the matching official update source, checkout-independently.
 
@@ -700,6 +723,7 @@ def check_self_update(
             fetcher=fetcher,
             target_resolver=target_resolver,
             environ=environment,
+            compare=compare,
         )
 
     # Case B — legacy local-directory install. By default migrate it onto the official channel
@@ -728,6 +752,7 @@ def check_self_update(
             fetcher=fetcher,
             target_resolver=target_resolver,
             environ=environment,
+            compare=compare,
         )
 
     # Case C — a remote/malformed direct-URL that is not a trusted official VCS install.
@@ -756,6 +781,7 @@ def check_self_update(
             fetcher=fetcher,
             target_resolver=target_resolver,
             environ=environment,
+            compare=compare,
         )
     if repair:
         return _blocked_plan(
@@ -797,6 +823,7 @@ def _channel_plan(
     fetcher: JsonFetcher,
     target_resolver: TargetResolver | None,
     environ: Mapping[str, str],
+    compare: AncestryOracle | None = None,
 ) -> SelfUpdatePlan:
     """Resolve the effective channel and its exact-commit target, then build the plan."""
 
@@ -821,7 +848,25 @@ def _channel_plan(
         allow_downgrade=allow_downgrade,
         migrating=migrating,
         repair=repair,
+        compare=compare or (lambda base, head: _github_commit_status(fetcher, base, head)),
     )
+
+
+def _github_commit_status(fetcher: JsonFetcher, base: str, head: str) -> str | None:
+    """Ask GitHub how ``head`` relates to ``base``: identical, ahead, behind, or diverged.
+
+    Credential-free and read-only against the official public repository. ``None`` on any failure —
+    a rate limit or a network error must not be able to *manufacture* a forward relationship, and
+    the caller treats an unanswered comparison as UNKNOWN rather than as permission.
+    """
+
+    url = f"{GITHUB_API_BASE}/repos/{OFFICIAL_REPOSITORY}/compare/{base}...{head}"
+    try:
+        payload = fetcher(url, CHECK_TIMEOUT_SECONDS, MAX_HTTP_BODY_BYTES)
+    except Exception:
+        return None
+    status = payload.get("status") if isinstance(payload, dict) else None
+    return status if isinstance(status, str) else None
 
 
 def _source_version(root: Path) -> str | None:
@@ -881,7 +926,7 @@ def perform_self_update(
             runner=runner,
             resolver=resolver,
             commit_reader=commit_reader or _read_installed_vcs_commit,
-            process_probe=process_probe or _other_openagent_processes,
+            process_probe=process_probe or probe_process_safety,
             metadata_writer=metadata_writer or write_install_metadata,
             lock_path=lock_path,
             lock_timeout=lock_timeout,
@@ -1388,6 +1433,7 @@ def _vcs_plan(
     allow_downgrade: bool,
     migrating: bool,
     repair: bool,
+    compare: AncestryOracle | None = None,
 ) -> SelfUpdatePlan:
     """Build a checkout-independent update plan from a resolved channel target (spec §11-§12)."""
 
@@ -1438,6 +1484,19 @@ def _vcs_plan(
         current_version
     )
 
+    # Commit ancestry, not version strings, decides whether this is forward motion (spec §3.2).
+    # The baseline is the newest commit this installation has *accepted*, so a rollback cannot walk
+    # it backwards one accepted commit at a time. During a release candidate every commit reports
+    # the same version, which is exactly when string comparison silently permits going backwards.
+    commit_baseline = installed_commit
+    if metadata is not None and metadata.last_accepted_commit:
+        commit_baseline = metadata.last_accepted_commit
+    relation = CommitRelation.SAME
+    if not migrating and commit_baseline and compare is not None:
+        relation = classify_commit_relation(
+            installed=commit_baseline, target=target.commit_sha, compare=compare
+        )
+
     command = _vcs_install_command(uv_path, target.package_url, python_version)
     common: dict[str, Any] = {
         **base,
@@ -1446,9 +1505,13 @@ def _vcs_plan(
         "target_commit": target.commit_sha,
         "package_url": target.package_url,
         "commands": [command],
-        "is_downgrade": is_downgrade,
+        "is_downgrade": is_downgrade or relation is CommitRelation.BEHIND,
+        "commit_relation": relation,
     }
 
+    # A version that plainly orders downward is reported as a downgrade, because that is the more
+    # useful message. Ancestry is checked next, and catches the case versions cannot see: identical
+    # version strings on different commits.
     if is_downgrade and not allow_downgrade:
         return SelfUpdatePlan(
             **common,
@@ -1458,6 +1521,21 @@ def _vcs_plan(
             detail=(
                 f"target {target_version} on the {channel.value} channel is older than the "
                 f"installed {baseline}; re-run with --allow-downgrade to force it"
+            ),
+        )
+
+    if not relation_permits_install(relation, allow_downgrade=allow_downgrade):
+        return SelfUpdatePlan(
+            **common,
+            can_update=False,
+            update_available=None,
+            reason=(
+                "commit_unknown"
+                if relation is CommitRelation.UNKNOWN
+                else f"commit_{relation.value}_blocked"
+            ),
+            detail=describe_relation_block(
+                relation, installed=commit_baseline, target=target.commit_sha
             ),
         )
 
@@ -1485,10 +1563,12 @@ def _vcs_plan(
             f"forcing downgrade to {target_version} at commit {target.commit_sha[:12]}",
         )
     elif same_version and not same_commit:
+        # Same version, different commit — only reachable now when ancestry proved the target is a
+        # descendant (or the operator passed --allow-downgrade), so "newer" is earned, not assumed.
         reason, detail = (
             "newer_commit",
-            f"refreshing {target_version or channel.value} to {channel.value} commit "
-            f"{target.commit_sha[:12]}",
+            f"advancing {target_version or channel.value} to the {channel.value} commit "
+            f"{target.commit_sha[:12]} ({relation.value} of the installed commit)",
         )
     elif repair and same_commit:
         reason, detail = (
@@ -1545,48 +1625,24 @@ def _read_installed_vcs_commit(binary: Path) -> str | None:
     return None
 
 
-def _other_openagent_processes() -> list[str]:
-    """Identities of other live OpenAgent processes, excluding this updater's own tree (spec §14).
+def _coerce_safety(value: ProcessSafety | Sequence[str]) -> ProcessSafety:
+    """Accept either a classified :class:`ProcessSafety` or a bare list of process identities.
 
-    Conservative and best-effort: a failure to enumerate returns an empty list rather than blocking
-    an update on a probe that could not run. ``--force`` bypasses a positive result, but the probe is
-    never trusted to *permit* an update on its own.
+    The list form is what the probe returned before spec §3.1: it can say *that* another OpenAgent
+    is live but not *what it is doing*, so a non-empty list is treated as an idle second process —
+    the weakest positive finding, and the only one ``--force`` may override.
     """
 
-    try:
-        import psutil
-    except Exception:  # pragma: no cover - psutil is a hard dependency, but never fail the updater
-        return []
-    me = os.getpid()
-    try:
-        my_ancestors = {me}
-        current = psutil.Process(me)
-        for parent in current.parents():
-            my_ancestors.add(parent.pid)
-    except Exception:
-        my_ancestors = {me}
-    found: list[str] = []
-    try:
-        processes = list(psutil.process_iter(["pid", "name", "cmdline"]))
-    except Exception:
-        return []
-    for proc in processes:
-        try:
-            pid = proc.info.get("pid")
-            if pid in my_ancestors:
-                continue
-            cmdline = proc.info.get("cmdline") or []
-            name = (proc.info.get("name") or "").lower()
-            haystack = " ".join(cmdline).lower()
-            is_openagent = name.startswith("openagent") or "openagent" in haystack
-            # Ignore package-manager processes that merely mention openagent (the updater itself).
-            if is_openagent and not any(
-                tok in haystack for tok in ("uv tool", "pip install", "self-update")
-            ):
-                found.append(f"pid {pid}")
-        except Exception:
-            continue
-    return found
+    if isinstance(value, ProcessSafety):
+        return value
+    identities = [str(item) for item in value]
+    if not identities:
+        return ProcessSafety(state=ProcessSafetyState.SAFE, detail="no other OpenAgent process")
+    return ProcessSafety(
+        state=ProcessSafetyState.ACTIVE_IDLE_PROCESS,
+        identities=identities[:5],
+        detail="another OpenAgent process is live",
+    )
 
 
 def _staged_binary_name() -> str:
@@ -1605,6 +1661,8 @@ def _vcs_result(
     doctor_exit_code: int | None = None,
     backup_path: str | None = None,
     rolled_back: bool = False,
+    metadata_persisted: bool = True,
+    status: str = "installed",
 ) -> SelfUpdateResult:
     return SelfUpdateResult(
         plan=plan,
@@ -1617,6 +1675,8 @@ def _vcs_result(
         doctor_exit_code=doctor_exit_code,
         backup_path=backup_path,
         rolled_back=rolled_back,
+        metadata_persisted=metadata_persisted,
+        status=status,
     )
 
 
@@ -1756,20 +1816,21 @@ def _perform_vcs_update_locked(
     target_version = plan.latest_version
     active = Path(plan.active_executable)
 
-    # Active-process safety (spec §14). --force may bypass a *process* probe, but the guarantee that
-    # active runs are never corrupted comes from the DB-tracked run layer, not from this heuristic.
-    others = process_probe()
-    if others and not force:
+    # Active-process safety (spec §3.1). --force is an override for an idle second process only.
+    # An active run, an open TUI, or a probe that could not run all block regardless of --force:
+    # the first two are live writers, and the third is an unanswered question, not a clear result.
+    safety = _coerce_safety(process_probe())
+    if not update_permitted(safety, force=force):
         return _vcs_result(
             plan,
             ok=False,
             ran=False,
-            error_type="process_active",
-            detail=(
-                "OpenAgent is currently running in another process "
-                f"({', '.join(others[:5])}). Close it or finish active runs before updating, "
-                "or pass --force."
+            error_type=(
+                "process_unknown"
+                if safety.state is ProcessSafetyState.UNKNOWN
+                else "process_active"
             ),
+            detail=describe_process_block(safety, force=force),
         )
 
     # 1) Stage the exact commit into an isolated tool area and prove it before touching the active
@@ -1930,6 +1991,8 @@ def _perform_vcs_update_locked(
     python_version = (
         install_argv[install_argv.index("--python") + 1] if "--python" in install_argv else "3.12"
     )
+    metadata_persisted = True
+    metadata_error: str | None = None
     try:
         metadata_writer(
             InstallMetadata(
@@ -1946,10 +2009,13 @@ def _perform_vcs_update_locked(
             ),
             environ=environment,
         )
-    except (
-        Exception
-    ):  # pragma: no cover - metadata is advisory; a write failure must not fail a good update
-        pass
+    except Exception as exc:  # noqa: BLE001 - any writer failure must be reported, not swallowed
+        # The binary is installed and verified, so this is not a failed update. But it is not an
+        # ordinary success either: without install.json this installation cannot say which channel
+        # it follows or which commit it last accepted, so the next update has to fail closed. The
+        # exception *class* is reported; its message may contain arbitrary local paths.
+        metadata_persisted = False
+        metadata_error = exc.__class__.__name__
 
     channel_name = plan.channel.value if plan.channel else "candidate"
     revised = plan.model_copy(
@@ -1961,6 +2027,17 @@ def _perform_vcs_update_locked(
             "detail": f"updated to {verified} on the {channel_name} channel and verified",
         }
     )
+    success_detail = (
+        f"updated to {verified} (commit {installed_commit[:12]}) on the {channel_name} "
+        "channel; exact executable, commit, and Doctor verified"
+    )
+    if not metadata_persisted:
+        success_detail = (
+            f"OpenAgent was updated to {verified} (commit {installed_commit[:12]}) successfully, "
+            f"but update-channel metadata could not be persisted ({metadata_error}). This "
+            f"installation can no longer prove its channel or last accepted commit, so the next "
+            f"update will refuse to run until it is restored. Run: openagent update --repair"
+        )
     return _vcs_result(
         revised,
         ok=True,
@@ -1969,8 +2046,7 @@ def _perform_vcs_update_locked(
         verified_commit=installed_commit,
         doctor_exit_code=doctor.returncode,
         backup_path=backup,
-        detail=(
-            f"updated to {verified} (commit {installed_commit[:12]}) on the {channel_name} "
-            "channel; exact executable, commit, and Doctor verified"
-        ),
+        metadata_persisted=metadata_persisted,
+        status="installed" if metadata_persisted else "installed_with_metadata_warning",
+        detail=success_detail,
     )
