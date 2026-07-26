@@ -627,12 +627,24 @@ jobs:
         shell: powershell
         run: |
           $log = "$env:RUNNER_TEMP\feature.log"
-          & "$env:GITHUB_WORKSPACE\setup.ps1" *> $log
-          if ($LASTEXITCODE -eq 0) { Write-Error "a non-channel commit was accepted as a production install"; exit 1 }
-          Get-Content $log
-          $text = Get-Content $log -Raw
+          # setup.ps1's Fail writes with [Console]::Error.WriteLine, which goes to the process's
+          # raw stderr handle and ignores PowerShell stream redirection — so running it in-process
+          # and redirecting with `*>` captured nothing, and the assertion below read an empty log
+          # while the real (correct) refusal went to the job output. Running it as a child process
+          # makes its stderr an ordinary redirectable stream, and matches how a user invokes it.
+          $proc = Start-Process -FilePath "powershell" `
+            -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$env:GITHUB_WORKSPACE\setup.ps1") `
+            -RedirectStandardOutput "$log.out" -RedirectStandardError "$log.err" `
+            -Wait -PassThru -NoNewWindow
+          Get-Content "$log.out", "$log.err" -ErrorAction SilentlyContinue | Set-Content $log
+          Write-Host "--- installer output (exit $($proc.ExitCode)) ---"
+          Get-Content $log -ErrorAction SilentlyContinue
+          Write-Host "--- end ---"
+          if ($proc.ExitCode -eq 0) { Write-Error "a non-channel commit was accepted as a production install"; exit 1 }
+          $text = (Get-Content $log -Raw -ErrorAction SilentlyContinue)
           if ($text -notmatch "is not on the|not a published stable release") { Write-Error "wrong refusal reason"; exit 1 }
           if ($text -notmatch "OPENAGENT_SETUP_LOCAL=1") { Write-Error "refusal did not name the supported alternative"; exit 1 }
+          Write-Host "feature-branch commit correctly refused"
 
   installer-windows:
     name: installer (windows-latest, ${{ matrix.shell }})
