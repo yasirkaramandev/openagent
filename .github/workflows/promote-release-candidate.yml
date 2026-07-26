@@ -1,0 +1,159 @@
+name: Promote release-candidate
+
+# Fast-forwards the protected `release-candidate` branch to an exact, fully-verified commit so the
+# `openagent update` candidate channel installs it (spec §7.1). This is the *only* sanctioned writer
+# of `release-candidate`; the branch is otherwise force-push- and deletion-protected. A draft PR head
+# is never a promotion target — only a commit that passes every gate below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: "Exact 40-hex commit to promote to release-candidate"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: promote-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: ${{ inputs.target_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate the target SHA is 40-hex
+        run: |
+          if ! printf '%s' "$TARGET" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::target_sha must be an exact 40-hex commit; got '$TARGET'"
+            exit 1
+          fi
+
+      - name: Check out the full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the commit exists in this repository
+        run: |
+          git cat-file -e "${TARGET}^{commit}" 2>/dev/null || {
+            echo "::error::commit $TARGET is not present in this repository"; exit 1; }
+
+      - name: Verify the version is a valid PEP 440 prerelease
+        run: |
+          python3 - "$TARGET" <<'PY'
+          import re, subprocess, sys
+          sha = sys.argv[1]
+          blob = subprocess.check_output(
+              ["git", "show", f"{sha}:src/openagent/__init__.py"], text=True)
+          m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', blob)
+          if not m:
+              print("::error::could not read __version__ at the target commit"); sys.exit(1)
+          version = m.group(1)
+          try:
+              from packaging.version import Version
+          except ModuleNotFoundError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "packaging"])
+              from packaging.version import Version
+          v = Version(version)  # raises InvalidVersion → PEP 440 violation
+          if not v.is_prerelease:
+              print(f"::error::candidate target {version} is not a prerelease; use the stable release flow")
+              sys.exit(1)
+          print(f"target version {version} is a valid PEP 440 prerelease")
+          PY
+
+      - name: Require every CI check and CodeQL to be successful on the target
+        run: |
+          # This gate matched against *job ids* (`installer-unix`, `wheel-lifecycle`) while GitHub
+          # reports check runs by *display name* (`installer (ubuntu-latest)`, `wheel fresh +
+          # v0.1.2 upgrade/backup restore`). Four of the nine required names therefore matched
+          # nothing, and a name that matches nothing produced no hits — which the old logic could
+          # only report as a failure, meaning this gate had never actually passed.
+          #
+          # Two rules now, in this order. First: *every* check run on the commit must be a
+          # completed success, so a new job is covered the moment it is added and a pending one
+          # cannot be mistaken for an absent one. Second: a required set must be present, so a
+          # commit that simply never ran the suite cannot pass by having nothing to fail.
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET}/check-runs" --paginate \
+            --jq '[.check_runs[] | {name, status, conclusion}]' > checks.json
+          python3 - "$TARGET" <<'PY'
+          import json, sys
+
+          target = sys.argv[1]
+          runs = json.load(open("checks.json"))
+          if not runs:
+              sys.exit(f"::error::no check runs at all on {target}; refusing to promote")
+
+          for run in sorted(runs, key=lambda r: r["name"] or ""):
+              print(f"  {run['name']}: {run['status']}/{run['conclusion']}")
+
+          bad = [
+              r for r in runs
+              if r["status"] != "completed" or r["conclusion"] != "success"
+          ]
+          if bad:
+              names = ", ".join(f"{r['name']} ({r['conclusion'] or r['status']})" for r in bad)
+              sys.exit(f"::error::not every check is green on {target}: {names}")
+
+          # Substrings of real check-run display names, verified against this repository's
+          # workflows. Keep in sync when a job is renamed — a stale entry fails closed here rather
+          # than silently waving a commit through.
+          required = [
+              "test (",
+              "textual-compat",
+              "container-sandbox",
+              "wheel fresh",
+              "smoke (",
+              "installer (ubuntu",
+              "installer (macos",
+              "installer (windows",
+              "production install (ubuntu",
+              "production install (macos",
+              "production install (windows",
+              "codeql",
+          ]
+          present = [(r["name"] or "").lower() for r in runs]
+          missing = [n for n in required if not any(n.lower() in p for p in present)]
+          if missing:
+              sys.exit(f"::error::required checks never ran on {target}: {', '.join(missing)}")
+          print(f"all {len(runs)} checks green, and every required check ran")
+          PY
+
+      - name: Require a fast-forward-only promotion
+        run: |
+          if git show-ref --verify --quiet refs/remotes/origin/release-candidate; then
+            current="$(git rev-parse refs/remotes/origin/release-candidate)"
+            if [ "$current" = "$TARGET" ]; then
+              echo "release-candidate is already at $TARGET; nothing to do"; exit 0
+            fi
+            if ! git merge-base --is-ancestor "$current" "$TARGET"; then
+              echo "::error::$TARGET is not a fast-forward of release-candidate ($current)"; exit 1
+            fi
+            echo "fast-forward: $current -> $TARGET"
+          else
+            echo "first promotion: release-candidate does not exist yet"
+          fi
+
+      - name: Build the wheel and run a clean wheel smoke
+        run: |
+          python3 -m pip install -q --upgrade build
+          git checkout -q "$TARGET"
+          python3 -m build --wheel --outdir dist_promote
+          wheel="$(ls dist_promote/*.whl | head -1)"
+          python3 -m venv /tmp/smoke && . /tmp/smoke/bin/activate
+          pip install -q "$wheel"
+          openagent version
+          openagent --help >/dev/null
+          deactivate
+
+      - name: Fast-forward release-candidate to the target
+        run: |
+          git push origin "${TARGET}:refs/heads/release-candidate"
+          echo "promoted release-candidate to $TARGET" >> "$GITHUB_STEP_SUMMARY"

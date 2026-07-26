@@ -11,13 +11,19 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, release-candidate]
+  # Releases are prepared as a stack: a fix branch based on a release branch, merged down. Scanning
+  # only PRs that target `main` meant an entire release candidate could be built, promoted, and
+  # soaked without CodeQL ever seeing it — the scan arrived after the decisions it was meant to
+  # inform. Release and fix branches are therefore scanned as their own PR targets.
   pull_request:
-    branches: [main]
+    branches: [main, release-candidate, "release/**", "fix/**"]
   schedule:
     # Weekly, so a newly published query finds an existing vulnerability without waiting for the
     # next commit to this repository.
     - cron: "27 4 * * 1"
+  # So a scan can be demanded on any ref at release time rather than waiting for a qualifying push.
+  workflow_dispatch:
 
 concurrency:
   group: codeql-${{ github.ref }}
