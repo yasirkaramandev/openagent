@@ -22,6 +22,34 @@ function Fail([string]$Stage, [string]$What, [string]$Fix) {
     exit 1
 }
 
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+    Run a native command, letting it write to stderr, and return its exit code.
+
+    .DESCRIPTION
+    Windows PowerShell 5.1 turns a native command's stderr output into ErrorRecords, and this
+    script sets $ErrorActionPreference = "Stop" — so an ordinary progress line aborts the
+    installer. uv writes both "Downloading cpython-3.12.13…" and "Python 3.12 is already
+    installed" to stderr, which meant the installer could fail either while doing its job or
+    while discovering it had nothing to do.
+
+    Suppressing stderr is the wrong fix: real errors live there too. The preference is instead
+    narrowed to this one call, the output is shown, and the *exit code* decides success — which is
+    what it was always supposed to decide.
+    #>
+    param([Parameter(Mandatory = $true)][scriptblock]$Command)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command 2>&1 | ForEach-Object { Write-Host $_ }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Find-Uv {
     $command = Get-Command uv -ErrorAction SilentlyContinue
     if ($null -ne $command) { return $command.Source }
@@ -85,13 +113,8 @@ try {
     }
 
     Write-Step "[2/6] Installing managed Python 3.12 (system/Store Python is untouched)"
-    # `2>&1 |` merges uv's stderr into the success stream. Without it, re-running setup.ps1 fails:
-    # $ErrorActionPreference = "Stop" makes Windows PowerShell 5.1 treat *any* native stderr output
-    # as a terminating error, and uv writes "Python 3.12 is already installed" to stderr when it has
-    # nothing to do. So the second run of the installer died at step 2 with a message saying the
-    # thing it wanted was already true. The exit code is still what decides success.
-    & $Uv python install 3.12 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) {
+    $code = Invoke-Native { & $Uv python install 3.12 }
+    if ($code -ne 0) {
         Fail "install-python" "uv could not install managed Python 3.12" "Check network/proxy access, then re-run setup.ps1."
     }
 
@@ -161,8 +184,10 @@ try {
         $InstallSource = "git+$OfficialRemote@$InstallCommit"
         $InstallSourceKind = "official-github-vcs"
     }
-    & $Uv tool install --force --python 3.12 $InstallSource
-    if ($LASTEXITCODE -ne 0) {
+    # Same stderr hazard: uv emits warnings here too ("Failed to hardlink files; falling back to
+    # full copy" is routine on a CI runner and must not abort an otherwise good install).
+    $code = Invoke-Native { & $Uv tool install --force --python 3.12 $InstallSource }
+    if ($code -ne 0) {
         Fail "install-openagent" "uv tool install failed for $InstallSource" "Check the dependency error above, then re-run setup.ps1."
     }
     $ToolBin = (& $Uv tool dir --bin | Select-Object -First 1).Trim()
