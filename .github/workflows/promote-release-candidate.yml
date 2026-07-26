@@ -46,6 +46,25 @@ jobs:
           git cat-file -e "${TARGET}^{commit}" 2>/dev/null || {
             echo "::error::commit $TARGET is not present in this repository"; exit 1; }
 
+      # `release-candidate` requires linear history, so a merge commit is rejected — but only at
+      # the very end, by the remote, after every gate has already run and passed. Checking it here
+      # turns a confusing "protected branch hook declined" into a statement of what is wrong and
+      # what to promote instead. A release branch is folded down with a fast-forward or a rebase
+      # precisely so its head stays promotable; `gh pr merge --merge` produces a head that is not.
+      - name: Verify the target is not a merge commit
+        run: |
+          parents="$(git rev-list --parents -n 1 "$TARGET" | wc -w)"
+          if [ "$parents" -gt 2 ]; then
+            first_parent="$(git rev-parse "${TARGET}^1")"
+            echo "::error::$TARGET is a merge commit, and release-candidate requires linear history."
+            echo "::error::Promote a linear commit instead — often this merge's second parent, whose"
+            echo "::error::tree is identical when the merge was a fast-forward equivalent."
+            echo "first parent:  $first_parent"
+            git rev-parse "${TARGET}^2" 2>/dev/null | sed 's/^/second parent: /' || true
+            exit 1
+          fi
+          echo "$TARGET is a single-parent commit"
+
       - name: Verify the version is a valid PEP 440 prerelease
         run: |
           python3 - "$TARGET" <<'PY'
