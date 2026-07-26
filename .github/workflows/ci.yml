@@ -265,11 +265,140 @@ jobs:
       - name: Build package
         run: python -m build
 
+  # Production install (§3.4). The installer-unix / installer-windows jobs below all set
+  # OPENAGENT_SETUP_LOCAL=1, which means every installer job we had was testing the *developer*
+  # path — installing a working tree. The thing users actually run was never exercised: install
+  # from the official VCS URL at an exact commit, with PEP 610 provenance and channel metadata to
+  # prove it. That is what this job does, and it asserts the provenance rather than assuming it.
+  #
+  # It installs the current release-candidate tip, not this PR's commit, because a PR commit is not
+  # on a channel — and refusing it is the point of §3.5, asserted directly in the last step.
+  installer-production:
+    name: production install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      OPENAGENT_SETUP_NO_LAUNCH: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Deliberately awkward paths: a space and a non-ASCII segment, plus custom UV_TOOL_DIR and
+      # OPENAGENT_HOME. Installers break on exactly these and nowhere else.
+      - name: Isolate uv and OpenAgent directories (spaces + non-ASCII)
+        run: |
+          base="$RUNNER_TEMP/oa production/kurulum-öçşğü"
+          mkdir -p "$base"
+          {
+            echo "UV_TOOL_DIR=$base/uv/tools"
+            echo "UV_TOOL_BIN_DIR=$base/uv/bin"
+            echo "UV_PYTHON_INSTALL_DIR=$base/uv/py"
+            echo "OPENAGENT_HOME=$base/home"
+            echo "OPENAGENT_DATA_DIR=$base/data"
+            echo "OPENAGENT_CONFIG_DIR=$base/config"
+            echo "OA_BASE=$base"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve the exact release-candidate commit
+        run: |
+          sha="$(git ls-remote https://github.com/yasirkaramandev/openagent.git \
+                 refs/heads/release-candidate | cut -f1)"
+          test -n "$sha" || { echo "could not resolve release-candidate"; exit 1; }
+          echo "CANDIDATE_SHA=$sha" >> "$GITHUB_ENV"
+          echo "installing exact commit $sha"
+
+      - name: Production install from the official repository at that exact commit
+        run: |
+          checkout="$OA_BASE/checkout"
+          git clone --quiet https://github.com/yasirkaramandev/openagent.git "$checkout"
+          git -C "$checkout" checkout --quiet "$CANDIDATE_SHA"
+          git -C "$checkout" rev-parse HEAD > "$OA_BASE/checkout-head-before"
+          # No OPENAGENT_SETUP_LOCAL: this is the real production path.
+          bash "$checkout/setup.sh"
+
+      - name: Provenance is an official exact-commit VCS install
+        run: |
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          direct_url="$(find "$UV_TOOL_DIR" -name direct_url.json | head -1)"
+          test -n "$direct_url" || { echo "no direct_url.json: not a VCS install"; exit 1; }
+          cat "$direct_url"
+          python3 - "$direct_url" "$CANDIDATE_SHA" <<'PY'
+          import json, sys
+          payload = json.load(open(sys.argv[1]))
+          assert payload["url"].endswith("yasirkaramandev/openagent.git"), payload["url"]
+          info = payload["vcs_info"]
+          assert info["vcs"] == "git", info
+          assert info["commit_id"] == sys.argv[2], (info["commit_id"], sys.argv[2])
+          print("direct_url.json: official repository at the exact target commit")
+          PY
+
+      - name: install.json records the channel and the accepted commit
+        run: |
+          cat "$OPENAGENT_HOME/install.json"
+          python3 - "$OPENAGENT_HOME/install.json" "$CANDIDATE_SHA" <<'PY'
+          import json, sys
+          meta = json.load(open(sys.argv[1]))
+          assert meta["source"] == "official-github-vcs", meta["source"]
+          assert meta["repository"] == "yasirkaramandev/openagent", meta["repository"]
+          assert meta["channel"] in {"candidate", "stable"}, meta["channel"]
+          assert meta["installed_commit"] == sys.argv[2], meta["installed_commit"]
+          assert meta["last_accepted_commit"] == sys.argv[2], meta["last_accepted_commit"]
+          print("install.json: channel + exact accepted commit recorded")
+          PY
+
+      - name: PATH resolves the installed executable, version and doctor are sane
+        run: |
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          resolved="$(command -v openagent)"
+          test "$resolved" = "$UV_TOOL_BIN_DIR/openagent" || { echo "PATH resolves $resolved"; exit 1; }
+          openagent version
+          openagent doctor --json > "$OA_BASE/doctor.json" || true
+          python3 -c "import json,sys; json.load(open(sys.argv[1])); print('doctor json ok')" "$OA_BASE/doctor.json"
+
+      - name: "update --check is a clean no-op on the freshly installed commit"
+        run: |
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          openagent update --check --json > "$OA_BASE/update.json" || true
+          python3 - "$OA_BASE/update.json" <<'PY'
+          import json, sys
+          payload = json.load(open(sys.argv[1]))
+          print(json.dumps(payload)[:400])
+          PY
+
+      - name: Second production install is idempotent and leaves the checkout untouched
+        run: |
+          checkout="$OA_BASE/checkout"
+          bash "$checkout/setup.sh"
+          git -C "$checkout" rev-parse HEAD > "$OA_BASE/checkout-head-after"
+          diff "$OA_BASE/checkout-head-before" "$OA_BASE/checkout-head-after"
+          test -z "$(git -C "$checkout" status --porcelain)" \
+            || { echo "installer dirtied the checkout:"; git -C "$checkout" status --short; exit 1; }
+
+      # §3.5: this PR's own commit is reachable from an official ref (refs/pull/N/head), which is
+      # exactly what the old membership test accepted. It is not on a channel, so it must be
+      # refused as a production install source — and the refusal must name the supported way in.
+      - name: A feature-branch commit is refused as a production install source
+        run: |
+          if bash setup.sh > "$RUNNER_TEMP/feature.log" 2>&1; then
+            echo "FAIL: a non-channel commit was accepted as a production install"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/feature.log"
+          grep -qi "is not on the\|not a published stable release" "$RUNNER_TEMP/feature.log"
+          grep -q "OPENAGENT_SETUP_LOCAL=1" "$RUNNER_TEMP/feature.log"
+
   # Real installer jobs (§5). These deliberately do NOT use actions/setup-python — the point is to
   # simulate a machine where the user has not installed Python, and prove setup.sh / setup.bat bring
   # their own managed Python via uv. They need network access (uv + managed Python + PyPI), so they
   # are a separate, clearly named job. uv's tool/python dirs are redirected into RUNNER_TEMP so the
   # runner's real environment is not polluted.
+  #
+  # These are the *developer* install path (OPENAGENT_SETUP_LOCAL=1). The production path is
+  # covered by installer-production above; neither substitutes for the other.
   installer-unix:
     name: installer (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -397,6 +526,93 @@ jobs:
           fi
           grep "database backup:" "$RUNNER_TEMP/migration.log"
           grep "stage : verify-migration" "$RUNNER_TEMP/migration.log"
+
+  # Windows production install (§3.4). Same contract as installer-production, through both Windows
+  # entrypoints: setup.bat from CMD and setup.ps1 from PowerShell. Windows is where a production
+  # install path is most likely to be broken and least likely to be noticed.
+  installer-production-windows:
+    name: production install (windows-latest, ${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [cmd, powershell]
+    env:
+      OPENAGENT_SETUP_NO_LAUNCH: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Isolate uv and OpenAgent directories (path with a space)
+        shell: cmd
+        run: |
+          mkdir "%RUNNER_TEMP%\oa production" 2>nul
+          echo UV_TOOL_DIR=%RUNNER_TEMP%\oa production\uv\tools>> "%GITHUB_ENV%"
+          echo UV_TOOL_BIN_DIR=%RUNNER_TEMP%\oa production\uv\bin>> "%GITHUB_ENV%"
+          echo UV_PYTHON_INSTALL_DIR=%RUNNER_TEMP%\oa production\uv\py>> "%GITHUB_ENV%"
+          echo OPENAGENT_HOME=%RUNNER_TEMP%\oa production\home>> "%GITHUB_ENV%"
+          echo OA_BASE=%RUNNER_TEMP%\oa production>> "%GITHUB_ENV%"
+
+      - name: Resolve the exact release-candidate commit and clone it
+        shell: powershell
+        run: |
+          $sha = (& git ls-remote https://github.com/yasirkaramandev/openagent.git refs/heads/release-candidate).Split("`t")[0]
+          if (-not $sha) { Write-Error "could not resolve release-candidate"; exit 1 }
+          "CANDIDATE_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & git clone --quiet https://github.com/yasirkaramandev/openagent.git "$env:OA_BASE\checkout"
+          & git -C "$env:OA_BASE\checkout" checkout --quiet $sha
+          Write-Host "installing exact commit $sha"
+
+      - name: Production install through CMD (setup.bat)
+        if: matrix.shell == 'cmd'
+        shell: cmd
+        run: |
+          cd /d "%OA_BASE%\checkout"
+          call setup.bat
+          if errorlevel 1 exit /b 1
+
+      - name: Production install through PowerShell (setup.ps1)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: |
+          & "$env:OA_BASE\checkout\setup.ps1"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Provenance, channel metadata, PATH, version, and doctor
+        shell: powershell
+        run: |
+          $env:PATH = "$env:UV_TOOL_BIN_DIR;$env:PATH"
+          $du = Get-ChildItem -Path $env:UV_TOOL_DIR -Recurse -Filter direct_url.json | Select-Object -First 1
+          if (-not $du) { Write-Error "no direct_url.json: not a VCS install"; exit 1 }
+          $payload = Get-Content $du.FullName -Raw | ConvertFrom-Json
+          if (-not $payload.url.EndsWith("yasirkaramandev/openagent.git")) { Write-Error "unexpected url $($payload.url)"; exit 1 }
+          if ($payload.vcs_info.commit_id -ne $env:CANDIDATE_SHA) { Write-Error "commit $($payload.vcs_info.commit_id) != $env:CANDIDATE_SHA"; exit 1 }
+          Write-Host "direct_url.json: official repository at the exact target commit"
+
+          $meta = Get-Content "$env:OPENAGENT_HOME\install.json" -Raw | ConvertFrom-Json
+          if ($meta.source -ne "official-github-vcs") { Write-Error "source $($meta.source)"; exit 1 }
+          if ($meta.installed_commit -ne $env:CANDIDATE_SHA) { Write-Error "installed_commit $($meta.installed_commit)"; exit 1 }
+          if ($meta.last_accepted_commit -ne $env:CANDIDATE_SHA) { Write-Error "last_accepted_commit $($meta.last_accepted_commit)"; exit 1 }
+          Write-Host "install.json: channel + exact accepted commit recorded"
+
+          $cmd = Get-Command openagent -ErrorAction Stop
+          Write-Host "PATH: $($cmd.Source)"
+          & openagent version
+          & openagent doctor --json > "$env:OA_BASE\doctor.json"
+          $null = Get-Content "$env:OA_BASE\doctor.json" -Raw | ConvertFrom-Json
+          Write-Host "doctor json ok"
+
+      - name: A feature-branch commit is refused as a production install source
+        shell: powershell
+        run: |
+          $log = "$env:RUNNER_TEMP\feature.log"
+          & "$env:GITHUB_WORKSPACE\setup.ps1" *> $log
+          if ($LASTEXITCODE -eq 0) { Write-Error "a non-channel commit was accepted as a production install"; exit 1 }
+          Get-Content $log
+          $text = Get-Content $log -Raw
+          if ($text -notmatch "is not on the|not a published stable release") { Write-Error "wrong refusal reason"; exit 1 }
+          if ($text -notmatch "OPENAGENT_SETUP_LOCAL=1") { Write-Error "refusal did not name the supported alternative"; exit 1 }
 
   installer-windows:
     name: installer (windows-latest, ${{ matrix.shell }})

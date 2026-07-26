@@ -96,7 +96,14 @@ try {
     $OfficialRemote = "https://github.com/yasirkaramandev/openagent.git"
     $LocalDev = ($env:OPENAGENT_SETUP_LOCAL -eq "1")
     $InstallChannel = if ($ExpectedVersion -match "(rc|a\d|b\d|dev)") { "candidate" } else { "stable" }
+    if ($env:OPENAGENT_SETUP_CHANNEL) {
+        if ($env:OPENAGENT_SETUP_CHANNEL -notin @("stable", "candidate", "dev")) {
+            Fail "install-openagent" "unknown OPENAGENT_SETUP_CHANNEL '$($env:OPENAGENT_SETUP_CHANNEL)'" "Choose stable, candidate, or dev."
+        }
+        $InstallChannel = $env:OPENAGENT_SETUP_CHANNEL
+    }
     $InstallCommit = ""
+    $ChannelSourceRef = $null
     if ($LocalDev) {
         Write-Step "[3/6] Installing OpenAgent from this checkout (local-development mode)"
         $InstallSource = $RepoRoot
@@ -111,14 +118,41 @@ try {
             Fail "install-openagent" "this directory is not a git checkout" "Set OPENAGENT_SETUP_LOCAL=1 to install from this directory instead."
         }
         $InstallCommit = $InstallCommit.Trim()
-        # GitHub serves any commit reachable from an advertised ref, so fetching the SHA directly is
-        # a precise membership test for the official repository (spec §20.3): it succeeds for a
-        # commit on any official branch and fails for a local-only or fork commit.
-        & git -C $RepoRoot fetch -q $OfficialRemote $InstallCommit 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            Fail "install-openagent" "commit $InstallCommit is not available from the official repository" "Push it to an official branch first, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+        # Fail closed unless this exact commit is on the *channel being installed* (spec §3.5).
+        # Reachable-from-some-official-ref is not enough: GitHub serves every commit on every
+        # branch, so the old test accepted any feature branch. stable = a published non-prerelease
+        # tag; candidate = the release-candidate branch; dev = main. Anything else is a development
+        # install and must say so with OPENAGENT_SETUP_LOCAL=1.
+        if ($InstallChannel -eq "stable") {
+            $TagMatch = $null
+            $Tags = & git ls-remote --tags $OfficialRemote 2>$null
+            foreach ($line in @($Tags)) {
+                $parts = $line -split "\s+"
+                if ($parts.Count -ge 2 -and $parts[0] -eq $InstallCommit) {
+                    $name = $parts[1] -replace "\^\{\}$", "" -replace "^refs/tags/", ""
+                    if ($name -notmatch "(rc|a\d|b\d|dev)") { $TagMatch = $name; break }
+                }
+            }
+            if (-not $TagMatch) {
+                Fail "install-openagent" "commit $InstallCommit is not a published stable release of the official repository" "Check out a release tag, use OPENAGENT_SETUP_CHANNEL=candidate or dev, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+            }
+            $ChannelSourceRef = "refs/tags/$TagMatch"
+        } else {
+            $ChannelSourceRef = if ($InstallChannel -eq "candidate") { "refs/heads/release-candidate" } else { "refs/heads/main" }
+            & git -C $RepoRoot fetch -q $OfficialRemote $ChannelSourceRef 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "install-openagent" "could not read $ChannelSourceRef from the official repository" "Check your network / proxy, then re-run."
+            }
+            $ChannelTip = (& git -C $RepoRoot rev-parse FETCH_HEAD 2>$null)
+            if (-not $ChannelTip) {
+                Fail "install-openagent" "could not resolve the tip of $ChannelSourceRef" "Re-run setup.ps1."
+            }
+            & git -C $RepoRoot merge-base --is-ancestor $InstallCommit $ChannelTip.Trim() 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "install-openagent" "commit $InstallCommit is not on the $InstallChannel channel ($ChannelSourceRef)" "Feature-branch commits are not an install source. Check out a channel commit, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+            }
         }
-        Write-Step "[3/6] Installing OpenAgent from official commit $InstallCommit ($InstallChannel channel)"
+        Write-Step "[3/6] Installing OpenAgent from official commit $InstallCommit ($InstallChannel channel, $ChannelSourceRef)"
         $InstallSource = "git+$OfficialRemote@$InstallCommit"
         $InstallSourceKind = "official-github-vcs"
     }
@@ -145,7 +179,7 @@ try {
             source                = $InstallSourceKind
             repository            = "yasirkaramandev/openagent"
             channel               = $InstallChannel
-            channel_ref           = if ($InstallChannel -eq "candidate") { "release-candidate" } else { $null }
+            channel_ref           = switch ($InstallChannel) { "candidate" { "release-candidate" } "dev" { "main" } default { $null } }
             installed_version     = $ExpectedVersion
             installed_commit      = if ($InstallCommit) { $InstallCommit } else { $null }
             last_accepted_version = $ExpectedVersion

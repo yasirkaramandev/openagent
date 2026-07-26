@@ -120,10 +120,18 @@ case "${1:-}" in --local-development) LOCAL_DEV=1 ;; esac
 
 # Infer the update channel from the source version: a prerelease tracks the candidate channel, a
 # final release tracks stable. The value is a valid OpenAgentUpdateChannel; the install *source*
-# (official-github-vcs vs dev-local) is recorded separately.
+# (official-github-vcs vs dev-local) is recorded separately. OPENAGENT_SETUP_CHANNEL overrides the
+# inference, which is how `dev` (main) is selected — it is never inferred.
 INSTALL_CHANNEL="stable"
 case "$EXPECTED_VERSION" in
     *rc*|*a[0-9]*|*b[0-9]*|*dev*|*.dev*) INSTALL_CHANNEL="candidate" ;;
+esac
+case "${OPENAGENT_SETUP_CHANNEL:-}" in
+    "") ;;
+    stable|candidate|dev) INSTALL_CHANNEL="${OPENAGENT_SETUP_CHANNEL}" ;;
+    *) die "install-openagent" \
+           "unknown OPENAGENT_SETUP_CHANNEL '${OPENAGENT_SETUP_CHANNEL}'" \
+           "Choose stable, candidate, or dev." ;;
 esac
 
 if [ "$LOCAL_DEV" = "1" ]; then
@@ -142,16 +150,49 @@ else
         || die "install-openagent" "this directory is not a git checkout" \
                "Set OPENAGENT_SETUP_LOCAL=1 to install from this directory instead."
     INSTALL_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-    # Fail closed unless this exact commit exists in the official repository. GitHub serves any
-    # commit reachable from an advertised ref (any branch or tag), so fetching the SHA directly is a
-    # precise membership test: it succeeds for a commit pushed to any official branch and fails for a
-    # commit that was only ever local or lives in a fork (spec §20.3). It also never writes a
-    # persistent ref into the user's checkout.
-    git -C "$REPO_ROOT" fetch -q "$OFFICIAL_REMOTE" "$INSTALL_COMMIT" 2>/dev/null \
-        || die "install-openagent" \
-               "commit $INSTALL_COMMIT is not available from the official repository" \
-               "Push it to an official branch first, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
-    say "[3/6] Installing OpenAgent from official commit ${INSTALL_COMMIT} (${INSTALL_CHANNEL} channel)"
+    # Fail closed unless this exact commit is on the *channel being installed* (spec §3.5). Being
+    # reachable from some official ref is not enough: GitHub serves every commit on every branch, so
+    # the old membership test accepted any feature branch — an unreviewed WIP commit could become a
+    # production install with `channel: stable` recorded next to it. Each channel has exactly one
+    # legitimate source:
+    #
+    #   stable    a published, non-prerelease release tag (the commit must *be* the tag)
+    #   candidate the release-candidate branch (the commit must be on it)
+    #   dev       main (the commit must be on it)
+    #
+    # Anything else is a development install and has to say so via OPENAGENT_SETUP_LOCAL=1.
+    if [ "$INSTALL_CHANNEL" = "stable" ]; then
+        # Match the commit against published tags. Annotated tags are listed twice, as the tag object
+        # and as the dereferenced commit (`^{}`), so both forms are compared.
+        TAG_MATCH="$(git ls-remote --tags "$OFFICIAL_REMOTE" 2>/dev/null \
+            | awk -v c="$INSTALL_COMMIT" '$1 == c { sub(/\^\{\}$/, "", $2); sub(/^refs\/tags\//, "", $2); print $2; exit }')" \
+            || TAG_MATCH=""
+        case "$TAG_MATCH" in
+            *rc*|*a[0-9]*|*b[0-9]*|*dev*) TAG_MATCH="" ;;  # a prerelease tag is not the stable channel
+        esac
+        [ -n "$TAG_MATCH" ] \
+            || die "install-openagent" \
+                   "commit $INSTALL_COMMIT is not a published stable release of the official repository" \
+                   "Check out a release tag, use OPENAGENT_SETUP_CHANNEL=candidate or dev, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+        CHANNEL_SOURCE_REF="refs/tags/$TAG_MATCH"
+    else
+        [ "$INSTALL_CHANNEL" = "candidate" ] \
+            && CHANNEL_SOURCE_REF="refs/heads/release-candidate" \
+            || CHANNEL_SOURCE_REF="refs/heads/main"
+        # FETCH_HEAD only; no persistent ref is written into the user's checkout.
+        git -C "$REPO_ROOT" fetch -q "$OFFICIAL_REMOTE" "$CHANNEL_SOURCE_REF" 2>/dev/null \
+            || die "install-openagent" \
+                   "could not read $CHANNEL_SOURCE_REF from the official repository" \
+                   "Check your network / proxy, then re-run."
+        CHANNEL_TIP="$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD 2>/dev/null || echo '')"
+        [ -n "$CHANNEL_TIP" ] \
+            || die "install-openagent" "could not resolve the tip of $CHANNEL_SOURCE_REF"
+        git -C "$REPO_ROOT" merge-base --is-ancestor "$INSTALL_COMMIT" "$CHANNEL_TIP" 2>/dev/null \
+            || die "install-openagent" \
+                   "commit $INSTALL_COMMIT is not on the ${INSTALL_CHANNEL} channel ($CHANNEL_SOURCE_REF)" \
+                   "Feature-branch commits are not an install source. Check out a channel commit, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+    fi
+    say "[3/6] Installing OpenAgent from official commit ${INSTALL_COMMIT} (${INSTALL_CHANNEL} channel, ${CHANNEL_SOURCE_REF})"
     INSTALL_SOURCE="git+${OFFICIAL_REMOTE}@${INSTALL_COMMIT}"
     INSTALL_SOURCE_KIND="official-github-vcs"
 fi
@@ -175,7 +216,10 @@ if mkdir -p "$OA_HOME" 2>/dev/null; then
     META="$OA_HOME/install.json"
     META_TMP="$OA_HOME/.install.json.$$"
     CHANNEL_REF="null"
-    [ "$INSTALL_CHANNEL" = "candidate" ] && CHANNEL_REF='"release-candidate"'
+    case "$INSTALL_CHANNEL" in
+        candidate) CHANNEL_REF='"release-candidate"' ;;
+        dev) CHANNEL_REF='"main"' ;;
+    esac
     COMMIT_JSON="null"
     [ -n "$INSTALL_COMMIT" ] && COMMIT_JSON="\"$INSTALL_COMMIT\""
     NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
