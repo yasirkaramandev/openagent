@@ -91,6 +91,16 @@ jobs:
           if not runs:
               sys.exit(f"::error::no check runs at all on {target}; refusing to promote")
 
+          # This job's own check run. When the workflow is dispatched from the branch whose HEAD is
+          # the target, its check run lands on the target — so "every check must be green" would
+          # count the promotion against itself: in_progress on the first attempt, and `failure`
+          # forever afterwards, which permanently bricks an otherwise-good commit. Promotion
+          # attempts are not evidence about the commit; they are evidence about promotion.
+          SELF = "promote"
+          runs = [r for r in runs if (r["name"] or "").strip().lower() != SELF]
+          if not runs:
+              sys.exit(f"::error::no CI check runs on {target}; refusing to promote")
+
           for run in sorted(runs, key=lambda r: r["name"] or ""):
               print(f"  {run['name']}: {run['status']}/{run['conclusion']}")
 
