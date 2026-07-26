@@ -11,17 +11,18 @@ import asyncio
 import json
 import math
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from ..core.cancellation import RunCancellation
-from ..core.errors import ErrorType, classify_http_status, is_retryable
+from ..core.errors import ErrorType, classify_http_status, is_retryable, redact_secrets
 from ..core.limits import RUNTIME_LIMITS
+from .retry import RETRYABLE_STATUSES, RetryBudget, RetryPolicy, extract_request_id
 
-_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_RETRY_STATUSES = RETRYABLE_STATUSES
 
 #: A 202 means the provider queued the request and expects the caller to poll for a result. The chat
 #: runtime is synchronous and has no polling, so a 202 is an explicit, honest failure — never an empty
@@ -33,11 +34,29 @@ _ASYNC_MESSAGE = (
 
 
 class TransportError(Exception):
-    def __init__(self, error_type: ErrorType, message: str, status: int | None = None) -> None:
+    """A provider call that failed, carrying everything a user needs to act on it.
+
+    ``message`` is redacted at construction rather than at the point it is rendered. A provider
+    error body can echo the ``Authorization`` header it rejected, and this object is passed to
+    logs, events, the TUI and test output — redacting once, here, means no future caller can add a
+    fifth rendering path that forgets.
+    """
+
+    def __init__(
+        self,
+        error_type: ErrorType,
+        message: str,
+        status: int | None = None,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        message = redact_secrets(message)
         super().__init__(message)
         self.error_type = error_type
         self.message = message
         self.status = status
+        #: The provider's own correlation id, when it sent one. Opaque, quotable to their support.
+        self.request_id = request_id
 
 
 @dataclass
@@ -45,11 +64,37 @@ class Transport:
     base_url: str
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float | None = None
+    #: Wall-clock ceiling for one logical call — *all* of its attempts and backoff sleeps, not each
+    #: attempt separately. Before this was a shared budget, three retries of a 120s call could run
+    #: for over eight minutes and still be reported as a 120-second timeout (spec §8.3).
     total_timeout: float = 120.0
     max_retries: int = 3
     backoff_base: float = 1.0
+    backoff_max: float = 30.0
+    #: Equal jitter on backoff, so a fleet rate-limited at the same moment does not retry in unison.
+    retry_jitter: bool = True
     cancellation: RunCancellation | None = field(default=None, repr=False)
+    #: The provider correlation id from the most recent response, for diagnostics.
+    last_request_id: str | None = field(default=None, repr=False)
+    #: Injectable so the wall-clock budget is testable without spending real seconds. A test that
+    #: has to sleep 8 real seconds to prove a backoff bound does not get written, and the bound then
+    #: goes unverified.
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     _client: httpx.AsyncClient | None = field(default=None, repr=False)
+
+    def _budget(self) -> RetryBudget:
+        return RetryBudget(self.total_timeout, clock=self.clock)
+
+    def _policy(self) -> RetryPolicy:
+        """Read the live fields each call, so a caller may retune a transport after construction."""
+
+        return RetryPolicy(
+            max_retries=self.max_retries,
+            backoff_base=self.backoff_base,
+            backoff_max=self.backoff_max,
+            total_budget=self.total_timeout,
+            jitter=self.retry_jitter,
+        )
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -77,13 +122,24 @@ class Transport:
     # ------------------------------------------------------------------ requests
 
     async def post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """POST JSON with retry; returns parsed JSON or raises :class:`TransportError`."""
+        """POST JSON with retry; returns parsed JSON or raises :class:`TransportError`.
 
+        Every attempt and every backoff sleep is spent from one budget opened here, so the call
+        cannot outlive ``total_timeout`` no matter how the retries fall.
+        """
+
+        policy = self._policy()
+        budget = self._budget()
         attempt = 0
         while True:
+            if budget.exhausted:
+                raise TransportError(
+                    ErrorType.TIMEOUT, f"provider request exceeded {policy.total_budget:g} seconds"
+                )
             try:
                 response = await asyncio.wait_for(
-                    self.client().post(path, json=payload), timeout=self.total_timeout
+                    self.client().post(path, json=payload),
+                    timeout=budget.clamp(policy.total_budget),
                 )
             except (
                 TimeoutError,
@@ -91,34 +147,51 @@ class Transport:
                 httpx.TimeoutException,
                 httpx.TransportError,
             ) as exc:
-                if attempt >= self.max_retries:
+                delay = policy.delay_for(attempt)
+                if attempt >= policy.max_retries or not budget.allows(delay):
                     raise TransportError(ErrorType.TIMEOUT, str(exc)) from exc
-                await self._sleep(attempt, None)
+                await self._sleep(delay)
                 attempt += 1
                 continue
 
+            self.last_request_id = extract_request_id(response.headers)
             if response.status_code == 202:
-                raise TransportError(ErrorType.ASYNC_UNSUPPORTED, _ASYNC_MESSAGE, status=202)
+                raise TransportError(
+                    ErrorType.ASYNC_UNSUPPORTED,
+                    _ASYNC_MESSAGE,
+                    status=202,
+                    request_id=self.last_request_id,
+                )
             if response.status_code >= 400:
                 retry_after = _retry_after(response)
-                if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
-                    await self._sleep(attempt, retry_after)
+                delay = policy.delay_for(attempt, retry_after=retry_after)
+                if (
+                    response.status_code in _RETRY_STATUSES
+                    and attempt < policy.max_retries
+                    and budget.allows(delay)
+                ):
+                    await self._sleep(delay)
                     attempt += 1
                     continue
                 raise TransportError(
                     classify_http_status(response.status_code),
                     _error_text(response),
                     status=response.status_code,
+                    request_id=self.last_request_id,
                 )
             try:
                 data = response.json()
             except ValueError as exc:
                 raise TransportError(
-                    ErrorType.INVALID_REQUEST, "provider returned invalid JSON"
+                    ErrorType.INVALID_REQUEST,
+                    "provider returned invalid JSON",
+                    request_id=self.last_request_id,
                 ) from exc
             if not isinstance(data, dict):
                 raise TransportError(
-                    ErrorType.INVALID_REQUEST, "provider returned a non-object JSON body"
+                    ErrorType.INVALID_REQUEST,
+                    "provider returned a non-object JSON body",
+                    request_id=self.last_request_id,
                 )
             return data
 
@@ -131,40 +204,50 @@ class Transport:
         surface a clear error (spec §44). Retries before the first event use exponential backoff.
         """
 
+        policy = self._policy()
+        budget = self._budget()
         attempt = 0
         received_event = False
         malformed = 0
         data_lines = 0
-        deadline = time.monotonic() + self.total_timeout
         while True:
             try:
                 async with self.client().stream("POST", path, json=payload) as response:
+                    self.last_request_id = extract_request_id(response.headers)
                     if response.status_code == 202:
                         await response.aread()
                         raise TransportError(
-                            ErrorType.ASYNC_UNSUPPORTED, _ASYNC_MESSAGE, status=202
+                            ErrorType.ASYNC_UNSUPPORTED,
+                            _ASYNC_MESSAGE,
+                            status=202,
+                            request_id=self.last_request_id,
                         )
                     if response.status_code >= 400:
                         body = (await response.aread()).decode("utf-8", errors="replace")
                         retry_after = _retry_after(response)
+                        delay = policy.delay_for(attempt, retry_after=retry_after)
                         # Header errors arrive before any event, so retrying is still safe.
                         if (
                             response.status_code in _RETRY_STATUSES
-                            and attempt < self.max_retries
+                            and attempt < policy.max_retries
                             and not received_event
+                            and budget.allows(delay)
                         ):
-                            await self._sleep(attempt, retry_after)
+                            await self._sleep(delay)
                             attempt += 1
                             continue  # retry outer loop
                         raise TransportError(
                             classify_http_status(response.status_code),
                             body,
                             status=response.status_code,
+                            request_id=self.last_request_id,
                         )
                     async for line in response.aiter_lines():
-                        if time.monotonic() >= deadline:
+                        if budget.exhausted:
                             raise TransportError(
-                                ErrorType.TIMEOUT, "provider stream exceeded 120 seconds"
+                                ErrorType.TIMEOUT,
+                                f"provider stream exceeded {policy.total_budget:g} seconds",
+                                request_id=self.last_request_id,
                             )
                         stripped = line.strip()
                         if (
@@ -187,6 +270,7 @@ class Transport:
                                 raise TransportError(
                                     ErrorType.UNKNOWN,
                                     str(obj.get("error"))[: RUNTIME_LIMITS.provider_error_bytes],
+                                    request_id=self.last_request_id,
                                 )
                             received_event = True
                             yield obj
@@ -196,6 +280,7 @@ class Transport:
                         raise TransportError(
                             ErrorType.MALFORMED_STREAM,
                             "provider stream contained only malformed data events",
+                            request_id=self.last_request_id,
                         )
                     return
             except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -204,10 +289,14 @@ class Transport:
                     raise TransportError(
                         ErrorType.CONNECTION_LOST,
                         f"stream disconnected after partial output; not retried ({exc})",
+                        request_id=self.last_request_id,
                     ) from exc
-                if attempt >= self.max_retries:
-                    raise TransportError(ErrorType.TIMEOUT, str(exc)) from exc
-                await self._sleep(attempt, None)
+                delay = policy.delay_for(attempt)
+                if attempt >= policy.max_retries or not budget.allows(delay):
+                    raise TransportError(
+                        ErrorType.TIMEOUT, str(exc), request_id=self.last_request_id
+                    ) from exc
+                await self._sleep(delay)
                 attempt += 1
 
     async def get_json(self, path: str) -> dict[str, Any]:
@@ -221,27 +310,38 @@ class Transport:
             raise TransportError(
                 ErrorType.CONNECTION_LOST, "provider network request failed"
             ) from exc
+        self.last_request_id = extract_request_id(response.headers)
         if response.status_code >= 400:
             raise TransportError(
                 classify_http_status(response.status_code),
                 _error_text(response),
                 status=response.status_code,
+                request_id=self.last_request_id,
             )
         try:
             data = response.json()
         except ValueError as exc:
             raise TransportError(
-                ErrorType.INVALID_REQUEST, "provider returned invalid JSON"
+                ErrorType.INVALID_REQUEST,
+                "provider returned invalid JSON",
+                request_id=self.last_request_id,
             ) from exc
         if not isinstance(data, dict):
             raise TransportError(
-                ErrorType.INVALID_REQUEST, "provider returned a non-object JSON body"
+                ErrorType.INVALID_REQUEST,
+                "provider returned a non-object JSON body",
+                request_id=self.last_request_id,
             )
         return data
 
-    async def _sleep(self, attempt: int, retry_after: float | None) -> None:
-        delay = retry_after if retry_after is not None else self.backoff_base * (2**attempt)
-        delay = min(30.0, max(0.0, delay))
+    async def _sleep(self, delay: float) -> None:
+        """Sleep, but stay cancellable.
+
+        A backoff is the longest a run sits doing nothing, so an uncancellable one means Ctrl-C
+        appears to hang for up to 30 seconds.
+        """
+
+        delay = max(0.0, delay)
         if self.cancellation is not None:
             await self.cancellation.guard(asyncio.sleep(delay))
         else:
