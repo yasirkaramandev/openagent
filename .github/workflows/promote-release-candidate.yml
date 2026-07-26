@@ -71,23 +71,60 @@ jobs:
 
       - name: Require every CI check and CodeQL to be successful on the target
         run: |
-          required="test textual-compat container-sandbox wheel-lifecycle smoke installer-unix installer-windows installer-powershell CodeQL"
-          runs_json="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET}/check-runs" --paginate \
-            --jq '[.check_runs[] | {name: .name, status: .status, conclusion: .conclusion}]')"
-          echo "$runs_json"
-          for name in $required; do
-            ok="$(printf '%s' "$runs_json" | python3 -c "
-          import json,sys
-          name=sys.argv[1]
-          runs=json.load(sys.stdin)
-          hits=[r for r in runs if name.lower() in (r['name'] or '').lower()]
-          print('yes' if hits and all(r['status']=='completed' and r['conclusion']=='success' for r in hits) else 'no')
-          " "$name")"
-            if [ "$ok" != "yes" ]; then
-              echo "::error::required check '$name' is not green on $TARGET"; exit 1
-            fi
-            echo "  ✓ $name"
-          done
+          # This gate matched against *job ids* (`installer-unix`, `wheel-lifecycle`) while GitHub
+          # reports check runs by *display name* (`installer (ubuntu-latest)`, `wheel fresh +
+          # v0.1.2 upgrade/backup restore`). Four of the nine required names therefore matched
+          # nothing, and a name that matches nothing produced no hits — which the old logic could
+          # only report as a failure, meaning this gate had never actually passed.
+          #
+          # Two rules now, in this order. First: *every* check run on the commit must be a
+          # completed success, so a new job is covered the moment it is added and a pending one
+          # cannot be mistaken for an absent one. Second: a required set must be present, so a
+          # commit that simply never ran the suite cannot pass by having nothing to fail.
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET}/check-runs" --paginate \
+            --jq '[.check_runs[] | {name, status, conclusion}]' > checks.json
+          python3 - "$TARGET" <<'PY'
+          import json, sys
+
+          target = sys.argv[1]
+          runs = json.load(open("checks.json"))
+          if not runs:
+              sys.exit(f"::error::no check runs at all on {target}; refusing to promote")
+
+          for run in sorted(runs, key=lambda r: r["name"] or ""):
+              print(f"  {run['name']}: {run['status']}/{run['conclusion']}")
+
+          bad = [
+              r for r in runs
+              if r["status"] != "completed" or r["conclusion"] != "success"
+          ]
+          if bad:
+              names = ", ".join(f"{r['name']} ({r['conclusion'] or r['status']})" for r in bad)
+              sys.exit(f"::error::not every check is green on {target}: {names}")
+
+          # Substrings of real check-run display names, verified against this repository's
+          # workflows. Keep in sync when a job is renamed — a stale entry fails closed here rather
+          # than silently waving a commit through.
+          required = [
+              "test (",
+              "textual-compat",
+              "container-sandbox",
+              "wheel fresh",
+              "smoke (",
+              "installer (ubuntu",
+              "installer (macos",
+              "installer (windows",
+              "production install (ubuntu",
+              "production install (macos",
+              "production install (windows",
+              "codeql",
+          ]
+          present = [(r["name"] or "").lower() for r in runs]
+          missing = [n for n in required if not any(n.lower() in p for p in present)]
+          if missing:
+              sys.exit(f"::error::required checks never ran on {target}: {', '.join(missing)}")
+          print(f"all {len(runs)} checks green, and every required check ran")
+          PY
 
       - name: Require a fast-forward-only promotion
         run: |
