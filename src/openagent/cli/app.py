@@ -140,49 +140,138 @@ def version() -> None:
     console.print(f"openagent {__version__}")
 
 
+def _update_check_json(plan) -> dict:
+    """The stable ``openagent update --check --json`` schema (spec §19.5)."""
+
+    return {
+        "current": {
+            "version": plan.current_version,
+            "commit": plan.installed_commit,
+            "executable": plan.active_executable,
+        },
+        "target": {
+            "version": plan.latest_version,
+            "commit": plan.target_commit,
+            "package_url": plan.package_url,
+        },
+        "channel": plan.channel.value if plan.channel else None,
+        "channel_ref": plan.channel_ref,
+        "source": plan.source,
+        "update_available": plan.update_available,
+        "can_update": plan.can_update,
+        "is_downgrade": plan.is_downgrade,
+        "reason": plan.reason,
+        "detail": plan.detail,
+    }
+
+
 @app.command("update")
 def update_openagent(
     check: bool = typer.Option(False, "--check", help="Check without changing the installation."),
     dry_run: bool = typer.Option(
-        False, "--dry-run", help="Show the source-matched update plan without running it."
+        False, "--dry-run", help="Show the resolved update plan without running it."
     ),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm the update non-interactively."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Deprecated: explicit `openagent update` is already consent."
+    ),
     repair: bool = typer.Option(
         False,
         "--repair",
         "--force-reinstall",
-        help="Reinstall from the proven source even if the version already matches.",
+        help="Reinstall the exact same target even if the version/commit already match.",
+    ),
+    channel: str = typer.Option(
+        None, "--channel", help="Update channel: stable, candidate, or dev."
+    ),
+    allow_downgrade: bool = typer.Option(
+        False, "--allow-downgrade", help="Permit installing a target older than the current one."
+    ),
+    to: str = typer.Option(
+        None, "--to", help="Install an exact 40-hex commit (used with --allow-downgrade)."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Proceed even if another OpenAgent process appears to be running."
+    ),
+    local_dev: bool = typer.Option(
+        False,
+        "--local-dev",
+        help="Use the legacy source-checkout developer workflow instead of migrating to a channel.",
     ),
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Update OpenAgent itself from its proven installation source.
+    """Update OpenAgent itself, from anywhere, without needing a checkout.
 
-    Source checkouts fast-forward only a clean official ``origin/main`` and re-run the platform
-    installer. Index installs use their owning uv/pipx environment (or that environment's exact
-    Python), then the command verifies PATH, version, and ``doctor --json`` before reporting success.
-
-    ``--repair`` forces the reinstall even when the checkout and its declared version already match
-    the active binary — useful when the binary on PATH is a stale copy of a current checkout.
+    A VCS/legacy install resolves the exact commit for its channel (``candidate`` for prereleases,
+    ``stable`` for releases; ``dev`` is opt-in) and installs ``git+https://…@<commit>`` under a
+    process lock, staging and verifying it before touching the active install, then verifying the
+    exact executable, version, commit, PATH, and ``doctor --json``. Running ``openagent update`` is
+    itself the confirmation — only a downgrade re-prompts (spec §5, §12, §19).
     """
 
-    from ..services.self_update import check_self_update, perform_self_update
+    from ..services.self_update import (
+        OFFICIAL_HTTPS_REMOTE,
+        OpenAgentUpdateChannel,
+        SelfUpdateTarget,
+        check_self_update,
+        perform_self_update,
+    )
 
     if check and dry_run:
         _fail("choose at most one of --check and --dry-run")
+    parsed_channel = None
+    if channel is not None:
+        parsed_channel = OpenAgentUpdateChannel.parse(channel)
+        if parsed_channel is None:
+            _fail(f"unknown channel {channel!r}; choose stable, candidate, or dev")
+
+    target_resolver = None
+    if to is not None:
+        import re as _re
+
+        sha = to.strip().lower()
+        if not _re.fullmatch(r"[0-9a-f]{40}", sha):
+            _fail("--to requires an exact 40-hex commit")
+        resolved_channel = parsed_channel or OpenAgentUpdateChannel.CANDIDATE
+        target_resolver = lambda _ch, _sha=sha, _c=resolved_channel: SelfUpdateTarget(  # noqa: E731
+            channel=_c,
+            repository="yasirkaramandev/openagent",
+            ref=None,
+            commit_sha=_sha,
+            version="",
+            package_url=f"git+{OFFICIAL_HTTPS_REMOTE}@{_sha}",
+            source_kind="github-vcs-explicit",
+            ci_verified=False,
+            prerelease=True,
+        )
+
     try:
-        plan = check_self_update(repair=repair)
+        plan = check_self_update(
+            repair=repair,
+            channel=parsed_channel,
+            allow_downgrade=allow_downgrade,
+            local_dev=local_dev,
+            target_resolver=target_resolver,
+        )
     except Exception as exc:  # noqa: BLE001 - this command must remain a DB-independent repair path
         _fail(f"OpenAgent update check failed ({exc.__class__.__name__})")
 
     if check or dry_run or not plan.can_update or plan.update_available is False:
         if json_out:
-            emit_json(
-                {"mode": "dry-run" if dry_run else "check", "plan": plan.model_dump(mode="json")}
-            )
+            if check:
+                emit_json(_update_check_json(plan))
+            else:
+                emit_json(
+                    {
+                        "mode": "dry-run" if dry_run else "check",
+                        "plan": plan.model_dump(mode="json"),
+                    }
+                )
         else:
             mark = "[green]✓[/green]" if plan.can_update else "[red]✗[/red]"
+            channel_note = f" [{plan.channel.value}]" if plan.channel else ""
             console.print(
-                f"{mark} OpenAgent {safe_markup(plan.current_version)} — {safe_markup(plan.detail)}"
+                f"{mark} OpenAgent {safe_markup(plan.current_version)}{safe_markup(channel_note)}"
+                f" — {safe_markup(plan.detail)}"
             )
             console.print(
                 f"  source: {safe_markup(plan.source)}; executable: "
@@ -195,19 +284,30 @@ def update_openagent(
             raise typer.Exit(1)
         return
 
-    if not yes:
-        if not sys.stdin.isatty():
-            _fail("non-interactive update requires --yes (or use --check/--dry-run)")
-        latest = plan.latest_version or (plan.remote_revision or "newest revision")[:12]
-        if not typer.confirm(f"Update OpenAgent {plan.current_version} to {latest}?"):
+    # A downgrade is the one case that still re-confirms interactively (spec §12).
+    if plan.is_downgrade and not json_out and sys.stdin.isatty():
+        target = plan.latest_version or (plan.target_commit or "")[:12]
+        if not typer.confirm(
+            f"Downgrade OpenAgent {plan.current_version} -> {target}?", default=False
+        ):
             raise typer.Exit(1)
 
-    result = perform_self_update(plan)
+    result = perform_self_update(plan, force=force)
     if json_out:
         emit_json(result.model_dump(mode="json"))
     else:
-        mark = "[green]✓[/green]" if result.ok else "[red]✗[/red]"
+        # A metadata write failure is a successful install with lost provenance — neither a plain
+        # ✓ nor a ✗ tells the truth about it, so it gets its own mark (spec §3.3).
+        mark = (
+            "[yellow]![/yellow]"
+            if result.ok and not result.metadata_persisted
+            else "[green]✓[/green]"
+            if result.ok
+            else "[red]✗[/red]"
+        )
         console.print(f"{mark} {safe_markup(result.detail)}")
+        if result.rolled_back:
+            console.print("  [yellow]rolled back to the previous installation[/yellow]")
         if result.backup_path:
             console.print(f"  database backup: {safe_markup(result.backup_path)}")
     if not result.ok:

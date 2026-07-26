@@ -4,6 +4,71 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6rc5] — unreleased
+
+Fifth release candidate. rc4 changed how the updater behaves, so it gets its own version rather
+than a second binary under the same name. Everything here is a case where the updater or the
+installer answered a question it could not actually answer, and the wrong answer was the permissive
+one. Each defect below has a regression test that was written first and observed failing against
+rc4. This is not the final `0.1.6`: remote CI across the supported matrix and a fresh RC soak on
+the exact rc5 commit remain release gates.
+
+### Updater safety
+
+- **`--force` can no longer bypass an active run or an open TUI.** The process probe returned a
+  bare list of identities, and `--force` bypassed a non-empty list outright — so "a run is mid-write"
+  and "OpenAgent is idle in another tab" were the same thing to it. Replaced with an explicit
+  `ProcessSafetyState` (`SAFE`, `ACTIVE_IDLE_PROCESS`, `ACTIVE_RUN`, `ACTIVE_TUI`, `UNKNOWN`).
+  `--force` overrides an idle second process and nothing else; an active run, an open TUI, and an
+  unanswerable probe all block regardless of it.
+- **A probe that could not run no longer reads as "nothing is running".** A missing `psutil`, an
+  unreadable process table, a process that denied inspection, an unreadable creation time (so a
+  reused pid cannot be told apart from the original), and an unverifiable executable all produced
+  the same empty list a genuinely quiet machine produces. They now produce `UNKNOWN`, which blocks.
+  Another user's unreadable process is still ignored — it cannot touch this user's installation.
+- **Active runs are read from the database, not guessed from command lines.** A leased turn carries
+  its owner's pid *and* creation time, so a crashed owner is not mistaken for a live writer and a
+  reused pid is not mistaken for either. A database that exists but cannot be read is `UNKNOWN`
+  rather than "no runs"; a database that does not exist yet is genuinely empty.
+- **Commit ancestry decides forward motion, not version strings.** "Same version, different commit"
+  was classified as an unconditional refresh. Within a release candidate every commit reports the
+  same version, which is exactly when that rule installs a commit *older* than the running one, or
+  one from an unrelated history. Ordering now comes from the commit graph via `CommitRelation`
+  (`SAME`, `AHEAD`, `BEHIND`, `DIVERGED`, `UNKNOWN`), compared against `last_accepted_commit` so a
+  rollback cannot walk the installation backwards one accepted commit at a time. `--allow-downgrade`
+  permits `BEHIND` and `DIVERGED` deliberately; nothing permits `UNKNOWN`.
+- **A lost `install.json` is reported instead of swallowed.** The write was wrapped in
+  `except Exception: pass`. The binary really is installed, so this is not a failed update — but the
+  file carries the channel and the last accepted commit, so losing it means the next update has to
+  fail closed. The result now reports `status: installed_with_metadata_warning`,
+  `metadata_persisted: false`, and names `openagent update --repair`. The exception class is
+  reported, never its message, which can contain arbitrary local paths.
+
+### Installer
+
+- **Only a channel is an install source.** "Is this commit in the official repository?" was tested
+  by fetching the SHA directly. GitHub serves every commit reachable from any advertised ref, so
+  that test accepted every feature branch — including a PR head via `refs/pull/N/head`. An
+  unreviewed commit could be installed with `channel: stable` recorded next to it. Each channel now
+  names its one legitimate source and proves membership: `stable` a published non-prerelease tag,
+  `candidate` ancestry against `release-candidate`, `dev` ancestry against `main`. `dev` is never
+  inferred — `OPENAGENT_SETUP_CHANNEL` has to ask for it. Development installs remain available and
+  must say so with `OPENAGENT_SETUP_LOCAL=1`.
+- **`setup.bat` installs like the other platforms.** It installed the local path unconditionally and
+  recorded no provenance at all. It now follows the same channel policy and writes `install.json`.
+
+### CI
+
+- **The production install path is tested.** Every installer job set `OPENAGENT_SETUP_LOCAL=1`, so
+  what CI verified was installing a working tree — the developer path. New `installer-production`
+  (ubuntu, macOS) and `installer-production-windows` (CMD, PowerShell) jobs install the official VCS
+  URL at an exact commit and assert the outcome: `direct_url.json` names the official repository and
+  the exact SHA, `install.json` carries the channel and `last_accepted_commit`, PATH resolves the
+  installed executable, `version` and `doctor --json` are sane, a second install is idempotent and
+  leaves the checkout clean, and a non-channel commit is refused with a message naming the supported
+  alternative. Paths deliberately contain a space and a non-ASCII segment, with custom
+  `UV_TOOL_DIR` and `OPENAGENT_HOME`.
+
 ## [0.1.6rc4] — unreleased
 
 Fourth release candidate. This candidate closes the remaining ownership, fail-closed boundary and

@@ -22,6 +22,34 @@ function Fail([string]$Stage, [string]$What, [string]$Fix) {
     exit 1
 }
 
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+    Run a native command, letting it write to stderr, and return its exit code.
+
+    .DESCRIPTION
+    Windows PowerShell 5.1 turns a native command's stderr output into ErrorRecords, and this
+    script sets $ErrorActionPreference = "Stop" — so an ordinary progress line aborts the
+    installer. uv writes both "Downloading cpython-3.12.13…" and "Python 3.12 is already
+    installed" to stderr, which meant the installer could fail either while doing its job or
+    while discovering it had nothing to do.
+
+    Suppressing stderr is the wrong fix: real errors live there too. The preference is instead
+    narrowed to this one call, the output is shown, and the *exit code* decides success — which is
+    what it was always supposed to decide.
+    #>
+    param([Parameter(Mandatory = $true)][scriptblock]$Command)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command 2>&1 | ForEach-Object { Write-Host $_ }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Find-Uv {
     $command = Get-Command uv -ErrorAction SilentlyContinue
     if ($null -ne $command) { return $command.Source }
@@ -85,15 +113,82 @@ try {
     }
 
     Write-Step "[2/6] Installing managed Python 3.12 (system/Store Python is untouched)"
-    & $Uv python install 3.12
-    if ($LASTEXITCODE -ne 0) {
+    $code = Invoke-Native { & $Uv python install 3.12 }
+    if ($code -ne 0) {
         Fail "install-python" "uv could not install managed Python 3.12" "Check network/proxy access, then re-run setup.ps1."
     }
 
-    Write-Step "[3/6] Installing or upgrading OpenAgent in an isolated uv tool environment"
-    & $Uv tool install --force --python 3.12 $RepoRoot
-    if ($LASTEXITCODE -ne 0) {
-        Fail "install-openagent" "uv tool install failed for $RepoRoot" "Check the dependency error above, then re-run setup.ps1."
+    # By default install an exact official commit from the remote so the binary's provenance is a
+    # pinned VCS commit and `openagent update` is checkout-independent afterwards. Set
+    # OPENAGENT_SETUP_LOCAL=1 to install from this working tree for development instead (spec §20).
+    $OfficialRemote = "https://github.com/yasirkaramandev/openagent.git"
+    $LocalDev = ($env:OPENAGENT_SETUP_LOCAL -eq "1")
+    $InstallChannel = if ($ExpectedVersion -match "(rc|a\d|b\d|dev)") { "candidate" } else { "stable" }
+    if ($env:OPENAGENT_SETUP_CHANNEL) {
+        if ($env:OPENAGENT_SETUP_CHANNEL -notin @("stable", "candidate", "dev")) {
+            Fail "install-openagent" "unknown OPENAGENT_SETUP_CHANNEL '$($env:OPENAGENT_SETUP_CHANNEL)'" "Choose stable, candidate, or dev."
+        }
+        $InstallChannel = $env:OPENAGENT_SETUP_CHANNEL
+    }
+    $InstallCommit = ""
+    $ChannelSourceRef = $null
+    if ($LocalDev) {
+        Write-Step "[3/6] Installing OpenAgent from this checkout (local-development mode)"
+        $InstallSource = $RepoRoot
+        $InstallSourceKind = "dev-local"
+        try { $InstallCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim() } catch { $InstallCommit = "" }
+    } else {
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            Fail "install-openagent" "git is required for an official install" "Install git, or set OPENAGENT_SETUP_LOCAL=1 to install from this checkout."
+        }
+        $InstallCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null)
+        if (-not $InstallCommit) {
+            Fail "install-openagent" "this directory is not a git checkout" "Set OPENAGENT_SETUP_LOCAL=1 to install from this directory instead."
+        }
+        $InstallCommit = $InstallCommit.Trim()
+        # Fail closed unless this exact commit is on the *channel being installed* (spec §3.5).
+        # Reachable-from-some-official-ref is not enough: GitHub serves every commit on every
+        # branch, so the old test accepted any feature branch. stable = a published non-prerelease
+        # tag; candidate = the release-candidate branch; dev = main. Anything else is a development
+        # install and must say so with OPENAGENT_SETUP_LOCAL=1.
+        if ($InstallChannel -eq "stable") {
+            $TagMatch = $null
+            $Tags = & git ls-remote --tags $OfficialRemote 2>$null
+            foreach ($line in @($Tags)) {
+                $parts = $line -split "\s+"
+                if ($parts.Count -ge 2 -and $parts[0] -eq $InstallCommit) {
+                    $name = $parts[1] -replace "\^\{\}$", "" -replace "^refs/tags/", ""
+                    if ($name -notmatch "(rc|a\d|b\d|dev)") { $TagMatch = $name; break }
+                }
+            }
+            if (-not $TagMatch) {
+                Fail "install-openagent" "commit $InstallCommit is not a published stable release of the official repository" "Check out a release tag, use OPENAGENT_SETUP_CHANNEL=candidate or dev, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+            }
+            $ChannelSourceRef = "refs/tags/$TagMatch"
+        } else {
+            $ChannelSourceRef = if ($InstallChannel -eq "candidate") { "refs/heads/release-candidate" } else { "refs/heads/main" }
+            & git -C $RepoRoot fetch -q $OfficialRemote $ChannelSourceRef 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "install-openagent" "could not read $ChannelSourceRef from the official repository" "Check your network / proxy, then re-run."
+            }
+            $ChannelTip = (& git -C $RepoRoot rev-parse FETCH_HEAD 2>$null)
+            if (-not $ChannelTip) {
+                Fail "install-openagent" "could not resolve the tip of $ChannelSourceRef" "Re-run setup.ps1."
+            }
+            & git -C $RepoRoot merge-base --is-ancestor $InstallCommit $ChannelTip.Trim() 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "install-openagent" "commit $InstallCommit is not on the $InstallChannel channel ($ChannelSourceRef)" "Feature-branch commits are not an install source. Check out a channel commit, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+            }
+        }
+        Write-Step "[3/6] Installing OpenAgent from official commit $InstallCommit ($InstallChannel channel, $ChannelSourceRef)"
+        $InstallSource = "git+$OfficialRemote@$InstallCommit"
+        $InstallSourceKind = "official-github-vcs"
+    }
+    # Same stderr hazard: uv emits warnings here too ("Failed to hardlink files; falling back to
+    # full copy" is routine on a CI runner and must not abort an otherwise good install).
+    $code = Invoke-Native { & $Uv tool install --force --python 3.12 $InstallSource }
+    if ($code -ne 0) {
+        Fail "install-openagent" "uv tool install failed for $InstallSource" "Check the dependency error above, then re-run setup.ps1."
     }
     $ToolBin = (& $Uv tool dir --bin | Select-Object -First 1).Trim()
     if (-not $ToolBin) {
@@ -102,6 +197,31 @@ try {
     $OpenAgent = Join-Path $ToolBin "openagent.exe"
     if (-not (Test-Path -LiteralPath $OpenAgent -PathType Leaf)) {
         Fail "install-openagent" "openagent.exe is missing from $ToolBin" "The tool install may have been interrupted; re-run setup.ps1."
+    }
+
+    # Persist install provenance (spec §8, §20.1) so `openagent update` is channel-aware immediately.
+    try {
+        $OaHome = if ($env:OPENAGENT_HOME) { $env:OPENAGENT_HOME } else { Join-Path $HOME ".openagent" }
+        New-Item -ItemType Directory -Force -Path $OaHome | Out-Null
+        $meta = [ordered]@{
+            schema_version        = 1
+            manager               = "uv-tool"
+            source                = $InstallSourceKind
+            repository            = "yasirkaramandev/openagent"
+            channel               = $InstallChannel
+            channel_ref           = switch ($InstallChannel) { "candidate" { "release-candidate" } "dev" { "main" } default { $null } }
+            installed_version     = $ExpectedVersion
+            installed_commit      = if ($InstallCommit) { $InstallCommit } else { $null }
+            last_accepted_version = $ExpectedVersion
+            last_accepted_commit  = if ($InstallCommit) { $InstallCommit } else { $null }
+            python                = "3.12"
+            updated_at            = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+        $metaPath = Join-Path $OaHome "install.json"
+        ($meta | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $metaPath -Encoding utf8
+        Write-Step "      recorded install provenance in $metaPath"
+    } catch {
+        Write-Warning "could not record install provenance (non-fatal)"
     }
 
     Write-Step "[4/6] Persisting the tool directory on the user PATH"

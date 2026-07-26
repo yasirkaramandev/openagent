@@ -78,10 +78,83 @@ if errorlevel 1 (
 )
 
 rem --------------------------------------------------------------------- 3. OpenAgent tool
-echo [openagent-setup] [3/6] Installing OpenAgent ^(runtime deps only - no dev tools; your data is preserved^)
-"!UV!" tool install --force --python 3.12 "%REPO_ROOT%"
+rem By default install an exact official commit from the remote, so provenance is a pinned VCS
+rem commit and `openagent update` is checkout-independent afterwards. The commit must be on the
+rem channel being installed (spec §3.5): stable = a published non-prerelease tag, candidate = the
+rem release-candidate branch, dev = main. A feature-branch commit is not a production install
+rem source — set OPENAGENT_SETUP_LOCAL=1 to install this working tree for development instead.
+set "OFFICIAL_REMOTE=https://github.com/yasirkaramandev/openagent.git"
+set "INSTALL_CHANNEL=stable"
+echo %EXPECTED_VERSION% | findstr /R "rc a[0-9] b[0-9] dev" >nul && set "INSTALL_CHANNEL=candidate"
+if defined OPENAGENT_SETUP_CHANNEL (
+    if /I "%OPENAGENT_SETUP_CHANNEL%"=="stable" ( set "INSTALL_CHANNEL=stable"
+    ) else if /I "%OPENAGENT_SETUP_CHANNEL%"=="candidate" ( set "INSTALL_CHANNEL=candidate"
+    ) else if /I "%OPENAGENT_SETUP_CHANNEL%"=="dev" ( set "INSTALL_CHANNEL=dev"
+    ) else (
+        call :die "install-openagent" "unknown OPENAGENT_SETUP_CHANNEL '%OPENAGENT_SETUP_CHANNEL%'" "Choose stable, candidate, or dev."
+        goto :eof
+    )
+)
+
+set "INSTALL_COMMIT="
+set "CHANNEL_SOURCE_REF="
+if "%OPENAGENT_SETUP_LOCAL%"=="1" (
+    echo [openagent-setup] [3/6] Installing OpenAgent from this checkout ^(local-development mode^)
+    set "INSTALL_SOURCE=%REPO_ROOT%"
+    set "INSTALL_SOURCE_KIND=dev-local"
+    for /f "delims=" %%i in ('git -C "%REPO_ROOT%" rev-parse HEAD 2^>nul') do set "INSTALL_COMMIT=%%i"
+) else (
+    where git >nul 2>&1 || (
+        call :die "install-openagent" "git is required for an official install" "Install git, or set OPENAGENT_SETUP_LOCAL=1 to install from this checkout."
+        goto :eof
+    )
+    for /f "delims=" %%i in ('git -C "%REPO_ROOT%" rev-parse HEAD 2^>nul') do set "INSTALL_COMMIT=%%i"
+    if not defined INSTALL_COMMIT (
+        call :die "install-openagent" "this directory is not a git checkout" "Set OPENAGENT_SETUP_LOCAL=1 to install from this directory instead."
+        goto :eof
+    )
+    if /I "!INSTALL_CHANNEL!"=="stable" (
+        set "TAG_MATCH="
+        for /f "tokens=1,2" %%a in ('git ls-remote --tags "%OFFICIAL_REMOTE%" 2^>nul') do (
+            if /I "%%a"=="!INSTALL_COMMIT!" if not defined TAG_MATCH (
+                set "CAND=%%b"
+                set "CAND=!CAND:refs/tags/=!"
+                set "CAND=!CAND:^{}=!"
+                echo !CAND! | findstr /R "rc a[0-9] b[0-9] dev" >nul || set "TAG_MATCH=!CAND!"
+            )
+        )
+        if not defined TAG_MATCH (
+            call :die "install-openagent" "commit !INSTALL_COMMIT! is not a published stable release of the official repository" "Check out a release tag, use OPENAGENT_SETUP_CHANNEL=candidate or dev, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+            goto :eof
+        )
+        set "CHANNEL_SOURCE_REF=refs/tags/!TAG_MATCH!"
+    ) else (
+        if /I "!INSTALL_CHANNEL!"=="candidate" ( set "CHANNEL_SOURCE_REF=refs/heads/release-candidate" ) else ( set "CHANNEL_SOURCE_REF=refs/heads/main" )
+        git -C "%REPO_ROOT%" fetch -q "%OFFICIAL_REMOTE%" "!CHANNEL_SOURCE_REF!" 2>nul
+        if errorlevel 1 (
+            call :die "install-openagent" "could not read !CHANNEL_SOURCE_REF! from the official repository" "Check your network / proxy, then re-run."
+            goto :eof
+        )
+        set "CHANNEL_TIP="
+        for /f "delims=" %%i in ('git -C "%REPO_ROOT%" rev-parse FETCH_HEAD 2^>nul') do set "CHANNEL_TIP=%%i"
+        if not defined CHANNEL_TIP (
+            call :die "install-openagent" "could not resolve the tip of !CHANNEL_SOURCE_REF!" "Re-run setup.bat."
+            goto :eof
+        )
+        git -C "%REPO_ROOT%" merge-base --is-ancestor "!INSTALL_COMMIT!" "!CHANNEL_TIP!" 2>nul
+        if errorlevel 1 (
+            call :die "install-openagent" "commit !INSTALL_COMMIT! is not on the !INSTALL_CHANNEL! channel ^(!CHANNEL_SOURCE_REF!^)" "Feature-branch commits are not an install source. Check out a channel commit, or set OPENAGENT_SETUP_LOCAL=1 for a local install."
+            goto :eof
+        )
+    )
+    echo [openagent-setup] [3/6] Installing OpenAgent from official commit !INSTALL_COMMIT! ^(!INSTALL_CHANNEL! channel, !CHANNEL_SOURCE_REF!^)
+    set "INSTALL_SOURCE=git+%OFFICIAL_REMOTE%@!INSTALL_COMMIT!"
+    set "INSTALL_SOURCE_KIND=official-github-vcs"
+)
+
+"!UV!" tool install --force --python 3.12 "!INSTALL_SOURCE!"
 if errorlevel 1 (
-    call :die "install-openagent" "uv tool install failed for %REPO_ROOT%" "Re-run setup.bat; check the output above for the failing dependency."
+    call :die "install-openagent" "uv tool install failed for !INSTALL_SOURCE!" "Re-run setup.bat; check the output above for the failing dependency."
     goto :eof
 )
 
@@ -101,6 +174,39 @@ if not defined OPENAGENT_BIN (
     call :die "install-openagent" "openagent executable missing in %TOOL_BIN% after install" "Re-run setup.bat."
     goto :eof
 )
+
+rem Persist install provenance so `openagent update` is channel-aware from the first run (spec §8,
+rem §20.1). Written at %OPENAGENT_HOME%\install.json; never contains a secret. Non-fatal on failure,
+rem but reported — an install that cannot record its channel will have to be repaired later.
+rem Quoting a literal `"` inside a batch `set` is a trap: `\"` is a backslash followed by a quote,
+rem not an escaped quote, so the first version of this block emitted `\"release-candidate\"` and
+rem produced invalid JSON. `set "A="B""` is the correct form — the outermost quote pair is stripped
+rem and the inner quotes survive into the value.
+set "OA_HOME=%OPENAGENT_HOME%"
+if not defined OA_HOME set "OA_HOME=%USERPROFILE%\.openagent"
+set "OA_CHANNEL_REF=null"
+if /I "!INSTALL_CHANNEL!"=="candidate" set "OA_CHANNEL_REF="release-candidate""
+if /I "!INSTALL_CHANNEL!"=="dev" set "OA_CHANNEL_REF="main""
+set "OA_COMMIT_JSON=null"
+if defined INSTALL_COMMIT set "OA_COMMIT_JSON="!INSTALL_COMMIT!""
+if not exist "!OA_HOME!" mkdir "!OA_HOME!" 2>nul
+(
+    echo {
+    echo   "schema_version": 1,
+    echo   "manager": "uv-tool",
+    echo   "source": "!INSTALL_SOURCE_KIND!",
+    echo   "repository": "yasirkaramandev/openagent",
+    echo   "channel": "!INSTALL_CHANNEL!",
+    echo   "channel_ref": !OA_CHANNEL_REF!,
+    echo   "installed_version": "!EXPECTED_VERSION!",
+    echo   "installed_commit": !OA_COMMIT_JSON!,
+    echo   "last_accepted_version": "!EXPECTED_VERSION!",
+    echo   "last_accepted_commit": !OA_COMMIT_JSON!,
+    echo   "python": "3.12"
+    echo }
+) > "!OA_HOME!\install.json" 2>nul ^
+    && echo [openagent-setup]       recorded install provenance in !OA_HOME!\install.json ^
+    || echo [openagent-setup] WARN  could not record install provenance ^(non-fatal^)
 
 rem --------------------------------------------------------------------- 4. PATH (user scope)
 echo [openagent-setup] [4/6] Adding the 'openagent' command to your user PATH
