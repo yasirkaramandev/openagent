@@ -113,6 +113,25 @@ class CompatibilityProfile:
     supports_server_state: bool = False
     server_state_id_field: str | None = None
 
+    # --- tool schema ------------------------------------------------------------------------
+    #: JSON Schema keywords this endpoint does not accept. Named explicitly rather than inferred:
+    #: sending a keyword a provider rejects fails the whole request, and silently dropping one that
+    #: *constrains* validity widens what the model may emit. :mod:`..tool_schema` does neither
+    #: quietly — it reports both outcomes (spec §8.1).
+    schema_unsupported_keywords: frozenset[str] = field(default_factory=frozenset)
+    #: OpenAI strict function calling requires ``additionalProperties: false`` on every object.
+    schema_requires_additional_properties_false: bool = False
+    #: A few endpoints reject the keyword outright.
+    schema_forbids_additional_properties: bool = False
+    #: Maximum object-nesting depth the endpoint documents. Deeper schemas are rejected locally
+    #: rather than sent and failed remotely.
+    schema_max_depth: int = 10
+    schema_max_enum_values: int = 500
+    #: Tool-name grammar. The intersection of OpenAI's and Anthropic's documented rules is the
+    #: default; a provider with a narrower rule narrows it here.
+    tool_name_pattern: str = r"^[a-zA-Z0-9_-]+$"
+    tool_name_max_length: int = 64
+
     # --- misc ------------------------------------------------------------------------------
     usage_location: str = "usage"
     error_mapper: str = "openai"
