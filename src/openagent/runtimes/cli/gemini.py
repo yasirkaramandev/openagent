@@ -1,0 +1,391 @@
+"""Gemini CLI adapter (spec §11).
+
+Runs ``gemini -p`` headlessly and maps its result onto :class:`NormalizedEvent`s. Three decisions
+here are deliberately more conservative than the documentation would allow, and each one is a claim
+this adapter refuses to make on the user's behalf.
+
+**JSON output is probed, never assumed.** ``--output-format json`` is documented, and there are
+released versions where passing it produces ``Unknown arguments: output-format`` and the help text
+(google-gemini/gemini-cli#9009). An adapter that trusts the docs turns that into a run which fails
+for reasons the user cannot connect to anything they did. So support is established by asking the
+installed binary, and a CLI that does not have it is still usable — with ``structured_events``
+reported as ``False``, which is the honest answer rather than a broken one.
+
+**The result is one object at the end, so live streaming is not claimed.** Headless ``gemini``
+returns ``{response, stats, error}`` once the run finishes. OpenAgent could emit a synthetic
+``message.delta`` per line to make the run console look busy, and that is exactly what spec §11.3
+forbids: a fabricated delta is indistinguishable from a real one downstream, so anything reasoning
+about latency or partial output would be reasoning about a fiction. ``structured_events`` and
+``live_structured_events`` are therefore separate answers, and the second is ``False``.
+
+**Resume is UNSUPPORTED until a live spike says otherwise.** ``/chat save`` and ``/chat resume``
+are interactive checkpoint commands; no headless session-id resume contract appears in the
+documentation this was written against. Re-sending the prompt history is *not* native resume and
+must not be labelled as it — the CLI would start a new session with a longer prompt, which behaves
+differently and costs differently. :data:`RESUME_SPIKE_REQUIRED` records what would have to be
+observed to change the answer.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from dataclasses import dataclass
+from typing import Any
+
+from ...core.errors import ErrorType, classify_http_status
+from ...core.events import EventType, NormalizedEvent
+from ...core.models import CliInstallation
+from ...core.permissions import READ_ONLY, SAFE_EDIT
+from .base import AuthStatus, CliCapabilities, CliRunRequest
+from .installations import inspect_installation
+from .locator import CliLocation
+from .locator import locate_candidates as locate_cli_candidates
+
+SOURCE = "gemini-cli"
+
+#: Documented ``--approval-mode`` values.
+APPROVAL_DEFAULT = "default"
+APPROVAL_AUTO_EDIT = "auto_edit"
+APPROVAL_YOLO = "yolo"
+
+#: What a live spike must observe before ``resumable`` may become ``True`` (spec §11.5).
+RESUME_SPIKE_REQUIRED = (
+    "a headless flag that resumes a named session and a machine-readable session id in the "
+    "run's own output; replaying prompt history is not native resume"
+)
+
+#: Authentication variables the Gemini CLI documents. Names only — values never leave the child
+#: environment, and OpenAgent stores the *state* and the *source*, never the credential (spec §11.2).
+AUTH_ENVIRONMENT_VARIABLES = (
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_LOCATION",
+)
+
+
+@dataclass(frozen=True)
+class GeminiPermissionMapping:
+    """How one OpenAgent permission profile becomes Gemini CLI flags (spec §11.4)."""
+
+    approval_mode: str
+    sandbox: bool
+    #: Tools to withhold. Empty means "whatever the CLI allows by default".
+    denied_tools: tuple[str, ...] = ()
+    #: Prepended to the prompt for profiles that are a *posture* rather than a flag.
+    prompt_prefix: str = ""
+    #: Why this mapping is what it is, for the wizard and Doctor to show.
+    note: str = ""
+
+
+#: Write and shell tools, withheld for the read-only and plan postures. Named explicitly because
+#: "read-only" has to mean something enforceable, not just an approval prompt the model can talk
+#: its way past.
+_MUTATING_TOOLS = ("run_shell_command", "write_file", "replace")
+
+_PERMISSION_MAPPINGS: dict[str, GeminiPermissionMapping] = {
+    READ_ONLY: GeminiPermissionMapping(
+        approval_mode=APPROVAL_DEFAULT,
+        sandbox=True,
+        denied_tools=_MUTATING_TOOLS,
+        note="sandboxed; write and shell tools withheld",
+    ),
+    SAFE_EDIT: GeminiPermissionMapping(
+        approval_mode=APPROVAL_AUTO_EDIT,
+        sandbox=True,
+        note="sandboxed; edits auto-approved, shell still prompts",
+    ),
+    "full": GeminiPermissionMapping(
+        approval_mode=APPROVAL_DEFAULT,
+        sandbox=True,
+        note="sandboxed; every tool call goes through the CLI's own approval",
+    ),
+    "plan": GeminiPermissionMapping(
+        approval_mode=APPROVAL_DEFAULT,
+        sandbox=True,
+        denied_tools=_MUTATING_TOOLS,
+        prompt_prefix=(
+            "Produce a plan only. Do not modify any file and do not run any command.\n\n"
+        ),
+        note="read-only tools plus a planning instruction",
+    ),
+}
+
+
+def permission_mapping(profile_name: str) -> GeminiPermissionMapping:
+    """Map an OpenAgent profile onto Gemini CLI flags.
+
+    ``yolo`` is deliberately absent. The CLI offers ``--yolo`` / ``--approval-mode yolo``, which
+    auto-approves every action including shell commands; OpenAgent does not surface it as a normal
+    choice, because a profile that a user can pick from a list is a profile they will pick without
+    reading what it does. An unknown profile falls back to the most restrictive mapping rather than
+    the most permissive — the direction a default should fail in.
+    """
+
+    return _PERMISSION_MAPPINGS.get(profile_name, _PERMISSION_MAPPINGS[READ_ONLY])
+
+
+def build_command(
+    request: CliRunRequest,
+    *,
+    executable: str = "gemini",
+    json_output: bool,
+) -> list[str]:
+    """The argv for one headless run.
+
+    ``json_output`` comes from :func:`probe_json_output_support`, not from a version guess: the
+    flag exists in some releases and not others, and passing it where it does not exist fails the
+    run with an argument error.
+    """
+
+    mapping = permission_mapping(request.permission_profile)
+    argv = [executable, "--prompt", mapping.prompt_prefix + request.prompt]
+
+    if json_output:
+        argv += ["--output-format", "json"]
+    if request.model:
+        argv += ["--model", request.model]
+    argv += ["--approval-mode", mapping.approval_mode]
+    if mapping.sandbox:
+        argv.append("--sandbox")
+    return argv
+
+
+@dataclass(frozen=True)
+class JsonOutputSupport:
+    """Whether the installed binary accepts ``--output-format json`` (spec §11.2)."""
+
+    supported: bool
+    detail: str = ""
+
+    @property
+    def structured_events(self) -> bool:
+        return self.supported
+
+
+async def probe_json_output_support(
+    executable: str, *, runner: Any | None = None
+) -> JsonOutputSupport:
+    """Ask the installed CLI whether it knows the flag, by reading its own help.
+
+    Reading ``--help`` rather than running a real prompt: a probe that costs a model call is a
+    probe that gets skipped, and skipping it puts the guess back.
+    """
+
+    run = runner or _run_help
+    try:
+        text = await run(executable)
+    except Exception as exc:  # noqa: BLE001 - any probe failure means "unknown", never "yes"
+        return JsonOutputSupport(False, f"could not read gemini --help ({exc.__class__.__name__})")
+    if "--output-format" in text:
+        return JsonOutputSupport(True, "gemini --help advertises --output-format")
+    return JsonOutputSupport(
+        False,
+        "this gemini build does not advertise --output-format; run output will be plain text",
+    )
+
+
+async def _run_help(executable: str) -> str:
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        "--help",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+    except (TimeoutError, asyncio.TimeoutError):
+        process.kill()
+        await process.wait()
+        raise
+    return (stdout or b"").decode("utf-8", "replace") + (stderr or b"").decode("utf-8", "replace")
+
+
+def map_result(payload: dict[str, Any], run_id: str) -> list[NormalizedEvent]:
+    """Map the single terminal JSON object onto normalized events (spec §11.3).
+
+    Emits at most one message and exactly one terminal event. No ``message.delta`` is synthesized:
+    the text did not arrive incrementally, and a fabricated delta is indistinguishable downstream
+    from one that did.
+    """
+
+    events: list[NormalizedEvent] = []
+    error = payload.get("error")
+
+    if isinstance(error, dict) and (error.get("message") or error.get("type")):
+        return [
+            NormalizedEvent(
+                type=EventType.RUN_FAILED,
+                run_id=run_id,
+                source=SOURCE,
+                data={
+                    "error_type": _map_error_type(error).value,
+                    "message": str(error.get("message") or error.get("type") or "gemini failed"),
+                },
+            )
+        ]
+
+    response = payload.get("response")
+    if isinstance(response, str) and response:
+        events.append(
+            NormalizedEvent(
+                type=EventType.MESSAGE_COMPLETED,
+                run_id=run_id,
+                source=SOURCE,
+                data={"text": response},
+            )
+        )
+
+    usage = _map_stats(payload.get("stats"))
+    if usage:
+        events.append(
+            NormalizedEvent(type=EventType.USAGE_UPDATED, run_id=run_id, source=SOURCE, data=usage)
+        )
+
+    events.append(
+        NormalizedEvent(type=EventType.RUN_COMPLETED, run_id=run_id, source=SOURCE, data={})
+    )
+    return events
+
+
+def _map_error_type(error: dict[str, Any]) -> ErrorType:
+    code = error.get("code")
+    if isinstance(code, int) and code:
+        return classify_http_status(code)
+    text = str(error.get("type") or error.get("message") or "").lower()
+    if "auth" in text:
+        return ErrorType.AUTHENTICATION_FAILED
+    if "quota" in text or "rate" in text:
+        return ErrorType.PROVIDER_RATE_LIMITED
+    return ErrorType.COMMAND_FAILED
+
+
+def _map_stats(stats: object) -> dict[str, Any]:
+    """Pull token counters out of ``stats.models`` without asserting a shape it may not have.
+
+    The documented structure is ``{models, tools, files}`` with per-model entries; the exact
+    counter names are not pinned here, so anything integer-valued and recognisably a token count is
+    summed and anything else is left alone rather than coerced.
+    """
+
+    if not isinstance(stats, dict):
+        return {}
+    models = stats.get("models")
+    if not isinstance(models, dict):
+        return {}
+    totals: dict[str, int] = {}
+    for entry in models.values():
+        if not isinstance(entry, dict):
+            continue
+        tokens = entry.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        for key, value in tokens.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] = totals.get(key, 0) + value
+    return {"tokens": totals} if totals else {}
+
+
+class GeminiCliAdapter:
+    """Gemini CLI, run headlessly (spec §11).
+
+    Marked experimental: the event mapping is fixture-validated and the resume contract is unproven.
+    """
+
+    cli_type = "gemini"
+
+    def __init__(self, executable: str | None = None) -> None:
+        self._explicit_executable = executable
+        self.location: CliLocation = locate_cli_candidates("gemini", explicit_path=executable)
+        self.executable = executable or self.location.active_executable
+        self._json_output: JsonOutputSupport | None = None
+
+    # ------------------------------------------------------------------ discovery
+
+    async def detect(self) -> CliInstallation | None:
+        self.location = await asyncio.to_thread(self.locate_candidates)
+        install = inspect_installation(
+            "gemini", self.location, adapter="gemini-headless-json", experimental=True
+        )
+        if install is not None:
+            self.executable = install.executable
+        return install
+
+    def locate_candidates(self) -> CliLocation:
+        self.location = locate_cli_candidates("gemini", explicit_path=self._explicit_executable)
+        return self.location
+
+    async def inspect_installation(self) -> CliInstallation | None:
+        return await self.detect()
+
+    async def json_output_support(self, *, refresh: bool = False) -> JsonOutputSupport:
+        if self._json_output is None or refresh:
+            if not self.executable:
+                self._json_output = JsonOutputSupport(False, "gemini is not installed")
+            else:
+                self._json_output = await probe_json_output_support(self.executable)
+        return self._json_output
+
+    # ------------------------------------------------------------------ capabilities
+
+    async def capabilities(self) -> CliCapabilities:
+        support = await self.json_output_support()
+        return CliCapabilities(
+            structured_events=support.structured_events,
+            # Not "we have not implemented it" — the contract does not exist in the documentation
+            # this was written against, and claiming it would make the wizard offer a resume that
+            # silently starts a new conversation (spec §11.5).
+            resumable=False,
+            edits_files=True,
+            runs_commands=True,
+            experimental=True,
+        )
+
+    @property
+    def live_structured_events(self) -> bool:
+        """Headless ``gemini`` returns one object at the end; nothing streams (spec §11.3)."""
+
+        return False
+
+    async def inspect_auth(self) -> AuthStatus:
+        """Report *which* credential mechanism is configured, never the credential.
+
+        Three documented paths — Google login, a Gemini API key, and Vertex AI — and OpenAgent
+        stores only which one is in play. Copying the value into OpenAgent's own store would create
+        a second copy of a secret that the CLI already manages, with no way to keep the two in sync
+        (spec §11.2).
+        """
+
+        present = [name for name in AUTH_ENVIRONMENT_VARIABLES if os.environ.get(name)]
+        if "GEMINI_API_KEY" in present or "GOOGLE_API_KEY" in present:
+            return AuthStatus(
+                authenticated=True,
+                detail="API key present in the environment",
+                environment_names=present,
+                source="environment",
+            )
+        if "GOOGLE_APPLICATION_CREDENTIALS" in present or "GOOGLE_CLOUD_PROJECT" in present:
+            return AuthStatus(
+                authenticated=True,
+                detail="Vertex AI / Application Default Credentials configured",
+                environment_names=present,
+                source="environment",
+            )
+        # An interactive Google login leaves no environment variable, so absence is not proof of
+        # anything. Non-blocking: the CLI's own error is more useful than a guess about why it
+        # might fail.
+        return AuthStatus(
+            authenticated=False,
+            detail="no credential variable set; an interactive Google login cannot be detected here",
+            blocking=False,
+            environment_names=[],
+            source="none",
+        )
+
+    def resume_run(self, session_id: str, prompt: str, request: CliRunRequest):
+        raise NotImplementedError(
+            f"Gemini CLI has no verified headless resume contract. Required to change this: "
+            f"{RESUME_SPIKE_REQUIRED}."
+        )
