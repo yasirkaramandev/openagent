@@ -18,7 +18,7 @@ that parameter — it is a statement about the request format, not about the mod
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from ...core.models import DiscoveryStrategy, Protocol
@@ -284,3 +284,56 @@ _DEFAULT_V2 = CompatibilityProfile("generic")
 
 def get_profile(provider_type: str) -> CompatibilityProfile:
     return PROFILES_V2.get(provider_type, _DEFAULT_V2)
+
+
+#: Fields that are properties of the *protocol*, not the vendor. When a provider is used over a
+#: protocol other than its default, these have to move with it — Anthropic Messages carries tool
+#: results as user content blocks whoever is serving it, and calls the token field ``max_tokens``
+#: whatever the vendor's chat endpoint calls it.
+_PROTOCOL_INVARIANTS: dict[Protocol, dict[str, object]] = {
+    Protocol.OPENAI_CHAT: {
+        "tool_result_policy": ToolResultPolicy.TOOL_ROLE,
+    },
+    Protocol.OPENAI_RESPONSES: {
+        "tool_result_policy": ToolResultPolicy.TOOL_ROLE,
+        "max_tokens_field": "max_output_tokens",
+    },
+    Protocol.ANTHROPIC_MESSAGES: {
+        "tool_result_policy": ToolResultPolicy.USER_CONTENT_BLOCK,
+        "max_tokens_field": "max_tokens",
+        # Anthropic's temperature range is 0–1 regardless of who serves the protocol. A vendor whose
+        # chat endpoint accepts 2.0 will still reject it here.
+        "temperature_max": 1.0,
+        # The Messages API has no `stream_options`; usage arrives in `message_delta`.
+        "stream_usage": False,
+        # `tool_stream` is a GLM chat-endpoint opt-in and is not a Messages field.
+        "tool_stream_request_field": None,
+    },
+    Protocol.OLLAMA_NATIVE_CHAT: {
+        "max_tokens_field": "num_predict",
+        "stream_usage": False,
+        "supports_tool_choice_auto": False,
+        "supports_tool_choice_required": False,
+    },
+    Protocol.LMSTUDIO_NATIVE_CHAT: {
+        "tool_result_policy": ToolResultPolicy.TOOL_ROLE,
+    },
+}
+
+
+def profile_for(provider_type: str, protocol: Protocol) -> CompatibilityProfile:
+    """The provider's profile, adapted to the protocol it will actually be spoken over.
+
+    Several v0.2 providers speak more than one protocol — Qwen and LM Studio speak three, MiniMax two
+    — and a profile written for the vendor's default would send the wrong field names over the others.
+    Rather than a profile per (vendor, protocol) pair, which is nine more tables to keep in sync, the
+    vendor's deviations are kept once and the protocol's invariants are layered on top.
+
+    Anything the vendor genuinely differs in *within* a protocol (MiniMax's temperature floor,
+    DeepSeek's reasoning field) survives, because those fields are not protocol invariants.
+    """
+
+    base = get_profile(provider_type)
+    if base.transport is protocol:
+        return base
+    return replace(base, transport=protocol, **_PROTOCOL_INVARIANTS.get(protocol, {}))  # type: ignore[arg-type]
