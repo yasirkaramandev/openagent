@@ -69,7 +69,10 @@ class TransportError(Exception):
 @dataclass
 class Transport:
     base_url: str
-    headers: dict[str, str] = field(default_factory=dict)
+    #: Excluded from ``repr``: these carry ``Authorization`` / ``x-api-key``, and a dataclass repr
+    #: reaches exception tracebacks, debug logging and test failure output. Redacting the *message* of
+    #: a TransportError is not enough if the transport that raised it prints its own headers.
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
     timeout: float | None = None
     #: Wall-clock ceiling for one logical call — *all* of its attempts and backoff sleeps, not each
     #: attempt separately. Before this was a shared budget, three retries of a 120s call could run
