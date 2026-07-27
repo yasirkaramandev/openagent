@@ -657,24 +657,61 @@ def cancel(
 def doctor(
     json_out: bool = typer.Option(False, "--json"),
     refresh_cli_updates: bool = typer.Option(False, "--refresh-cli-updates"),
+    flat: bool = typer.Option(
+        False, "--flat", help="print one line per check instead of grouping into sections"
+    ),
 ) -> None:
-    """Run system diagnostics (spec §41)."""
+    """Run system diagnostics (spec §41, §21).
+
+    Grouped into sections by default. A flat list is readable at ten checks and stops being readable
+    at sixty, which is where v0.2 lands it — nine providers, six CLIs, per-model capability evidence.
+    ``--flat`` keeps the old rendering for scripts that parse lines.
+
+    The JSON shape gains a ``sections`` key and keeps ``checks`` unchanged, so existing consumers do
+    not break.
+    """
+
+    from ..services.doctor_sections import group_checks
+    from ..services.doctor_sections import to_dict as sections_to_dict
+
     oa = _app()
     checks = _run(oa.doctor.run(refresh_cli_updates=refresh_cli_updates))
     exit_code = oa.doctor.exit_code(checks)
+    reports = group_checks(checks)
+
+    marks = {
+        "ok": "[green]✓[/green]",
+        "warn": "[yellow]⚠[/yellow]",
+        "fail": "[red]✗[/red]",
+    }
+
     if json_out:
-        emit_json({"checks": [c.to_dict() for c in checks], "exit_code": exit_code})
-    else:
-        marks = {
-            "ok": "[green]✓[/green]",
-            "warn": "[yellow]⚠[/yellow]",
-            "fail": "[red]✗[/red]",
-        }
+        emit_json(
+            {
+                "checks": [c.to_dict() for c in checks],
+                **sections_to_dict(reports),
+                "exit_code": exit_code,
+            }
+        )
+    elif flat:
         for check in checks:
             console.print(
                 f"{marks.get(check.status, '?')} {safe_markup(check.name)}"
                 + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else "")
             )
+    else:
+        for report in reports:
+            # An empty section is still printed. An absent section reads as "we did not look", which
+            # is the one thing a diagnostic must never imply.
+            console.print(
+                f"\n{marks.get(report.status, '?')} [bold]{safe_markup(report.title)}[/bold] "
+                f"[dim]({safe_markup(report.summary())})[/dim]"
+            )
+            for check in report.checks:
+                console.print(
+                    f"  {marks.get(check.status, '?')} {safe_markup(check.name)}"
+                    + (f" — [dim]{safe_markup(check.detail)}[/dim]" if check.detail else "")
+                )
     if exit_code:
         raise typer.Exit(exit_code)
 
