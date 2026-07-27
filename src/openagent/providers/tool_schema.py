@@ -177,7 +177,11 @@ def normalize_tool_schema(
     """
 
     name = schema.get("name")
-    result = ToolSchemaNormalizationResult(tool_name=name if isinstance(name, str) else "<unnamed>")
+    # A blank name is labelled the same as a missing one: this label is what a "tool withheld"
+    # report shows the user, and `''` names nothing they can act on.
+    result = ToolSchemaNormalizationResult(
+        tool_name=name if isinstance(name, str) and name.strip() else "<unnamed>"
+    )
 
     if not isinstance(name, str) or not name.strip():
         result.executable = False

@@ -91,6 +91,15 @@ class ErrorType(str, Enum):
     #: OpenAI-compatible URL that turns out to serve something else, or a version skew.
     PROTOCOL_MISMATCH = "protocol_mismatch"
     OUTPUT_LIMIT_EXCEEDED = "output_limit_exceeded"
+    #: The request never reached the provider: connection refused, DNS failure, no route. Distinct
+    #: from TIMEOUT (the endpoint accepted the connection and did not answer in time) and from
+    #: CONNECTION_LOST (a stream that had already delivered events). The distinction is what tells a
+    #: local-provider user to *start their server* rather than to wait (spec §8.2, §12.4).
+    NETWORK_UNAVAILABLE = "network_unavailable"
+    #: TLS negotiation failed — an untrusted or expired certificate, a hostname mismatch, a protocol
+    #: version refusal. Never retried and never downgraded: a remote endpoint that cannot prove its
+    #: identity is not one to send a credential to (spec §23.3, §27).
+    TLS_ERROR = "tls_error"
 
     # --- local provider services (spec §12, §13) -------------------------------------------
     #: The local server (Ollama, LM Studio) is not reachable. Not retried: a daemon that is down
@@ -130,6 +139,11 @@ RETRYABLE = {
     ErrorType.PROVIDER_RATE_LIMITED,
     ErrorType.PROVIDER_OVERLOADED,
     ErrorType.TIMEOUT,
+    # A connection that never opened may be a transient DNS or routing failure, and no request was
+    # delivered, so replaying it cannot duplicate anything (spec §8.3 permits connection reset and
+    # temporary DNS). A genuinely down server exhausts the small retry budget and then reports
+    # honestly — the cost is one bounded backoff, not a wrong diagnosis.
+    ErrorType.NETWORK_UNAVAILABLE,
 }
 
 #: Errors that must never be retried (spec §8.3, §44).
@@ -171,6 +185,9 @@ NON_RETRYABLE = {
     ErrorType.CONNECTION_LOST,
     ErrorType.STREAM_INTERRUPTED,
     ErrorType.USER_CANCELLED,
+    # A certificate that does not validate now will not validate on the next attempt, and retrying
+    # a TLS failure is how a downgrade gets normalized into "flaky network".
+    ErrorType.TLS_ERROR,
 }
 
 

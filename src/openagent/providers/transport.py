@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import ssl
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -49,6 +50,7 @@ class TransportError(Exception):
         status: int | None = None,
         *,
         request_id: str | None = None,
+        body: dict[str, Any] | None = None,
     ) -> None:
         message = redact_secrets(message)
         super().__init__(message)
@@ -57,6 +59,11 @@ class TransportError(Exception):
         self.status = status
         #: The provider's own correlation id, when it sent one. Opaque, quotable to their support.
         self.request_id = request_id
+        #: The parsed error object, when the failure arrived as a JSON payload rather than a status.
+        #: Carried so a protocol wire can classify the provider's *own* error type — an in-stream
+        #: ``{"error": {"type": "overloaded_error"}}`` is raised here before any wire sees the
+        #: stream, and without the payload every such failure would flatten to UNKNOWN.
+        self.body = body
 
 
 @dataclass
@@ -147,9 +154,14 @@ class Transport:
                 httpx.TimeoutException,
                 httpx.TransportError,
             ) as exc:
+                error_type = classify_transport_exception(exc)
                 delay = policy.delay_for(attempt)
-                if attempt >= policy.max_retries or not budget.allows(delay):
-                    raise TransportError(ErrorType.TIMEOUT, str(exc)) from exc
+                if (
+                    error_type is ErrorType.TLS_ERROR
+                    or attempt >= policy.max_retries
+                    or not budget.allows(delay)
+                ):
+                    raise TransportError(error_type, str(exc)) from exc
                 await self._sleep(delay)
                 attempt += 1
                 continue
@@ -271,6 +283,7 @@ class Transport:
                                     ErrorType.UNKNOWN,
                                     str(obj.get("error"))[: RUNTIME_LIMITS.provider_error_bytes],
                                     request_id=self.last_request_id,
+                                    body=obj,
                                 )
                             received_event = True
                             yield obj
@@ -291,10 +304,114 @@ class Transport:
                         f"stream disconnected after partial output; not retried ({exc})",
                         request_id=self.last_request_id,
                     ) from exc
+                error_type = classify_transport_exception(exc)
                 delay = policy.delay_for(attempt)
-                if attempt >= policy.max_retries or not budget.allows(delay):
+                if (
+                    error_type is ErrorType.TLS_ERROR
+                    or attempt >= policy.max_retries
+                    or not budget.allows(delay)
+                ):
                     raise TransportError(
-                        ErrorType.TIMEOUT, str(exc), request_id=self.last_request_id
+                        error_type, str(exc), request_id=self.last_request_id
+                    ) from exc
+                await self._sleep(delay)
+                attempt += 1
+
+    async def stream_ndjson(
+        self, path: str, payload: dict[str, Any]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """POST and yield newline-delimited JSON objects.
+
+        Ollama streams NDJSON rather than SSE — one bare JSON object per line, no ``data:`` prefix
+        and no ``[DONE]`` sentinel. Reusing :meth:`stream_sse` for it would silently drop every line
+        (none start with ``data:``) and report an empty, successful turn, so the framing gets its own
+        reader.
+
+        The replay rule is the same and for the same reason: a stream is only safe to retry *before*
+        the first object reaches the caller. After that, a reconnect would duplicate text and tool
+        calls, so a mid-stream drop is reported as ``CONNECTION_LOST`` rather than retried.
+        """
+
+        policy = self._policy()
+        budget = self._budget()
+        attempt = 0
+        received_object = False
+        malformed = 0
+        lines_seen = 0
+        while True:
+            try:
+                async with self.client().stream("POST", path, json=payload) as response:
+                    self.last_request_id = extract_request_id(response.headers)
+                    if response.status_code >= 400:
+                        body = (await response.aread()).decode("utf-8", errors="replace")
+                        retry_after = _retry_after(response)
+                        delay = policy.delay_for(attempt, retry_after=retry_after)
+                        if (
+                            response.status_code in _RETRY_STATUSES
+                            and attempt < policy.max_retries
+                            and not received_object
+                            and budget.allows(delay)
+                        ):
+                            await self._sleep(delay)
+                            attempt += 1
+                            continue
+                        raise TransportError(
+                            classify_http_status(response.status_code),
+                            body,
+                            status=response.status_code,
+                            request_id=self.last_request_id,
+                        )
+                    async for line in response.aiter_lines():
+                        if budget.exhausted:
+                            raise TransportError(
+                                ErrorType.TIMEOUT,
+                                f"provider stream exceeded {policy.total_budget:g} seconds",
+                                request_id=self.last_request_id,
+                            )
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        lines_seen += 1
+                        try:
+                            obj = json.loads(stripped)
+                        except json.JSONDecodeError:
+                            malformed += 1
+                            continue
+                        if not isinstance(obj, dict):
+                            malformed += 1
+                            continue
+                        if obj.get("error"):
+                            raise TransportError(
+                                ErrorType.UNKNOWN,
+                                str(obj.get("error"))[: RUNTIME_LIMITS.provider_error_bytes],
+                                request_id=self.last_request_id,
+                                body=obj,
+                            )
+                        received_object = True
+                        yield obj
+                    if lines_seen and malformed == lines_seen and not received_object:
+                        raise TransportError(
+                            ErrorType.MALFORMED_STREAM,
+                            "provider stream contained only malformed lines",
+                            request_id=self.last_request_id,
+                        )
+                    return
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if received_object:
+                    raise TransportError(
+                        ErrorType.CONNECTION_LOST,
+                        f"stream disconnected after partial output; not retried ({exc})",
+                        request_id=self.last_request_id,
+                    ) from exc
+                error_type = classify_transport_exception(exc)
+                delay = policy.delay_for(attempt)
+                if (
+                    error_type is ErrorType.TLS_ERROR
+                    or attempt >= policy.max_retries
+                    or not budget.allows(delay)
+                ):
+                    raise TransportError(
+                        error_type, str(exc), request_id=self.last_request_id
                     ) from exc
                 await self._sleep(delay)
                 attempt += 1
@@ -305,10 +422,10 @@ class Transport:
         except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
             raise TransportError(ErrorType.TIMEOUT, "provider request timed out") from exc
         except httpx.TransportError as exc:
-            # Keep URLs and proxy diagnostics out of the durable/user-visible message; discovery
-            # still distinguishes this from a timeout via CONNECTION_LOST.
+            # Keep URLs and proxy diagnostics out of the durable/user-visible message; the classified
+            # type still tells a caller apart a TLS refusal from an unreachable endpoint.
             raise TransportError(
-                ErrorType.CONNECTION_LOST, "provider network request failed"
+                classify_transport_exception(exc), "provider network request failed"
             ) from exc
         self.last_request_id = extract_request_id(response.headers)
         if response.status_code >= 400:
@@ -346,6 +463,65 @@ class Transport:
             await self.cancellation.guard(asyncio.sleep(delay))
         else:
             await asyncio.sleep(delay)
+
+
+def classify_transport_exception(exc: BaseException) -> ErrorType:
+    """Tell apart the three ways a request can fail below the HTTP layer.
+
+    Before this existed, ``post_json`` and both stream readers reported every ``httpx.TransportError``
+    as :data:`~openagent.core.errors.ErrorType.TIMEOUT`. A refused connection to a local Ollama then
+    read as "the model is slow", and the user was told to wait for a daemon that was not running.
+
+    * a TLS failure is :data:`TLS_ERROR` — never retried, never downgraded;
+    * a connection that never opened is :data:`NETWORK_UNAVAILABLE` — nothing was delivered, so a
+      bounded retry is safe;
+    * a connection that opened and went quiet is :data:`TIMEOUT`.
+    """
+
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
+        # A connect *timeout* is still a connection that never opened.
+        return (
+            ErrorType.NETWORK_UNAVAILABLE
+            if isinstance(exc, httpx.ConnectTimeout)
+            else ErrorType.TIMEOUT
+        )
+    if _is_tls_failure(exc):
+        return ErrorType.TLS_ERROR
+    if isinstance(exc, (httpx.ConnectError, httpx.UnsupportedProtocol, httpx.ProxyError)):
+        return ErrorType.NETWORK_UNAVAILABLE
+    if isinstance(exc, httpx.TransportError):
+        return ErrorType.NETWORK_UNAVAILABLE
+    return ErrorType.UNKNOWN
+
+
+def _is_tls_failure(exc: BaseException) -> bool:
+    """Whether a transport failure was really a certificate/handshake problem.
+
+    httpx wraps an ``ssl.SSLError`` in ``ConnectError``, so the type alone does not say. The cause
+    chain is checked first (authoritative) and the message only as a fallback for wrappers that
+    dropped it.
+    """
+
+    cause: BaseException | None = exc
+    seen = 0
+    while cause is not None and seen < 5:
+        if isinstance(cause, ssl.SSLError) or cause.__class__.__module__ == "ssl":
+            return True
+        cause = cause.__cause__ or cause.__context__
+        seen += 1
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "certificate verify",
+            "ssl:",
+            "sslerror",
+            "tlsv1",
+            "hostname mismatch",
+            "self-signed certificate",
+            "certificate has expired",
+        )
+    )
 
 
 def _retry_after(response: httpx.Response) -> float | None:

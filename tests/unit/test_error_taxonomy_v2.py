@@ -52,6 +52,11 @@ _REQUIRED_BY_SPEC = {
     "protocol_mismatch": ErrorType.PROTOCOL_MISMATCH,
     "catalog_unavailable": ErrorType.CATALOG_UNAVAILABLE,
     "catalog_partial": ErrorType.CATALOG_PARTIAL,
+    "network_unavailable": ErrorType.NETWORK_UNAVAILABLE,
+    "tls_error": ErrorType.TLS_ERROR,
+    "request_timeout": ErrorType.TIMEOUT,
+    "cancelled": ErrorType.USER_CANCELLED,
+    "unknown": ErrorType.UNKNOWN,
 }
 
 
@@ -193,3 +198,28 @@ def test_key_shaped_tokens_are_redacted(text: str):
 def test_ordinary_diagnostics_survive_redaction():
     message = "model gemini-3-pro-preview is not available in region europe-west4"
     assert redact_secrets(message) == message
+
+
+# --------------------------------------------------------------------------- network vs timeout
+
+
+def test_an_unreachable_endpoint_and_a_silent_one_are_different_errors():
+    """Before these were distinct, a refused connection to a local server read as "the model is slow".
+
+    The remedies are opposite — start the daemon, versus wait — so collapsing them produces advice
+    that cannot work.
+    """
+
+    assert ErrorType.NETWORK_UNAVAILABLE is not ErrorType.TIMEOUT
+    assert ErrorType.NETWORK_UNAVAILABLE is not ErrorType.CONNECTION_LOST
+
+
+def test_a_request_that_never_left_may_be_retried():
+    assert is_retryable(ErrorType.NETWORK_UNAVAILABLE)
+
+
+def test_a_tls_failure_is_never_retried():
+    """Retrying a certificate failure is how a TLS downgrade gets normalized as a flaky network."""
+
+    assert not is_retryable(ErrorType.TLS_ERROR)
+    assert ErrorType.TLS_ERROR in NON_RETRYABLE
