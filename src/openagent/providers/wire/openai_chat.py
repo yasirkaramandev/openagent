@@ -291,7 +291,7 @@ class OpenAIChatWire:
         for index, call in enumerate(_list(message.get("tool_calls"))):
             if not isinstance(call, dict):
                 continue
-            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            function = _dict(call.get("function"))
             assembler.register_tool_call(
                 index=index,
                 tool_id=_text_or_none(call.get("id")),
@@ -338,7 +338,7 @@ class OpenAIChatWire:
             for choice in _list(chunk.get("choices")):
                 if not isinstance(choice, dict):
                     continue
-                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                delta = _dict(choice.get("delta"))
 
                 content = delta.get("content")
                 if isinstance(content, str) and content:
@@ -357,9 +357,7 @@ class OpenAIChatWire:
                         index if isinstance(index, int) and not isinstance(index, bool) else None
                     )
                     tool_id = _text_or_none(call.get("id"))
-                    function = (
-                        call.get("function") if isinstance(call.get("function"), dict) else {}
-                    )
+                    function = _dict(call.get("function"))
                     name = _text_or_none(function.get("name"))
                     if name is not None:
                         assembler.append_tool_name(name, index=index, tool_id=tool_id)
@@ -562,3 +560,14 @@ def _body_error_message(data: dict[str, Any]) -> str:
     if isinstance(error, dict):
         return str(error.get("message") or error)
     return "provider reported an error in the response body"
+
+
+def _dict(value: object) -> dict[str, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    A named helper rather than an inline ``x if isinstance(x, dict) else {}``: the inline form looks up
+    the key twice and, because the isinstance check applies to a *different* call expression, narrows
+    nothing — so every downstream ``.get`` is untyped. One helper fixes both.
+    """
+
+    return value if isinstance(value, dict) else {}

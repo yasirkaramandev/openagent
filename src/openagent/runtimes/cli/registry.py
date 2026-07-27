@@ -17,20 +17,42 @@ from .antigravity import AntigravityAdapter
 from .base import CliAdapter, CliModelDiscoveryContext
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .gemini import GeminiCliAdapter
+from .kimi_acp import KimiAcpAdapter
 from .model_discovery import CliModelOption
+from .qwen_code import QwenCodeAdapter
 
-#: Known first-class CLI adapters, keyed by type.
+#: Known CLI adapters, keyed by type.
+#:
+#: An adapter is registered only once its whole lifecycle exists — start_run, cancel, auth,
+#: capabilities and the exactly-one-terminal-event contract (spec §11.7). Registration is what makes
+#: an adapter genuinely usable: the wizard, Doctor, run preflight and the executor all resolve through
+#: here and put it through the same preflight as the first-class ones. Half an adapter in this dict is
+#: an entry a user can select and then watch fail.
 _BUILDERS: dict[str, Any] = {
     "codex": CodexAdapter,
     "claude": ClaudeAdapter,
+    "gemini": GeminiCliAdapter,
     "antigravity": AntigravityAdapter,
+    "qwen": QwenCodeAdapter,
+    "kimi": KimiAcpAdapter,
 }
+
+#: First-class adapters, as distinct from experimental ones (spec §19.4). First-class means the event
+#: mapping has been observed against a real run of that CLI; experimental means it is
+#: fixture-validated and the contract may still be wrong. The split is reported, not hidden, because
+#: "experimental" is a claim about *our evidence*, not about the CLI's quality.
+FIRST_CLASS = ("codex", "claude", "gemini")
+EXPERIMENTAL = ("qwen", "kimi", "antigravity")
 
 #: Human-readable titles for each registry key.
 _DISPLAY_NAMES: dict[str, str] = {
     "codex": "Codex CLI",
     "claude": "Claude Code",
+    "gemini": "Gemini CLI",
     "antigravity": "Antigravity",
+    "qwen": "Qwen Code",
+    "kimi": "Kimi (ACP)",
 }
 
 #: Honest verification status per CLI (spec §17 vocabulary). Kept here, not in the UI, so the label
@@ -40,7 +62,19 @@ _DISPLAY_NAMES: dict[str, str] = {
 _STATUS_LABELS: dict[str, str] = {
     "codex": "Verified live (reasoning, plan, commands, files, web search and resume captured)",
     "claude": "Fixture validated (not yet run against a live claude CLI)",
+    "gemini": (
+        "Fixture validated; JSON output and model discovery probed on the installed binary. "
+        "Headless resume is unsupported — no machine-readable session contract is documented"
+    ),
     "antigravity": "Verified live, read-only (editing is experimental and opt-in)",
+    "qwen": (
+        "Experimental, fixture validated. Every flag is verified against the installed binary before "
+        "use; resume requires the build to advertise --resume"
+    ),
+    "kimi": (
+        "Experimental, fixture validated. Capabilities come from the agent's own ACP initialize "
+        "handshake; resume requires the agent to advertise loadSession"
+    ),
 }
 
 

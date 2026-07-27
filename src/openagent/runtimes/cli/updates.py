@@ -37,7 +37,12 @@ UPDATE_LOCK_TIMEOUT = UPDATE_TIMEOUT_SECONDS + 30
 MAX_UPDATE_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
 
-_NPM_PACKAGE = {"codex": "@openai/codex", "claude": "@anthropic-ai/claude-code"}
+_NPM_PACKAGE = {
+    "codex": "@openai/codex",
+    "claude": "@anthropic-ai/claude-code",
+    "gemini": "@google/gemini-cli",
+    "qwen": "@qwen-code/qwen-code",
+}
 
 
 class CliUpdateConfig(BaseModel):

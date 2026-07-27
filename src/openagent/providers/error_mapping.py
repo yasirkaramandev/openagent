@@ -202,7 +202,7 @@ _MINIMAX_CODES = {
 
 def _minimax(signal: ProviderErrorSignal) -> ErrorType | None:
     body = signal.body or {}
-    base_resp = body.get("base_resp") if isinstance(body.get("base_resp"), dict) else {}
+    base_resp = _dict(body.get("base_resp"))
     code = base_resp.get("status_code")
     if isinstance(code, int) and code != 0:
         mapped = _MINIMAX_CODES.get(code)
@@ -321,3 +321,14 @@ def map_provider_error(mapper: str, signal: ProviderErrorSignal) -> ErrorType:
     except Exception:  # noqa: BLE001 - a refiner is diagnostics; it must not mask the real failure
         return signal.base
     return refined if isinstance(refined, ErrorType) else signal.base
+
+
+def _dict(value: object) -> dict[str, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    A named helper rather than an inline ``x if isinstance(x, dict) else {}``: the inline form looks up
+    the key twice and, because the isinstance check applies to a *different* call expression, narrows
+    nothing — so every downstream ``.get`` is untyped. One helper fixes both.
+    """
+
+    return value if isinstance(value, dict) else {}

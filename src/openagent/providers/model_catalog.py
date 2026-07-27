@@ -312,7 +312,7 @@ def _openrouter_entry(item: object) -> CatalogEntry | None:
     if not isinstance(model_id, str) or not model_id.strip():
         return None
 
-    architecture = item.get("architecture") if isinstance(item.get("architecture"), dict) else {}
+    architecture = _dict(item.get("architecture"))
     parameters = {
         value for value in (item.get("supported_parameters") or []) if isinstance(value, str)
     }
@@ -336,16 +336,20 @@ def _openrouter_entry(item: object) -> CatalogEntry | None:
     if "text" in modalities or not modalities:
         claims[Capability.TEXT] = CapabilityStatus.SUPPORTED
 
-    pricing = item.get("pricing") if isinstance(item.get("pricing"), dict) else {}
+    pricing = _dict(item.get("pricing"))
+    # Built as a mapping, not keyword arguments: RemoteModel permits provider extras by design, and
+    # naming them as parameters would claim they are part of the shared model rather than this
+    # catalog's own metadata.
+    fields: dict[str, Any] = {
+        "id": model_id,
+        "display_name": item.get("name") or model_id,
+        "owned_by": model_id.split("/", 1)[0] if "/" in model_id else None,
+        "context_window": _positive_int(item.get("context_length")),
+        "canonical_slug": item.get("canonical_slug"),
+        "output_modalities": architecture.get("output_modalities") or [],
+    }
     try:
-        model = RemoteModel(
-            id=model_id,
-            display_name=item.get("name") or model_id,
-            owned_by=model_id.split("/", 1)[0] if "/" in model_id else None,
-            context_window=_positive_int(item.get("context_length")),
-            canonical_slug=item.get("canonical_slug"),
-            output_modalities=architecture.get("output_modalities") or [],
-        )
+        model = RemoteModel(**fields)
     except (TypeError, ValueError):
         return None
 
@@ -415,7 +419,7 @@ async def _ollama_tags_show(transport: Transport) -> CatalogResult:
     entries: list[CatalogEntry] = []
     show_failures = 0
     for name, item in base:
-        detail = item.get("details") if isinstance(item.get("details"), dict) else {}
+        detail = _dict(item.get("details"))
         show = described.get(name)
         if show is None and name in {n for n, _ in base[:_SHOW_LIMIT]}:
             show_failures += 1
@@ -426,17 +430,18 @@ async def _ollama_tags_show(transport: Transport) -> CatalogResult:
             if capability is not None:
                 claims[capability] = CapabilityStatus.SUPPORTED
 
+        fields: dict[str, Any] = {
+            "id": name,
+            "display_name": name,
+            "owned_by": detail.get("family") if isinstance(detail.get("family"), str) else None,
+            "context_window": _ollama_context(show),
+            "parameter_size": detail.get("parameter_size"),
+            "quantization": detail.get("quantization_level"),
+            "size_bytes": _positive_int(item.get("size")),
+            "modified_at": item.get("modified_at"),
+        }
         try:
-            model = RemoteModel(
-                id=name,
-                display_name=name,
-                owned_by=detail.get("family") if isinstance(detail.get("family"), str) else None,
-                context_window=_ollama_context(show),
-                parameter_size=detail.get("parameter_size"),
-                quantization=detail.get("quantization_level"),
-                size_bytes=_positive_int(item.get("size")),
-                modified_at=item.get("modified_at"),
-            )
+            model = RemoteModel(**fields)
         except (TypeError, ValueError):
             malformed += 1
             continue
@@ -593,18 +598,19 @@ def _lmstudio_entries(data: dict[str, Any]) -> tuple[list[CatalogEntry], int]:
         if model_type == "vlm":
             claims[Capability.IMAGE_INPUT] = CapabilityStatus.SUPPORTED
 
+        fields: dict[str, Any] = {
+            "id": model_id,
+            "display_name": item.get("display_name") or model_id,
+            "owned_by": item.get("publisher") if isinstance(item.get("publisher"), str) else None,
+            "context_window": _positive_int(
+                item.get("max_context_length") or item.get("context_length")
+            ),
+            "architecture": item.get("arch"),
+            "quantization": item.get("quantization"),
+            "model_type": model_type,
+        }
         try:
-            model = RemoteModel(
-                id=model_id,
-                display_name=item.get("display_name") or model_id,
-                owned_by=item.get("publisher") if isinstance(item.get("publisher"), str) else None,
-                context_window=_positive_int(
-                    item.get("max_context_length") or item.get("context_length")
-                ),
-                architecture=item.get("arch"),
-                quantization=item.get("quantization"),
-                model_type=model_type,
-            )
+            model = RemoteModel(**fields)
         except (TypeError, ValueError):
             malformed += 1
             continue
@@ -734,3 +740,14 @@ def _curated(provider_type: str) -> CatalogResult:
 
 def _positive_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _dict(value: object) -> dict[str, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    A named helper rather than an inline ``x if isinstance(x, dict) else {}``: the inline form looks up
+    the key twice and, because the isinstance check applies to a *different* call expression, narrows
+    nothing — so every downstream ``.get`` is untyped. One helper fixes both.
+    """
+
+    return value if isinstance(value, dict) else {}

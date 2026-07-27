@@ -483,7 +483,7 @@ def _extract_token_count(data: dict[str, Any]) -> int | None:
         value = data.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    usage = _dict(data.get("usage"))
     for key in ("total_tokens", "input_tokens", "prompt_tokens"):
         value = usage.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -503,3 +503,14 @@ def build_provider_adapter(provider_type: str, **kwargs: Any) -> WireProviderAda
     if spec is None:
         raise KeyError(f"unknown v0.2 provider {provider_type!r}; known: {spec_names()}")
     return WireProviderAdapter(spec=spec, **kwargs)
+
+
+def _dict(value: object) -> dict[str, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    A named helper rather than an inline ``x if isinstance(x, dict) else {}``: the inline form looks up
+    the key twice and, because the isinstance check applies to a *different* call expression, narrows
+    nothing — so every downstream ``.get`` is untyped. One helper fixes both.
+    """
+
+    return value if isinstance(value, dict) else {}

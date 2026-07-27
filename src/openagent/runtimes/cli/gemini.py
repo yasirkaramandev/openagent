@@ -29,18 +29,36 @@ observed to change the answer.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ...core.errors import ErrorType, classify_http_status
 from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
 from ...core.permissions import READ_ONLY, SAFE_EDIT
-from .base import AuthStatus, CliCapabilities, CliRunRequest
+from ...security.process import (
+    ManagedProcess,
+    TerminationOutcome,
+    TerminationResult,
+    minimal_environment,
+)
+from .base import (
+    AuthStatus,
+    CliCapabilities,
+    CliModelDiscoveryContext,
+    CliRunRequest,
+    run_buffered_cli,
+)
 from .installations import inspect_installation
 from .locator import CliLocation
 from .locator import locate_candidates as locate_cli_candidates
+from .model_discovery import CliModelDiscoveryResult, CliModelOption
+from .updates import check_update as inspect_update
+from .updates import perform_update as execute_update
 
 SOURCE = "gemini-cli"
 
@@ -301,6 +319,10 @@ class GeminiCliAdapter:
         self.location: CliLocation = locate_cli_candidates("gemini", explicit_path=executable)
         self.executable = executable or self.location.active_executable
         self._json_output: JsonOutputSupport | None = None
+        #: Live runs, by run id, so cancel() signals the right process tree.
+        self._processes: dict[str, ManagedProcess] = {}
+        #: The last model-discovery attempt, for the wizard to show method and reason.
+        self.last_model_discovery: CliModelDiscoveryResult | None = None
 
     # ------------------------------------------------------------------ discovery
 
@@ -384,8 +406,339 @@ class GeminiCliAdapter:
             source="none",
         )
 
+    # ------------------------------------------------------------------ model discovery
+
+    #: How the wizard labels where this list came from.
+    model_discovery_method = "gemini-config-allowlist"
+
+    async def list_models(self, context: CliModelDiscoveryContext | None = None) -> list[str]:
+        """Enumerate models this installation can actually reach — never a documented guess.
+
+        The order is the one spec §11.4 requires, and each step is skipped rather than faked when it
+        is unavailable:
+
+        1. the project's / user's own settings, where a policy allowlist means an administrator has
+           already answered the question with authority over the machine;
+        2. the credential's API catalog, when a Gemini key is present in the environment the CLI
+           would actually run under;
+        3. nothing — the wizard then offers a manual id and "use the CLI's own default".
+
+        There is deliberately no hardcoded alias list, and no listing command is invented: the Gemini
+        CLI documents none, and a stale alias produces a run that fails for a reason the user cannot
+        connect to anything they did.
+        """
+
+        context = context or CliModelDiscoveryContext()
+
+        allowlist = _settings_allowlist(context.project_root)
+        if allowlist:
+            self.last_model_discovery = CliModelDiscoveryResult(
+                cli_type=self.cli_type,
+                available=True,
+                method="gemini-settings-allowlist",
+                options=[
+                    CliModelOption(id=model, display_name=model, source="gemini settings policy")
+                    for model in allowlist
+                ],
+            )
+            return allowlist
+
+        catalog = await self._api_catalog(context)
+        if catalog is not None:
+            self.last_model_discovery = CliModelDiscoveryResult(
+                cli_type=self.cli_type,
+                available=True,
+                method="gemini-api-catalog",
+                options=[
+                    CliModelOption(id=model, display_name=model, source="Gemini API catalog")
+                    for model in catalog
+                ],
+            )
+            return catalog
+
+        self.last_model_discovery = CliModelDiscoveryResult(
+            cli_type=self.cli_type,
+            available=False,
+            method=self.model_discovery_method,
+            error=(
+                "the Gemini CLI documents no model listing command, no settings allowlist was found, "
+                "and no Gemini API key is present to read the catalog with; type a model id, or "
+                "leave it blank to use the CLI's own default"
+            ),
+        )
+        return []
+
+    async def _api_catalog(self, context: CliModelDiscoveryContext) -> list[str] | None:
+        """Read the credential's own catalog, when a credential is actually present.
+
+        Scoped to the environment the CLI would run under, so the answer reflects the key that will
+        serve the run rather than whatever happens to be exported in the parent shell.
+        """
+
+        environment = context.environment or dict(os.environ)
+        api_key = environment.get("GEMINI_API_KEY") or environment.get("GOOGLE_API_KEY")
+        if not api_key:
+            return None
+        from ...providers.gemini_interactions import GeminiInteractionsAdapter
+
+        adapter = GeminiInteractionsAdapter(api_key=api_key)
+        try:
+            models = await adapter.list_models()
+        except Exception:  # noqa: BLE001 - a failed catalog read is "unknown", never a fabricated list
+            return None
+        finally:
+            await adapter.transport.aclose()
+        ids = [model.id for model in models if _serves_content(model)]
+        return sorted(ids) or None
+
+    # ------------------------------------------------------------------ runs
+
+    def start_run(self, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]:
+        return self._drive(request)
+
+    async def _drive(self, request: CliRunRequest) -> AsyncIterator[NormalizedEvent]:
+        if not self.executable:
+            yield NormalizedEvent(
+                run_id=request.run_id,
+                type=EventType.RUN_FAILED,
+                source=SOURCE,
+                data={
+                    "error_type": ErrorType.CLI_NOT_FOUND.value,
+                    "message": "gemini is not installed",
+                },
+            )
+            return
+
+        support = await self.json_output_support()
+        argv = build_command(request, executable=self.executable, json_output=support.supported)
+        mapping = permission_mapping(request.permission_profile)
+
+        # The credential the *run* needs, and nothing else. A Gemini run must not receive
+        # ANTHROPIC_API_KEY or OPENAI_API_KEY merely because the user has them exported (spec §19.2).
+        env = minimal_environment(request.credential_env)
+        if mapping.denied_tools:
+            # Enforced by configuration rather than by an approval prompt: "read-only" has to mean
+            # something the model cannot talk its way past.
+            env["GEMINI_EXCLUDE_TOOLS"] = ",".join(mapping.denied_tools)
+
+        proc = ManagedProcess(argv, cwd=request.workspace, env=env)
+        self._processes[request.run_id] = proc
+        try:
+            if support.supported:
+                async for event in run_buffered_cli(
+                    proc=proc, run_id=request.run_id, source=SOURCE, parser=_parse_run_output
+                ):
+                    yield event
+            else:
+                # No structured output on this build. The text is still the answer; it is reported as
+                # one completed message, with structured_events already advertised as False.
+                async for event in run_buffered_cli(
+                    proc=proc, run_id=request.run_id, source=SOURCE, parser=_parse_plain_output
+                ):
+                    yield event
+        finally:
+            self._processes.pop(request.run_id, None)
+
+    async def cancel(self, run_id: str) -> TerminationResult:
+        """Terminate the run's own process tree.
+
+        Identity-checked by :class:`ManagedProcess`: a pid recorded at start is verified against the
+        process's create time and executable before anything is signalled, so a reused pid cannot
+        cause an unrelated process to be killed (spec §11.3).
+        """
+
+        proc = self._processes.get(run_id)
+        if proc is not None:
+            return await proc.cancel()
+        return TerminationResult(TerminationOutcome.ALREADY_GONE)
+
+    # ------------------------------------------------------------------ updates
+
+    async def check_update(self):
+        """Report whether an update is available *and whether OpenAgent may perform it*.
+
+        Delegates to the shared provenance-checked updater rather than reimplementing it. Provenance
+        decides the second answer (spec §11.5): an npm-global install can be updated with npm, a
+        Homebrew install needs brew, and a binary someone copied into ``~/bin`` has no mechanism
+        OpenAgent can infer — guessing one is how a working install becomes a broken one.
+        """
+
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("gemini is not installed")
+        return await asyncio.to_thread(inspect_update, installation)
+
+    async def perform_update(self, *, dry_run: bool = False, active_run_ids: Sequence[str] = ()):
+        installation = await self.detect()
+        if installation is None:
+            raise RuntimeError("gemini is not installed")
+        status = await asyncio.to_thread(inspect_update, installation)
+        return await asyncio.to_thread(
+            execute_update,
+            installation,
+            status,
+            dry_run=dry_run,
+            active_run_ids=active_run_ids,
+        )
+
+    # ------------------------------------------------------------------ resume
+
     def resume_run(self, session_id: str, prompt: str, request: CliRunRequest):
         raise NotImplementedError(
             f"Gemini CLI has no verified headless resume contract. Required to change this: "
             f"{RESUME_SPIKE_REQUIRED}."
         )
+
+
+# ------------------------------------------------------------------------------- run output
+
+
+def _parse_run_output(text: str, run_id: str) -> list[NormalizedEvent]:
+    """Parse the single JSON document headless ``gemini --output-format json`` prints.
+
+    The document may be pretty-printed across many lines, so the whole of stdout is parsed at once. A
+    body that is not JSON at all is reported as a failure rather than silently dropped: the run
+    produced output nobody can read, which is a different thing from a run that produced nothing.
+    """
+
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        # Some builds print a banner before the JSON. Try the outermost object before giving up.
+        payload = _first_json_object(stripped)
+        if payload is None:
+            return [
+                NormalizedEvent(
+                    type=EventType.RUN_FAILED,
+                    run_id=run_id,
+                    source=SOURCE,
+                    data={
+                        "error_type": ErrorType.MALFORMED_STREAM.value,
+                        "message": "gemini did not produce readable JSON output",
+                    },
+                )
+            ]
+    if not isinstance(payload, dict):
+        return [
+            NormalizedEvent(
+                type=EventType.RUN_FAILED,
+                run_id=run_id,
+                source=SOURCE,
+                data={
+                    "error_type": ErrorType.MALFORMED_STREAM.value,
+                    "message": "gemini output was not a JSON object",
+                },
+            )
+        ]
+    return map_result(payload, run_id)
+
+
+def _parse_plain_output(text: str, run_id: str) -> list[NormalizedEvent]:
+    """A build without ``--output-format``: the text *is* the answer."""
+
+    body = text.strip()
+    events: list[NormalizedEvent] = []
+    if body:
+        events.append(
+            NormalizedEvent(
+                type=EventType.MESSAGE_COMPLETED,
+                run_id=run_id,
+                source=SOURCE,
+                data={"text": body},
+            )
+        )
+    events.append(
+        NormalizedEvent(type=EventType.RUN_COMPLETED, run_id=run_id, source=SOURCE, data={})
+    )
+    return events
+
+
+def _first_json_object(text: str) -> Any | None:
+    """Extract the first balanced ``{...}`` from a body that has a banner in front of it."""
+
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        payload, _ = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return payload
+
+
+# ------------------------------------------------------------------------------- settings
+
+
+#: Where the Gemini CLI reads configuration from, project scope before user scope.
+_SETTINGS_PATHS = (".gemini/settings.json",)
+_USER_SETTINGS = Path.home() / ".gemini" / "settings.json"
+
+
+def _settings_allowlist(project_root: Path | None) -> list[str]:
+    """Models an administrator has already restricted this installation to.
+
+    A policy allowlist is the strongest answer available offline: someone with authority over the
+    machine has stated which models may be used, which beats both a documented alias list and a
+    catalog the key can see but policy forbids.
+    """
+
+    candidates: list[Path] = []
+    if project_root is not None:
+        candidates.extend(project_root / name for name in _SETTINGS_PATHS)
+    candidates.append(_USER_SETTINGS)
+
+    for path in candidates:
+        models = _read_allowlist(path)
+        if models:
+            return models
+    return []
+
+
+def _read_allowlist(path: Path) -> list[str]:
+    try:
+        if not path.is_file():
+            return []
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    for key in ("availableModels", "allowedModels", "models"):
+        value = data.get(key)
+        if isinstance(value, list):
+            models = [item for item in value if isinstance(item, str) and item.strip()]
+            if models:
+                return models
+        if isinstance(value, dict):
+            allowed = value.get("allowed") or value.get("available")
+            if isinstance(allowed, list):
+                models = [item for item in allowed if isinstance(item, str) and item.strip()]
+                if models:
+                    return models
+    return []
+
+
+def _serves_content(model: Any) -> bool:
+    """Whether a catalog entry can serve a generation request at all.
+
+    Gemini's catalog includes embedding models. Filtering on the *provider's own* statement of which
+    methods a model serves is not a guess about capability — it is reading what Google said.
+    """
+
+    methods = getattr(model, "supported_generation_methods", None)
+    if methods is None:
+        extra = model.model_dump() if hasattr(model, "model_dump") else {}
+        methods = extra.get("supported_generation_methods")
+    if not isinstance(methods, list) or not methods:
+        # Nothing stated: keep the model. Dropping it would hide a usable model on the strength of
+        # missing metadata.
+        return True
+    return any("generatecontent" in str(method).lower() for method in methods)

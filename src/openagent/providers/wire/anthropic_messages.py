@@ -278,8 +278,8 @@ class AnthropicMessagesWire:
             response_id=response_id,
         )
 
-        for event in tool_call_events(turn, response_id=response_id):
-            yield event
+        for tool_event in tool_call_events(turn, response_id=response_id):
+            yield tool_event
         usage_event = _usage_event(data.get("usage"), response_id)
         if usage_event is not None:
             yield usage_event
@@ -356,10 +356,9 @@ class AnthropicMessagesWire:
                     if isinstance(fragment, str):
                         block.setdefault("type", "tool_use")
                         block["_partial_json"] = str(block.get("_partial_json") or "") + fragment
-                        tool_index = tool_indexes.get(index)
-                        if tool_index is None:
-                            tool_index = len(tool_indexes)
-                            tool_indexes[index] = tool_index
+                        existing = tool_indexes.get(index)
+                        tool_index = len(tool_indexes) if existing is None else existing
+                        tool_indexes[index] = tool_index
                         assembler.append_tool_argument_fragment(fragment, index=tool_index)
                 continue
 
@@ -408,8 +407,8 @@ class AnthropicMessagesWire:
         )
         self._native_blocks = _finalize_blocks(blocks)
 
-        for event in tool_call_events(turn, response_id=response_id):
-            yield event
+        for tool_event in tool_call_events(turn, response_id=response_id):
+            yield tool_event
         usage_event = _usage_event(raw_usage, response_id)
         if usage_event is not None:
             yield usage_event

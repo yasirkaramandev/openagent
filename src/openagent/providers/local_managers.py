@@ -274,7 +274,7 @@ class OllamaProviderManager(LocalProviderManager):
             name = item.get("name") or item.get("model")
             if not isinstance(name, str) or not name:
                 continue
-            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            details = _dict(item.get("details"))
             status.models.append(
                 LocalModel(
                     id=name,
@@ -410,3 +410,14 @@ def _int_or_none(value: object) -> int | None:
 
 def managers() -> list[LocalProviderManager]:
     return [OllamaProviderManager(), LmStudioProviderManager()]
+
+
+def _dict(value: object) -> dict[str, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    A named helper rather than an inline ``x if isinstance(x, dict) else {}``: the inline form looks up
+    the key twice and, because the isinstance check applies to a *different* call expression, narrows
+    nothing — so every downstream ``.get`` is untyped. One helper fixes both.
+    """
+
+    return value if isinstance(value, dict) else {}

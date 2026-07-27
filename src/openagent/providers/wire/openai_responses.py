@@ -260,8 +260,8 @@ class OpenAIResponsesWire:
             response_id=self._last_response_id,
         )
 
-        for event in tool_call_events(turn, response_id=self._last_response_id):
-            yield event
+        for tool_event in tool_call_events(turn, response_id=self._last_response_id):
+            yield tool_event
         usage_event = _usage_event(data.get("usage"), self._last_response_id)
         if usage_event is not None:
             yield usage_event
@@ -309,10 +309,9 @@ class OpenAIResponsesWire:
 
             if kind == "response.function_call_arguments.delta":
                 index = _index(event)
-                tool_index = tool_indexes.get(index)
-                if tool_index is None:
-                    tool_index = len(tool_indexes)
-                    tool_indexes[index] = tool_index
+                existing = tool_indexes.get(index)
+                tool_index = len(tool_indexes) if existing is None else existing
+                tool_indexes[index] = tool_index
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     assembler.append_tool_argument_fragment(delta, index=tool_index)
@@ -333,8 +332,8 @@ class OpenAIResponsesWire:
                 continue
 
             if kind in {"response.failed", "error"}:
-                response = _dict(event.get("response"))
-                error = _dict(response.get("error")) or _dict(event.get("error"))
+                failed = _dict(event.get("response"))
+                error = _dict(failed.get("error")) or _dict(event.get("error"))
                 yield NormalizedModelEvent(
                     type=ModelEventType.ERROR,
                     error_type=ErrorType.UNKNOWN.value,
@@ -358,8 +357,8 @@ class OpenAIResponsesWire:
             response_id=self._last_response_id,
         )
 
-        for event in tool_call_events(turn, response_id=self._last_response_id):
-            yield event
+        for tool_event in tool_call_events(turn, response_id=self._last_response_id):
+            yield tool_event
         usage_event = _usage_event(raw_usage, self._last_response_id)
         if usage_event is not None:
             yield usage_event

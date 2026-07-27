@@ -221,7 +221,7 @@ class OllamaNativeWire:
 
     async def _complete(self, payload: dict[str, Any]) -> AsyncIterator[NormalizedModelEvent]:
         data = await self.transport.post_json(_PATH, payload)
-        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        message = _dict(data.get("message"))
         assembler = StreamingTurnAssembler()
 
         text = message.get("content")
@@ -257,7 +257,7 @@ class OllamaNativeWire:
         tool_calls_seen: list[dict[str, Any]] = []
 
         async for chunk in self.transport.stream_ndjson(_PATH, payload):
-            message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
+            message = _dict(chunk.get("message"))
 
             content = message.get("content")
             if isinstance(content, str) and content:
@@ -315,7 +315,7 @@ class OllamaNativeWire:
         for position, call in enumerate(calls if isinstance(calls, list) else []):
             if not isinstance(call, dict):
                 continue
-            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            function = _dict(call.get("function"))
             name = function.get("name")
             if not isinstance(name, str) or not name.strip():
                 continue
@@ -406,3 +406,14 @@ def _finish(data: dict[str, Any]) -> str | None:
 
 def _count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _dict(value: object) -> dict[str, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    A named helper rather than an inline ``x if isinstance(x, dict) else {}``: the inline form looks up
+    the key twice and, because the isinstance check applies to a *different* call expression, narrows
+    nothing — so every downstream ``.get`` is untyped. One helper fixes both.
+    """
+
+    return value if isinstance(value, dict) else {}
