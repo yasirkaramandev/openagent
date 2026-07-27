@@ -234,3 +234,87 @@ def _dead_pid() -> int:
     proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
     proc.wait()
     return proc.pid
+
+
+# =========================================================================== updater integration
+
+
+class TestTheUpdaterUsesTheInspection:
+    """The lock now decides *what the block message says*, not merely whether to block.
+
+    Before, a held lock and an abandoned one produced the same dead end. Both still block — two
+    updaters rewriting one binary is the thing being prevented — but only one of them is something
+    the user can act on, and the message has to say which.
+    """
+
+    def _antigravity(self, tmp_path: Path):
+        from openagent.core.models import CliInstallation, CliInstallSource
+
+        executable = tmp_path / "agy"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        return CliInstallation(
+            id="cli_agy",
+            type="antigravity",
+            executable=str(executable),
+            resolved_executable=str(executable),
+            version="1.1.7",
+            install_source=CliInstallSource.NATIVE,
+        )
+
+    def _status(self):
+        from openagent.core.models import CliInstallSource, CliUpdateState, CliUpdateStatus
+
+        return CliUpdateStatus(
+            current_version="1.1.7",
+            latest_version="1.2.0",
+            update_available=True,
+            state=CliUpdateState.AVAILABLE,
+            install_source=CliInstallSource.NATIVE,
+            update_method="agy-official-installer",
+        )
+
+    def _run(self, monkeypatch, tmp_path: Path, report: UpdateLockReport):
+        from openagent.runtimes.cli import update_lock as lock_module
+        from openagent.runtimes.cli.updates import perform_update
+
+        monkeypatch.setattr(lock_module, "inspect_update_lock", lambda *a, **k: report)
+        return perform_update(
+            self._antigravity(tmp_path),
+            self._status(),
+            dry_run=True,
+            locks_dir=tmp_path / "locks",
+        )
+
+    def test_a_live_lock_blocks_and_says_it_will_not_be_removed(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        report = UpdateLockReport(
+            path=tmp_path / "update.lock",
+            present=True,
+            pid=os.getpid(),
+            owner_state=LockOwnerState.ALIVE,
+            age=timedelta(minutes=5),
+        )
+        result = self._run(monkeypatch, tmp_path, report)
+        assert "will not remove" in result.detail
+        assert "clear-stale-lock" not in result.detail
+
+    def test_an_abandoned_lock_blocks_but_offers_the_remedy(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        report = UpdateLockReport(
+            path=tmp_path / "update.lock",
+            present=True,
+            pid=999_999,
+            owner_state=LockOwnerState.GONE,
+            age=STALE_AFTER + timedelta(hours=1),
+        )
+        result = self._run(monkeypatch, tmp_path, report)
+        assert "abandoned" in result.detail
+        assert "clear-stale-lock" in result.detail
+
+    def test_no_lock_does_not_block_on_the_lock(self, monkeypatch, tmp_path: Path) -> None:
+        report = UpdateLockReport(path=tmp_path / "update.lock", present=False)
+        result = self._run(monkeypatch, tmp_path, report)
+        assert "updater lock" not in result.detail
