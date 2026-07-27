@@ -383,6 +383,89 @@ async def run_managed_cli(
     )
 
 
+#: Parses a CLI's whole stdout into events, for backends that emit one document rather than a stream.
+BufferedParser = Callable[[str, str], list[NormalizedEvent]]
+
+
+async def run_buffered_cli(
+    *,
+    proc: ManagedProcess,
+    run_id: str,
+    source: str,
+    parser: BufferedParser,
+) -> AsyncIterator[NormalizedEvent]:
+    """Run a CLI that prints **one document at the end**, not a stream of JSONL objects.
+
+    Headless ``gemini`` returns a single ``{response, stats, error}`` object once the run finishes, and
+    ``--output-format json`` may pretty-print it across many lines. :func:`run_managed_cli` parses
+    stdout line by line, so a multi-line document yields nothing at all and the run looks empty.
+
+    What this deliberately does *not* do is synthesize ``message.delta`` events to make the run console
+    look busy (spec §11.3). A fabricated delta is indistinguishable downstream from a real one, so
+    anything reasoning about latency or partial output would be reasoning about a fiction.
+
+    The terminal contract is identical to the streaming driver's — buffered, then reconciled
+    fail-closed against the exit code — because "exactly one terminal event per run" is a property of
+    OpenAgent, not of any particular CLI's output format.
+    """
+
+    try:
+        await proc.start()
+    except ProcessStartupError as exc:
+        yield NormalizedEvent(
+            run_id=run_id,
+            type=EventType.RUN_FAILED,
+            source=source,
+            data={"error_type": "process_startup_failed", "message": str(exc)},
+        )
+        return
+    yield NormalizedEvent(
+        run_id=run_id,
+        type=EventType.PROCESS_STARTED,
+        source=source,
+        data={
+            "pid": proc.pid,
+            "create_time": proc.create_time,
+            "process_identity": proc.identity.model_dump() if proc.identity else None,
+        },
+    )
+
+    chunks: list[str] = []
+    async for line in proc.stream_stdout():
+        chunks.append(line)
+    code = await proc.wait()
+
+    if proc.stdout_limit_exceeded:
+        yield NormalizedEvent(
+            run_id=run_id,
+            type=EventType.RUN_FAILED,
+            source=source,
+            data={
+                "error_type": "output_limit_exceeded",
+                "message": proc.stdout_limit_detail,
+                "truncated": True,
+                "stdout_bytes": proc.stdout_total_bytes,
+            },
+        )
+        return
+
+    observations = TerminalObservations()
+    for event in parser("\n".join(chunks), run_id):
+        if is_terminal_event(event):
+            observations.observe(event)
+            continue
+        yield event
+
+    yield reconcile_terminal(
+        run_id=run_id,
+        source=source,
+        observations=observations,
+        exit_code=code,
+        cancelled=proc.cancelled,
+        stderr=proc.stderr,
+    )
+
+
 def detect_version(executable: str) -> str | None:
     try:
         result = subprocess.run(

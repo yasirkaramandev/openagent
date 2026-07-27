@@ -37,7 +37,12 @@ UPDATE_LOCK_TIMEOUT = UPDATE_TIMEOUT_SECONDS + 30
 MAX_UPDATE_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
 
-_NPM_PACKAGE = {"codex": "@openai/codex", "claude": "@anthropic-ai/claude-code"}
+_NPM_PACKAGE = {
+    "codex": "@openai/codex",
+    "claude": "@anthropic-ai/claude-code",
+    "gemini": "@google/gemini-cli",
+    "qwen": "@qwen-code/qwen-code",
+}
 
 
 class CliUpdateConfig(BaseModel):
@@ -618,11 +623,20 @@ def _perform_update_locked(
         installation.type == "antigravity"
         and installation.install_source is CliInstallSource.NATIVE
     ):
-        updater_lock = Path.home() / ".gemini" / "antigravity-cli" / "updater" / "update.lock"
-        if updater_lock.exists():
-            return blocked(
-                f"Antigravity updater lock is present at {updater_lock}; OpenAgent will not remove it"
+        # The lock is inspected rather than merely tested for existence (spec §21.8). A lock a live
+        # updater holds and a lock a killed one left behind block updates identically, and the second
+        # otherwise blocks them forever with no way out except deleting a file the user has no reason
+        # to know about. Inspecting says which it is; removing it is still never automatic.
+        from .update_lock import inspect_update_lock
+
+        lock = inspect_update_lock()
+        if lock.blocks_update:
+            remedy = (
+                " It appears abandoned; `openagent cli update --clear-stale-lock` can remove it."
+                if lock.stale
+                else " OpenAgent will not remove it."
             )
+            return blocked(f"Antigravity updater lock: {lock.summary()}.{remedy}")
     argv = _update_argv(installation, status)
     if argv is None:
         if installation.install_source in {

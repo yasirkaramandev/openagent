@@ -147,7 +147,51 @@ class DoctorService:
             checks.append(self._provider_agent_integrity_check())
         except Exception:  # noqa: BLE001
             checks.append(self._unavailable_domain_check("Provider/agent integrity"))
+        checks.extend(self._v2_checks())
         return checks
+
+    def _v2_checks(self) -> list[Check]:
+        """The v0.2 sections' own checks (spec §21).
+
+        Each is wrapped separately: one failing diagnostic must not remove the others from the report,
+        because a Doctor that stops at the first problem is least useful exactly when it is needed.
+        """
+
+        from .doctor_sections import migration_hold_check
+
+        out: list[Check] = []
+        try:
+            from ..runtimes.cli.update_lock import inspect_update_lock
+
+            lock = inspect_update_lock()
+            if lock.present:
+                # A held lock is a warning either way — it blocks updates — but the *reason* differs,
+                # and a stale one is actionable while a live one is simply "wait".
+                out.append(
+                    Check(
+                        "Antigravity updater lock",
+                        WARN,
+                        lock.summary(),
+                        data=lock.to_dict(),
+                    )
+                )
+        except Exception:  # noqa: BLE001 - a foreign lock we cannot read must not break Doctor
+            out.append(
+                Check("Antigravity updater lock", WARN, "the updater lock could not be inspected")
+            )
+        try:
+            from ..storage.migrations_v2 import registration_status
+
+            out.append(migration_hold_check(registration_status()))
+        except Exception:  # noqa: BLE001 - report the gap rather than losing every other check
+            out.append(
+                Check(
+                    "v0.2 schema migrations",
+                    WARN,
+                    "the migration registration state could not be read",
+                )
+            )
+        return out
 
     @staticmethod
     def _unavailable_domain_check(name: str) -> Check:

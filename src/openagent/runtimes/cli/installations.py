@@ -14,6 +14,8 @@ from .locator import CliLocation, CommandRunner, ExecutableCandidate, run_bounde
 _NPM_PACKAGES = {
     "codex": "@openai/codex",
     "claude": "@anthropic-ai/claude-code",
+    "gemini": "@google/gemini-cli",
+    "qwen": "@qwen-code/qwen-code",
 }
 
 
