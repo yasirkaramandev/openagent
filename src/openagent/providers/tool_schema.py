@@ -200,9 +200,13 @@ def normalize_tool_schema(
         result.warnings.append("tool parameters must be a JSON Schema object")
         return result
 
-    if not _check_size(parameters, result):
-        return result
+    # Depth first, then size. _measure_depth stops as soon as it passes the limit, so it is bounded
+    # by the profile's own ceiling; serializing is not, and a 500-deep hostile schema exhausts the
+    # stack inside json.dumps before anything gets to reject it. The cheap bounded structural check
+    # has to gate the expensive unbounded one, not follow it.
     if not _check_depth(parameters, profile, result):
+        return result
+    if not _check_size(parameters, result):
         return result
 
     normalized = _walk(parameters, profile, result, path="parameters", depth=0)

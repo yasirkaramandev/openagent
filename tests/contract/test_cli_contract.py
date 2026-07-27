@@ -120,18 +120,42 @@ class TestNotInstalled:
         assert caps.resumable is False
 
     @pytest.mark.parametrize("cli_type", CLIS)
-    async def test_model_discovery_reports_unavailable_rather_than_a_fabricated_list(
-        self, cli_type: str
-    ) -> None:
+    async def test_model_discovery_never_fabricates_a_list(self, cli_type: str) -> None:
+        """The invariant: a CLI that is not installed has no models on this machine.
+
+        Two honest shapes are in use and both are accepted here — returning an empty list with a
+        reason, or raising a clear not-installed error that the registry's ``discover_cli_models``
+        converts into the same reason. What is *not* accepted is a non-empty list: the documented
+        aliases describe the product, and presenting them as this installation's models produces a
+        wizard entry that looks authoritative and a run that fails later with ``cli_not_found``.
+        """
+
         if installed(cli_type):
             pytest.skip(f"{cli_type} is installed on this machine")
         adapter = build_cli_adapter(cli_type)
-        models = await adapter.list_models()
+        try:
+            models = await adapter.list_models()
+        except RuntimeError as exc:
+            assert "not installed" in str(exc).lower()
+            return
         assert models == [], f"{cli_type} invented a model list for a CLI that is not installed"
         result = getattr(adapter, "last_model_discovery", None)
         if result is not None:
             assert result.available is False
             assert result.error, "an unavailable discovery must carry a reason the user can act on"
+
+    @pytest.mark.parametrize("cli_type", CLIS)
+    async def test_registry_discovery_turns_either_shape_into_a_reason(self, cli_type: str) -> None:
+        """Whichever shape an adapter uses, the registry presents one answer to the wizard."""
+
+        from openagent.runtimes.cli.registry import discover_cli_models
+
+        if installed(cli_type):
+            pytest.skip(f"{cli_type} is installed on this machine")
+        discovery = await discover_cli_models(cli_type)
+        assert discovery.available is False
+        assert discovery.models == []
+        assert discovery.error, "the wizard needs a reason it can show"
 
     @pytest.mark.parametrize("cli_type", CLIS)
     async def test_a_run_against_a_missing_cli_fails_cleanly(self, cli_type: str, tmp_path) -> None:
