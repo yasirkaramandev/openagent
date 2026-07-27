@@ -610,3 +610,109 @@ class TestSpecTableIntegrity:
             assert all(
                 "localhost" in url or "127.0.0.1" in url for url in region.endpoints.values()
             ), f"{name}'s default region should be this machine"
+
+
+# =========================================================================== factory routing
+
+
+class TestTheFactoryReachesTheV2Adapters:
+    """Without this routing the whole v0.2 provider layer is unreachable from the app.
+
+    ``build_adapter`` is the single chokepoint between a stored connection and something that can
+    talk to it — provider_service and preflight both go through it — so a provider is either
+    upgraded for both callers or for neither.
+    """
+
+    @pytest.mark.parametrize("provider", PROVIDERS)
+    def test_every_v2_provider_is_served_by_the_wire_adapter(self, provider: str) -> None:
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(id="p", name="p", provider_type=provider)
+        assert isinstance(build_adapter(connection, "test-key"), WireProviderAdapter)
+
+    @pytest.mark.parametrize("provider", ["openai", "nvidia-build"])
+    def test_v0_1_providers_keep_their_own_adapters(self, provider: str) -> None:
+        """Those adapters are still the right implementation for them; nothing is churned."""
+
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(id="p", name="p", provider_type=provider)
+        assert not isinstance(build_adapter(connection, "k"), WireProviderAdapter)
+
+    @pytest.mark.parametrize("provider", PROVIDERS)
+    def test_every_v2_provider_is_selectable_in_the_wizard(self, provider: str) -> None:
+        """The wizard builds its list from PRESETS; an implemented provider missing from it is
+        implemented and unreachable."""
+
+        from openagent.providers.factory import preset_names
+
+        assert provider in preset_names()
+
+    def test_a_stored_region_is_honoured_over_the_spec_default(self) -> None:
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(id="p", name="p", provider_type="kimi", region="cn")
+        built = build_adapter(connection, "k")
+        assert built.region_id == "cn"
+        assert "moonshot.cn" in built.base_url
+
+    def test_a_stored_protocol_the_region_serves_is_honoured(self) -> None:
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(
+            id="p", name="p", provider_type="minimax", protocol=Protocol.OPENAI_CHAT
+        )
+        built = build_adapter(connection, "k")
+        assert built.protocol is Protocol.OPENAI_CHAT
+
+    def test_a_stored_protocol_the_provider_cannot_speak_falls_back_to_its_preference(self) -> None:
+        """Never served over a protocol the row did not ask for *and* the region does not serve.
+
+        A row carrying a stale protocol is a real thing after an upgrade; using the spec's own
+        preference order is the honest resolution, and it is why ``protocol`` is only passed through
+        when the spec actually lists it.
+        """
+
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(
+            id="p", name="p", provider_type="gemini", protocol=Protocol.OPENAI_CHAT
+        )
+        built = build_adapter(connection, "k")
+        assert built.protocol is Protocol.GEMINI_INTERACTIONS
+
+    def test_a_stored_base_url_overrides_the_region_default(self) -> None:
+        """A self-hosted endpoint or a gateway keeps working; the region still scopes the credential."""
+
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(
+            id="p",
+            name="p",
+            provider_type="deepseek",
+            base_url="https://gateway.example.com/v1",
+        )
+        built = build_adapter(connection, "k")
+        assert built.base_url == "https://gateway.example.com/v1"
+
+    def test_a_stored_row_cannot_grant_itself_the_insecure_http_exemption(self) -> None:
+        """A user has to opt into cleartext deliberately; a persisted row is not that opt-in."""
+
+        from openagent.core.models import ProviderConnection
+        from openagent.providers.factory import build_adapter
+
+        connection = ProviderConnection(
+            id="p",
+            name="p",
+            provider_type="ollama",
+            region="remote",
+            base_url="http://ollama.lan:11434",
+        )
+        with pytest.raises(InsecureEndpointError):
+            build_adapter(connection, "k")
