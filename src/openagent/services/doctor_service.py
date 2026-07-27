@@ -161,6 +161,25 @@ class DoctorService:
 
         out: list[Check] = []
         try:
+            from ..runtimes.cli.update_lock import inspect_update_lock
+
+            lock = inspect_update_lock()
+            if lock.present:
+                # A held lock is a warning either way — it blocks updates — but the *reason* differs,
+                # and a stale one is actionable while a live one is simply "wait".
+                out.append(
+                    Check(
+                        "Antigravity updater lock",
+                        WARN,
+                        lock.summary(),
+                        data=lock.to_dict(),
+                    )
+                )
+        except Exception:  # noqa: BLE001 - a foreign lock we cannot read must not break Doctor
+            out.append(
+                Check("Antigravity updater lock", WARN, "the updater lock could not be inspected")
+            )
+        try:
             from ..storage.migrations_v2 import registration_status
 
             out.append(migration_hold_check(registration_status()))
