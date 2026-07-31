@@ -777,3 +777,84 @@ class TestProviderStorageParity:
                 base_url="http://example.com",
                 is_local=True,
             )
+
+
+class TestMigration0017Backfill:
+    """0017 reads the session column that actually exists (spec §9.4).
+
+    It looked for ``session_id`` and ``cli_session_id``. Neither has ever been a column on
+    ``runs`` — the real one is ``provider_session_id`` — so the backfill matched nothing and every
+    run was left ``normalized_replay`` with an empty ``remote_session_id``. Measured against a real
+    database: 19 of 33 runs carried a session id and none were migrated, silently downgrading 19
+    resumable sessions to replay-only.
+    """
+
+    def test_a_cli_run_becomes_a_native_session(self, db) -> None:
+        with db.begin() as conn:
+            _seed_run_with_session(conn, run_id="r1", agent="cli-agent", runtime="cli")
+            _m0017_session_resume(conn)
+            row = conn.exec_driver_sql(
+                "SELECT resume_mode, remote_session_id FROM runs WHERE id='r1'"
+            ).first()
+        assert row[0] == "native_session"
+        assert row[1] == "sess-abc"
+
+    def test_an_api_run_keeps_the_id_without_claiming_a_resumable_mode(self, db) -> None:
+        """A session id does not say which *kind* of session it is.
+
+        A CLI id names a session the CLI can reattach to. An API id names provider-side state that
+        only means anything if the provider was asked to keep it — which this migration cannot
+        verify retroactively — so it is recorded as a remote interaction and the mode stays
+        conservative.
+        """
+
+        with db.begin() as conn:
+            _seed_run_with_session(conn, run_id="r2", agent="api-agent", runtime="api-agent")
+            _m0017_session_resume(conn)
+            row = conn.exec_driver_sql(
+                "SELECT resume_mode, remote_session_id, remote_interaction_id "
+                "FROM runs WHERE id='r2'"
+            ).first()
+        assert row[0] == "normalized_replay"
+        assert not row[1]
+        assert row[2] == "sess-abc"
+
+    def test_a_run_whose_agent_is_gone_is_left_alone(self, db) -> None:
+        """With the agent deleted there is nothing to say what the id means, so nothing is claimed."""
+
+        with db.begin() as conn:
+            _seed_run_with_session(conn, run_id="r3", agent="deleted-agent", runtime=None)
+            _m0017_session_resume(conn)
+            row = conn.exec_driver_sql(
+                "SELECT resume_mode, remote_session_id FROM runs WHERE id='r3'"
+            ).first()
+        assert row[0] == "normalized_replay"
+        assert not row[1]
+
+
+def _seed_run_with_session(conn, *, run_id: str, agent: str, runtime: str | None) -> None:
+    """One run carrying a legacy ``provider_session_id``, optionally with its agent present."""
+
+    if runtime is not None:
+        provider_id = None
+        if runtime == "api-agent":
+            # ck_agents_api_provider: an API agent without a provider is the "agent exists,
+            # provider missing" state the schema exists to prevent, so the fixture cannot skip it.
+            provider_id = f"prov-{agent}"
+            _insert_provider(conn, provider_id, "openai", {"provider_type": "openai"})
+        conn.execute(
+            text(
+                "INSERT INTO agents (name, normalized_name, title, runtime_type, provider_id, "
+                "state_revision, data) VALUES (:n, :n, '', :rt, :pid, 0, '{}')"
+            ),
+            {"n": agent, "rt": runtime, "pid": provider_id},
+        )
+    conn.execute(
+        text(
+            "INSERT INTO runs (id, agent, status, workspace, provider_session_id, started_at, "
+            "execution_backend, state_revision, data) "
+            "VALUES (:id, :agent, 'completed', '/tmp', 'sess-abc', '2026-01-01T00:00:00Z', "
+            "'local', 0, '{}')"
+        ),
+        {"id": run_id, "agent": agent},
+    )

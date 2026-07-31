@@ -550,20 +550,47 @@ def _m0017_session_resume(conn: Connection) -> None:
         "CREATE INDEX IF NOT EXISTS ix_runs_remote_session ON runs (remote_session_id)"
     )
 
-    # Backfill from what each run already recorded. A run with a CLI session id was resumable by that
-    # id all along; writing the mode down makes the resume path explicit instead of re-derived.
+    # Backfill from what each run already recorded. A run that carried a session id was resumable by
+    # that id all along; writing the mode down makes the resume path explicit instead of re-derived.
+    #
+    # The column this reads is `provider_session_id`. The two names tried before it — `session_id`
+    # and `cli_session_id` — have never existed on this table, so the backfill matched nothing and
+    # every run was left `normalized_replay` with an empty remote_session_id. Measured on a real
+    # database: 19 of 33 runs carried a session id and none of them were migrated, which silently
+    # downgraded 19 resumable sessions to replay-only.
     session_column = next(
         (
             candidate
-            for candidate in ("session_id", "cli_session_id")
+            for candidate in ("provider_session_id", "session_id", "cli_session_id")
             if _column_exists(conn, "runs", candidate)
         ),
         None,
     )
     if session_column is not None:
+        # A session id does not by itself say *which kind* of session it is. A CLI run's id names a
+        # session the CLI owns and can reattach to; an API run's names provider-side state that only
+        # means anything if that provider was actually asked to keep it. Treating every id as a CLI
+        # native session would promise reattachment for runs that have nothing to reattach to, so
+        # the mode comes from the agent's runtime and the API case stays conservative.
         conn.exec_driver_sql(
             "UPDATE runs SET resume_mode='native_session', remote_session_id="
-            f"{session_column} WHERE {session_column} IS NOT NULL AND {session_column} != ''"
+            f"{session_column} "
+            f"WHERE {session_column} IS NOT NULL AND {session_column} != '' "
+            "AND agent IN (SELECT name FROM agents WHERE runtime_type='cli')"
+        )
+        # A run whose agent no longer exists matches neither statement and keeps
+        # `normalized_replay`. That is the right answer, not an oversight: with the agent gone
+        # there is nothing to say whether the id names a CLI session or provider-side state, and
+        # guessing either way would promise a resume that cannot be honoured.
+        #
+        # API runs keep their id, but as a *remote interaction* reference and without claiming a
+        # resumable mode: whether the provider retained anything depends on server_state_enabled,
+        # which this migration cannot verify retroactively.
+        conn.exec_driver_sql(
+            "UPDATE runs SET remote_interaction_id="
+            f"{session_column} "
+            f"WHERE {session_column} IS NOT NULL AND {session_column} != '' "
+            "AND agent IN (SELECT name FROM agents WHERE runtime_type='api-agent')"
         )
 
     invalid = [
