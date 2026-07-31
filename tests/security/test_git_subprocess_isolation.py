@@ -458,3 +458,131 @@ def test_discover_filter_names_finds_attribute_and_config_bindings(repo: Path) -
     _install_evil_filter(repo, repo / "unused-marker")
     names = _discover_filter_names(repo)
     assert "evil" in names
+
+
+# ---------------------------------------------------------------- filter discovery portability
+#
+# The discovery query used `git config --local --includes --name-only --get-regexp <re>`. That
+# combination is not accepted by every Git in range — Git 2.55 on Windows exited non-zero, and the
+# non-zero branch raises UnsafeGitFilterConfiguration. So an argv portability problem was reported
+# as a *security* finding, and it fails closed hard enough to make the repository unusable.
+#
+# The query is now `-z --get-regexp`, which every supported Git accepts and which returns the key
+# anyway. These tests pin both the behaviour and the parsing that goes with it.
+
+
+@requires_git
+def test_discovery_returns_empty_when_no_filter_is_configured(tmp_path: Path) -> None:
+    """git exits 1 for "no key matched". That is an answer, not a failure."""
+
+    from openagent.security.git_runner import _discover_filter_names
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    subprocess.run(["git", "init", "-q", str(plain)], check=True, capture_output=True)
+    assert _discover_filter_names(plain) == set()
+
+
+@requires_git
+@pytest.mark.parametrize("kind", ["clean", "smudge", "process", "required"])
+def test_discovery_finds_every_filter_binding_kind(tmp_path: Path, kind: str) -> None:
+    repo = tmp_path / f"repo-{kind}"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    value = "true" if kind == "required" else "cat"
+    subprocess.run(
+        ["git", "config", f"filter.probe.{kind}", value],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    from openagent.security.git_runner import _discover_filter_names
+
+    assert "probe" in _discover_filter_names(repo)
+
+
+@requires_git
+def test_discovery_survives_a_newline_inside_a_filter_command(tmp_path: Path) -> None:
+    """Guards the parsing that came with ``-z``.
+
+    ``--name-only`` used to strip values, so embedded newlines could not reach the parser at all.
+    Now that records are ``key\nvalue``, the key is everything before the *first* newline — and a
+    value containing a newline must not be read as another config key. This is a new hazard
+    introduced by the fix, so it gets its own test rather than being assumed safe.
+    """
+
+    repo = tmp_path / "newline"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "filter.multiline.clean", "cat\nfilter.injected.clean=evil"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    from openagent.security.git_runner import _discover_filter_names
+
+    names = _discover_filter_names(repo)
+    assert "multiline" in names
+    assert "injected" not in names, "a newline in a value was parsed as a separate config key"
+
+
+@requires_git
+@pytest.mark.parametrize("name", ["with space", "ünïcode-ådï"])
+def test_discovery_works_from_an_awkward_repository_path(tmp_path: Path, name: str) -> None:
+    """argv is passed as a list, so a space or a non-ASCII character is not a quoting problem."""
+
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "filter.awkward.clean", "cat"], cwd=repo, check=True, capture_output=True
+    )
+    from openagent.security.git_runner import _discover_filter_names
+
+    assert "awkward" in _discover_filter_names(repo)
+
+
+@requires_git
+def test_discovery_reads_an_included_local_config(tmp_path: Path) -> None:
+    """``--includes`` is on, so a filter reached through include.path must still be found."""
+
+    repo = tmp_path / "included"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    extra = repo / ".git" / "extra.config"
+    extra.write_text('[filter "viainclude"]\n\tclean = cat\n', encoding="utf-8")
+    subprocess.run(
+        ["git", "config", "include.path", "extra.config"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    from openagent.security.git_runner import _discover_filter_names
+
+    assert "viainclude" in _discover_filter_names(repo)
+
+
+@requires_git
+def test_a_real_query_failure_is_still_refused(tmp_path: Path, monkeypatch) -> None:
+    """The fail-closed branch stays fail-closed — it just no longer fires on a portability quirk.
+
+    Asserted by forcing a non-zero, non-1 exit rather than by trusting that the argv is portable:
+    the whole point is that "the query did not run" must never read as "no filters are configured".
+    """
+
+    from openagent.security import git_runner
+
+    repo = tmp_path / "fails"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+
+    def broken(*args, **kwargs):
+        return git_runner.GitResult(stdout="", stderr="fatal: something went wrong", returncode=128)
+
+    monkeypatch.setattr(git_runner, "run_capture", broken)
+    with pytest.raises(git_runner.UnsafeGitFilterConfiguration) as caught:
+        git_runner._discover_filter_names(repo)
+    assert "128" in str(caught.value)
+    # stderr is surfaced for diagnosis; stdout never is, because it carries config values.
+    assert "something went wrong" in str(caught.value)
