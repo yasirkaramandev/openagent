@@ -352,9 +352,24 @@ if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI le
     _kernel32.GetCurrentProcess.argtypes = []
     _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
 
-    def _win_error(call: str) -> PrivateFileError:
+    ERROR_FILE_EXISTS = 80
+    ERROR_ALREADY_EXISTS = 183
+
+    def _win_error(call: str) -> OSError:
+        """Translate the last Win32 error, preserving "already exists" as ``FileExistsError``.
+
+        Not cosmetic. ``private_directory`` retries on ``FileExistsError`` when its random name
+        collides, and ``create_private_file`` promises never to truncate an existing file —
+        callers spell both as ``except FileExistsError``/``except OSError``. Collapsing every
+        Win32 failure into ``PrivateFileError`` made the retry unreachable on Windows and turned
+        "this path is taken" into "this path is insecure", which is a different diagnosis.
+        """
+
         code = ctypes.get_last_error()
-        return PrivateFileError(f"{call} failed: [{code}] {ctypes.FormatError(code)}")
+        message = f"{call} failed: [{code}] {ctypes.FormatError(code)}"
+        if code in (ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS):
+            return FileExistsError(message)
+        return PrivateFileError(message)
 
     def _aligned_buffer(size: int) -> ctypes.Array[ctypes.c_uint32]:
         """A DWORD-aligned scratch buffer.
@@ -700,9 +715,9 @@ def private_directory(prefix: str) -> Iterator[Path]:
         try:
             create_private_directory(candidate)
         except FileExistsError:
+            # A name collision, not a security failure: try another. PrivateFileError propagates,
+            # because a directory we could not make private is not something to retry around.
             continue
-        except PrivateFileError:
-            raise
         try:
             yield candidate
         finally:
