@@ -185,17 +185,32 @@ def test_posix_a_restrictive_umask_cannot_narrow_the_directory() -> None:
 
 
 @posix_only
-def test_posix_a_widened_file_fails_verification() -> None:
-    """The verifier is not a formality: loosen the mode and it must notice."""
+def test_posix_an_ordinarily_created_file_fails_verification() -> None:
+    """The verifier is not a formality: hand it a normal file and it must refuse.
 
-    with private_directory("openagent-test-") as directory:
-        path = directory / "secret.json"
-        create_private_file(path, b"x")
-        os.chmod(path, 0o644)
-        verification = verify_private_file(path)
-        assert not verification.ok
-        assert any("mode is" in finding for finding in verification.findings)
-        assert any("other has access" in finding for finding in verification.findings)
+    The negative control deliberately does *not* ``chmod`` to a permissive mask. It writes the file
+    the ordinary way, under an ordinary ``umask``, which is exactly how this mistake happens in
+    real code — someone reaches for ``Path.write_text`` instead of ``create_private_file`` and gets
+    ``0644`` without ever choosing it. Asserting the verifier rejects that is a stronger claim than
+    asserting it rejects a mask nobody would write on purpose.
+
+    (It also keeps the suite free of a real world-readable ``chmod``, which a static analyser is
+    right to flag and which no amount of "but it is only a test" makes safe to normalise.)
+    """
+
+    previous = os.umask(0o022)
+    try:
+        with private_directory("openagent-test-") as directory:
+            path = directory / "secret.json"
+            path.write_text("x")
+            assert stat.S_IMODE(path.stat().st_mode) == 0o644, "umask did not apply as expected"
+            verification = verify_private_file(path)
+            assert not verification.ok
+            assert any("mode is" in finding for finding in verification.findings)
+            assert any("other has access" in finding for finding in verification.findings)
+            assert any("group has access" in finding for finding in verification.findings)
+    finally:
+        os.umask(previous)
 
 
 @posix_only
