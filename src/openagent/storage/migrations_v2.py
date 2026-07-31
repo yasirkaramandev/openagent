@@ -1,0 +1,541 @@
+"""Migrations 0015–0017: the v0.2 schema (spec §23).
+
+These three revisions are written, tested, and **deliberately not chained into**
+:data:`~.migrations.MIGRATIONS` on this branch. The reason is mechanical: revision 0014 lives on the
+0.1.6 release branches and has not reached ``main`` yet. Appending 0015 with ``down_revision="0014"``
+to a chain that ends at 0013 would produce a chain with a hole, and cherry-picking a copy of 0014 here
+would create a *second* 0014 that conflicts with the real one the moment the release merges. Either
+way the damage lands on a user's database, which is the one place a mistake cannot be taken back.
+
+So the chain fragment is declared here and :func:`register_v2_migrations` splices it on only when 0014
+is actually present. Nothing about the migration bodies is provisional — they are complete and their
+tests apply them against a real database — and the day 0014 reaches ``main`` the registration becomes a
+no-op decision rather than a piece of work.
+
+What each revision adds, and why it is a schema change rather than a JSON field:
+
+* **0015** — protocol, discovery strategy, region, workspace, server-state preference, local/remote.
+  These are the columns provider *queries* filter on: "which connections are local", "which speak
+  Anthropic Messages", "which region is this key for". In the JSON blob they are unqueryable, and the
+  region one is load-bearing — a key belongs to exactly one region and the endpoint is chosen from it.
+* **0016** — capability evidence with its provenance. The v0.1 shape was booleans on a model row, which
+  cannot express "supported, by a live probe, against revision X, at time T". Without those columns
+  there is no way to invalidate exactly the rows a credential rotation invalidates.
+* **0017** — resume mode, session/interaction ids, the continuation artifact's path, hash and schema,
+  and the four fingerprints resume verification compares. A resume that cannot check what it is
+  resuming into is the failure mode :mod:`openagent.services.resume` exists to prevent.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+
+from .migrations import (
+    MIGRATIONS,
+    Migration,
+    MigrationVerificationError,
+    _add_column,
+    _column_exists,
+    _redacted_record_id,
+    _table_exists,
+)
+
+#: The revision these three build on. Not a guess — 0014 is "provider generation ownership", and 0015
+#: adds columns to the same ``provider_connections`` table it touched.
+BASE_REVISION = "0014"
+
+_FORWARD = (
+    "Local user data revisions are forward-only; restoration uses the reported online backup."
+)
+
+
+# --------------------------------------------------------------------------- 0015
+
+
+#: Protocol values a provider row may carry. Validated on write rather than trusted: an unrecognised
+#: protocol is a row nothing can build an adapter for, and finding that out at run time turns a data
+#: problem into a mysterious runtime failure.
+_KNOWN_PROTOCOLS = frozenset(
+    {
+        "openai-chat",
+        "openai-responses",
+        "anthropic-messages",
+        "gemini-interactions",
+        "ollama-native-chat",
+        "lmstudio-native-chat",
+    }
+)
+
+_KNOWN_DISCOVERY = frozenset(
+    {
+        "openai-models",
+        "gemini-models",
+        "openrouter-catalog",
+        "ollama-tags-show",
+        "lmstudio-native",
+        "curated-catalog",
+        "manual-only",
+    }
+)
+
+
+def _m0015_provider_protocol_and_region(conn: Connection) -> None:
+    """Promote protocol, discovery, region, workspace and locality to columns (spec §23.1).
+
+    All five already exist inside ``provider_connections.data``. Promoting them is not tidying: they
+    are what the provider list, Doctor and the wizard *filter* on, and a JSON blob cannot be filtered
+    without reading every row and parsing it.
+
+    The backfill reads each row's existing JSON, so no value is invented. A row whose JSON does not
+    name a protocol keeps the historical default (``openai-chat``) — that is what the code has been
+    doing with it all along, so writing it down changes nothing about behaviour and makes it visible.
+    """
+
+    if not _table_exists(conn, "provider_connections"):
+        return
+
+    _add_column(conn, "provider_connections", "protocol", "VARCHAR NOT NULL DEFAULT 'openai-chat'")
+    _add_column(
+        conn,
+        "provider_connections",
+        "model_discovery",
+        "VARCHAR NOT NULL DEFAULT 'openai-models'",
+    )
+    _add_column(conn, "provider_connections", "region", "VARCHAR")
+    _add_column(conn, "provider_connections", "workspace_id", "VARCHAR")
+    #: 0 = the provider keeps no state for us. Default off, everywhere it exists: turning it on is a
+    #: privacy decision the user makes knowingly (spec §10.4, §13.3, §16.5).
+    _add_column(conn, "provider_connections", "server_state_enabled", "INTEGER NOT NULL DEFAULT 0")
+    #: 1 = a service the user runs. Decides the loopback plain-HTTP exemption, so it is a column and
+    #: not a string comparison against the URL at every call site.
+    _add_column(conn, "provider_connections", "is_local", "INTEGER NOT NULL DEFAULT 0")
+    #: Which CompatibilityProfile shape produced this row's behaviour, so a profile change can be
+    #: reasoned about after the fact.
+    _add_column(conn, "provider_connections", "profile_version", "VARCHAR NOT NULL DEFAULT '2'")
+
+    invalid: list[str] = []
+    for row in conn.exec_driver_sql(
+        "SELECT id, provider_type, data FROM provider_connections"
+    ).mappings():
+        payload = _payload(row["data"])
+        protocol = _text(payload.get("protocol")) or "openai-chat"
+        if protocol not in _KNOWN_PROTOCOLS:
+            invalid.append(str(row["id"]))
+            continue
+        discovery = _discovery_for(str(row["provider_type"] or ""), payload)
+        region = _text(payload.get("region"))
+        workspace = _text(payload.get("workspace_id"))
+        # Never inferred as on. A row written before this column existed did not have server state
+        # enabled, whatever its provider is capable of.
+        state = payload.get("server_state_enabled") is True
+        local = _looks_local(payload)
+
+        # NOT mirrored into the JSON aggregate here, though §7.3 asks for that invariant.
+        #
+        # Attempting it fails the migration's own domain-validation gate: ProviderConnection is
+        # declared extra="forbid" and has no model_discovery / server_state_enabled / is_local /
+        # profile_version field, so writing them into `data` makes every provider row unparseable
+        # and the whole migration rolls back. (Confirmed against a real user database.)
+        #
+        # The invariant is therefore blocked on work this migration cannot do alone: the fields
+        # have to exist on the domain model, the repository encode/decode, and the service first.
+        # Until then the columns are authoritative for queries and `data` simply does not carry
+        # them — which is a documented gap, not a disagreement between two stored copies.
+
+        conn.execute(
+            text(
+                "UPDATE provider_connections SET protocol=:protocol, model_discovery=:discovery, "
+                "region=:region, workspace_id=:workspace, server_state_enabled=:state, "
+                "is_local=:local, profile_version='2' WHERE id=:id"
+            ),
+            {
+                "protocol": protocol,
+                "discovery": discovery,
+                "region": region,
+                "workspace": workspace,
+                "state": 1 if state else 0,
+                "local": 1 if local else 0,
+                "id": row["id"],
+            },
+        )
+
+    if invalid:
+        listed = ", ".join(_redacted_record_id(value) for value in sorted(invalid))
+        raise MigrationVerificationError(
+            "these provider connections name a wire protocol this build does not implement, so the "
+            f"protocol column cannot be populated for them: {listed}. Fix or remove them and retry; "
+            "the pre-migration backup is retained"
+        )
+
+
+#: Discovery strategy per provider type, for the backfill. Only providers whose strategy is *not* the
+#: OpenAI convention are listed — everything else keeps the default, which is what it was already
+#: doing.
+_DISCOVERY_BY_TYPE = {
+    "gemini": "gemini-models",
+    "openrouter": "openrouter-catalog",
+    "ollama": "ollama-tags-show",
+    "lmstudio": "lmstudio-native",
+    "qwen": "curated-catalog",
+}
+
+
+def _discovery_for(provider_type: str, payload: dict[str, Any]) -> str:
+    explicit = _text(payload.get("model_discovery"))
+    if explicit and explicit in _KNOWN_DISCOVERY:
+        return explicit
+    return _DISCOVERY_BY_TYPE.get(provider_type, "openai-models")
+
+
+#: Hosts that make a connection local. Matched on the parsed host, never as a substring of the URL:
+#: ``https://localhost.attacker.example`` contains "localhost" and is not loopback.
+_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"})
+
+
+def _looks_local(payload: dict[str, Any]) -> bool:
+    from urllib.parse import urlsplit
+
+    for key in ("base_url", "anthropic_base_url"):
+        url = _text(payload.get(key))
+        if not url:
+            continue
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            continue
+        if host in _LOOPBACK:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- 0016
+
+
+_EVIDENCE_TABLE_DDL = """
+CREATE TABLE capability_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id VARCHAR NOT NULL REFERENCES provider_connections (id) ON DELETE CASCADE,
+    model_id VARCHAR NOT NULL,
+    capability VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    source VARCHAR NOT NULL,
+    observed_at VARCHAR NOT NULL,
+    probe_version INTEGER NOT NULL DEFAULT 1,
+    provider_version VARCHAR,
+    model_revision VARCHAR,
+    credential_revision VARCHAR NOT NULL DEFAULT '',
+    -- The four columns below are what makes invalidation *targeted* rather than a blunt purge.
+    -- Evidence is only valid for the endpoint that produced it: the same model id behind a
+    -- different protocol, base URL, region or workspace is a different question, and answering it
+    -- from a cached row is how a capability the user does not have gets reported as supported.
+    -- Without these stored, "invalidate on base URL change" cannot be expressed as a query, so
+    -- the rule would exist in prose only.
+    protocol VARCHAR NOT NULL DEFAULT '',
+    -- The base URL is fingerprinted, not stored: it can carry a key in a query string or a
+    -- tenant name in a host, and this table is read by Doctor and printed.
+    base_url_fingerprint VARCHAR NOT NULL DEFAULT '',
+    region VARCHAR,
+    workspace_id VARCHAR,
+    detail VARCHAR NOT NULL DEFAULT '',
+    -- Uniqueness includes protocol and endpoint identity for the same reason: two probes of one
+    -- model over two protocols are two facts, and collapsing them onto one row would let the
+    -- second silently overwrite the first.
+    UNIQUE (provider_id, model_id, capability, source, protocol, base_url_fingerprint)
+)
+"""
+
+#: The legacy capability booleans, and the capability each maps to. A row rewritten from these is
+#: evidence of the *weakest* kind: it records what an older build believed, not something observed
+#: under the current probe definition.
+_LEGACY_CAPABILITY_FIELDS = {
+    "text": "text",
+    "streaming": "streaming",
+    "tool_calling": "tool_calling",
+    "parallel_tool_calling": "parallel_tool_calling",
+    "structured_output": "structured_output",
+    "vision": "image_input",
+    "system_prompt": "system_prompt",
+}
+
+#: The source a migrated legacy boolean gets. Emphatically **not** ``live_probe``: the old row does not
+#: record whether anything was probed, under which probe version, or against which model revision, and
+#: labelling it as a live probe would let a v0.1 guess outrank a real v0.2 catalog reading forever.
+LEGACY_SOURCE = "legacy_migration"
+
+
+def _m0016_capability_evidence(conn: Connection) -> None:
+    """Give capability claims a provenance (spec §23.2).
+
+    The v0.1 shape is booleans inside ``models.data.capabilities`` plus a single
+    ``capabilities_tested_at``. That cannot express the four things v0.2 decides with: which source
+    said so, under which probe definition, against which model revision, and with which credential. A
+    ledger needs all four, because the point of ranking evidence is to invalidate exactly the rows a
+    change invalidates — and a boolean has nothing to invalidate on.
+
+    Legacy booleans are carried across as ``legacy_migration``, which is the honest source. Recording
+    them as ``live_probe`` would be a lie with consequences: it is the strongest automatic source, so a
+    v0.1 guess would outrank every real catalog reading from then on.
+    """
+
+    if not _table_exists(conn, "capability_evidence"):
+        conn.exec_driver_sql(_EVIDENCE_TABLE_DDL)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_capability_evidence_model "
+            "ON capability_evidence (provider_id, model_id)"
+        )
+
+    if not _table_exists(conn, "models"):
+        return
+
+    # A model row's provider column has been named differently across revisions; resolve it rather
+    # than assuming, because guessing wrong here silently migrates zero rows.
+    provider_column = next(
+        (
+            candidate
+            for candidate in ("provider_connection", "provider_id")
+            if _column_exists(conn, "models", candidate)
+        ),
+        None,
+    )
+    if provider_column is None:
+        return
+
+    known_providers = {
+        str(row[0]) for row in conn.exec_driver_sql("SELECT id FROM provider_connections")
+    }
+
+    for row in conn.exec_driver_sql(
+        f"SELECT id, {provider_column} AS provider, data FROM models"
+    ).mappings():
+        provider_id = str(row["provider"] or "")
+        if provider_id not in known_providers:
+            # The foreign key would reject it. A model row whose provider is gone is a pre-existing
+            # inconsistency, not something this migration should fail the whole upgrade over.
+            continue
+        payload = _payload(row["data"])
+        capabilities = payload.get("capabilities")
+        if not isinstance(capabilities, dict):
+            continue
+        observed_at = _text(payload.get("capabilities_tested_at")) or ""
+        remote_model = _text(payload.get("remote_model_id")) or str(row["id"])
+
+        for legacy_field, capability in _LEGACY_CAPABILITY_FIELDS.items():
+            value = capabilities.get(legacy_field)
+            if value is None:
+                # None means "never determined" in the v0.1 model too. Writing a row for it would
+                # turn an absence of knowledge into a record of one.
+                continue
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO capability_evidence "
+                    "(provider_id, model_id, capability, status, source, observed_at, "
+                    " probe_version, model_revision, credential_revision, detail) "
+                    "VALUES (:provider, :model, :capability, :status, :source, :observed, "
+                    " 0, NULL, :credential, :detail)"
+                ),
+                {
+                    "provider": provider_id,
+                    "model": remote_model,
+                    "capability": capability,
+                    "status": "supported" if value is True else "unsupported",
+                    "source": LEGACY_SOURCE,
+                    "observed": observed_at,
+                    "credential": "",
+                    # probe_version 0 marks "produced by no probe definition we still run", so a
+                    # freshness check treats it as stale rather than current.
+                    "detail": "migrated from a pre-v0.2 capability flag",
+                },
+            )
+
+
+# --------------------------------------------------------------------------- 0017
+
+
+_RESUME_COLUMNS = (
+    ("resume_mode", "VARCHAR NOT NULL DEFAULT 'normalized_replay'"),
+    ("remote_session_id", "VARCHAR"),
+    ("remote_interaction_id", "VARCHAR"),
+    # Kept separate from remote_interaction_id rather than folded into it. Gemini's
+    # `previous_interaction_id` and the Responses family's `previous_response_id` are different
+    # fields with different lifetimes on different endpoints, and a provider can expose both.
+    # One column would force a resume to guess which field a stored id belongs in, and guessing
+    # wrong sends a valid-looking id the provider will reject.
+    ("remote_response_id", "VARCHAR"),
+    ("continuation_path", "VARCHAR"),
+    ("continuation_hash", "VARCHAR"),
+    ("continuation_schema", "INTEGER"),
+    ("runtime_version", "VARCHAR"),
+    ("provider_fingerprint", "VARCHAR"),
+    ("model_fingerprint", "VARCHAR"),
+    ("project_fingerprint", "VARCHAR"),
+)
+
+_KNOWN_RESUME_MODES = frozenset(
+    {
+        "native_session",
+        "server_interaction",
+        "client_native_replay",
+        "normalized_replay",
+        "unsupported",
+    }
+)
+
+
+def _m0017_session_resume(conn: Connection) -> None:
+    """Record how each session can be resumed, and what to check first (spec §23.3).
+
+    Every column here is something :func:`~openagent.services.resume.verify_resume` compares. Storing
+    the continuation's *path and hash* rather than its bytes keeps the row small enough to list
+    sessions cheaply while still making a truncated artifact detectable — and a truncated native
+    message is the failure that does not error, it just degrades the turn.
+
+    The four fingerprints exist because each one changes independently and each one changes what a
+    resume means: the project decides whether a CLI session id is even addressable, the provider
+    fingerprint decides whether server-held state is still visible, the model fingerprint decides
+    whether recorded capabilities still apply, and the runtime version decides whether the session
+    format is the same one.
+    """
+
+    if not _table_exists(conn, "runs"):
+        return
+
+    for column, ddl in _RESUME_COLUMNS:
+        _add_column(conn, "runs", column, ddl)
+
+    conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_runs_remote_session ON runs (remote_session_id)"
+    )
+
+    # Backfill from what each run already recorded. A run with a CLI session id was resumable by that
+    # id all along; writing the mode down makes the resume path explicit instead of re-derived.
+    session_column = next(
+        (
+            candidate
+            for candidate in ("session_id", "cli_session_id")
+            if _column_exists(conn, "runs", candidate)
+        ),
+        None,
+    )
+    if session_column is not None:
+        conn.exec_driver_sql(
+            "UPDATE runs SET resume_mode='native_session', remote_session_id="
+            f"{session_column} WHERE {session_column} IS NOT NULL AND {session_column} != ''"
+        )
+
+    invalid = [
+        str(row[0])
+        for row in conn.exec_driver_sql(
+            "SELECT id FROM runs WHERE resume_mode NOT IN "
+            "('native_session','server_interaction','client_native_replay','normalized_replay',"
+            "'unsupported')"
+        )
+    ]
+    if invalid:
+        listed = ", ".join(_redacted_record_id(value) for value in sorted(invalid))
+        raise MigrationVerificationError(
+            f"these runs carry a resume mode this build does not implement: {listed}"
+        )
+
+
+# --------------------------------------------------------------------------- chain fragment
+
+
+#: The three revisions, in order, chained to :data:`BASE_REVISION`.
+V2_MIGRATIONS: tuple[Migration, ...] = (
+    Migration(
+        "0015",
+        BASE_REVISION,
+        "provider protocol, discovery, region and locality",
+        _m0015_provider_protocol_and_region,
+        _FORWARD,
+    ),
+    Migration(
+        "0016",
+        "0015",
+        "capability evidence with provenance",
+        _m0016_capability_evidence,
+        _FORWARD,
+    ),
+    Migration(
+        "0017",
+        "0016",
+        "session resume mode, continuation reference and fingerprints",
+        _m0017_session_resume,
+        _FORWARD,
+    ),
+)
+
+
+def base_revision_present(migrations: list[Migration] | None = None) -> bool:
+    """Whether the revision this fragment chains onto is in the active chain."""
+
+    chain = migrations if migrations is not None else MIGRATIONS
+    return any(migration.revision == BASE_REVISION for migration in chain)
+
+
+def register_v2_migrations(migrations: list[Migration] | None = None) -> bool:
+    """Splice 0015–0017 onto the chain, if and only if 0014 is there.
+
+    Returns whether they were registered. Called at import time by nothing: the caller is the module
+    that owns the chain, and on this branch that call has not been made because 0014 is still on the
+    release branches. Splicing regardless would leave a hole at 0014 that
+    :func:`~.migrations.run_migrations` walks straight into, on a user's database.
+    """
+
+    chain = migrations if migrations is not None else MIGRATIONS
+    if not base_revision_present(chain):
+        return False
+    existing = {migration.revision for migration in chain}
+    for migration in V2_MIGRATIONS:
+        if migration.revision not in existing:
+            chain.append(migration)
+    return True
+
+
+def registration_status() -> dict[str, Any]:
+    """A Doctor-readable explanation of why these are or are not active."""
+
+    present = base_revision_present()
+    return {
+        "revisions": [migration.revision for migration in V2_MIGRATIONS],
+        "base_revision": BASE_REVISION,
+        "base_revision_present": present,
+        "registered": present
+        and all(
+            migration.revision in {m.revision for m in MIGRATIONS} for migration in V2_MIGRATIONS
+        ),
+        "reason": (
+            "active"
+            if present
+            else (
+                f"revision {BASE_REVISION} is not in this build's migration chain; 0015-0017 chain "
+                f"onto it and are held back until it lands, because a chain with a hole would be "
+                f"walked into on a user's database"
+            )
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _payload(raw: object) -> dict[str, Any]:
+    """Parse a domain JSON blob, tolerating the ways it can be stored."""
+
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None

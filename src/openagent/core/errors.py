@@ -28,8 +28,24 @@ class ErrorType(str, Enum):
     AUTHENTICATION_FAILED = "authentication_failed"
     PERMISSION_DENIED = "permission_denied"
     MODEL_NOT_FOUND = "model_not_found"
+    #: The provider still routes the model but has announced its removal. Distinct from
+    #: MODEL_NOT_FOUND because the request may still succeed today — the user needs to migrate, not
+    #: to fix a typo (spec §8.2; e.g. DeepSeek's retired `deepseek-chat`/`deepseek-reasoner`
+    #: aliases).
+    MODEL_DEPRECATED = "model_deprecated"
+    #: The model exists and the credential is valid, but it cannot do what the request needs — a
+    #: tool call sent to a model with no tool support, say. Retrying cannot help; choosing another
+    #: model can.
+    MODEL_CAPABILITY_MISSING = "model_capability_missing"
+    #: The endpoint rejected a *parameter*, not the content. Separated from INVALID_REQUEST so the
+    #: compatibility profile that sent it can be corrected instead of the user's prompt.
+    UNSUPPORTED_PARAMETER = "unsupported_parameter"
     PROVIDER_RATE_LIMITED = "provider_rate_limited"
     PROVIDER_OVERLOADED = "provider_overloaded"
+    #: The credential is valid but belongs to a different region/workspace than the endpoint being
+    #: called. Reads as an auth failure on the wire and is not one — the fix is the endpoint, not
+    #: the key (spec §16, §18.3).
+    PROVIDER_REGION_MISMATCH = "provider_region_mismatch"
     INSUFFICIENT_BALANCE = "insufficient_balance"
     INVALID_REQUEST = "invalid_request"
     CONTEXT_LIMIT = "context_limit"
@@ -52,9 +68,57 @@ class ErrorType(str, Enum):
     #: success (spec §15.5, some NVIDIA model types).
     ASYNC_UNSUPPORTED = "async_unsupported"
     MALFORMED_STREAM = "malformed_stream"
+    #: The transport stayed up and the provider stopped sending without a terminal event. Distinct
+    #: from CONNECTION_LOST, which is the socket dropping: here the turn is incomplete but nothing
+    #: failed at the network layer, so the remedy is to treat the turn as unfinished rather than to
+    #: diagnose connectivity (spec §8.2).
+    STREAM_INTERRUPTED = "stream_interrupted"
     INVALID_TOOL_CALL = "invalid_tool_call"
     INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
+    #: A continuation needs the previous assistant turn (its tool calls, and for some providers the
+    #: reasoning that accompanied them) and it is not available. Sending the request anyway earns a
+    #: provider 400 at best and a silently degraded turn at worst (spec §10, §15.3).
+    TOOL_HISTORY_INCOMPLETE = "tool_history_incomplete"
+    #: A stored continuation envelope cannot be replayed: wrong provider or protocol, a failed
+    #: integrity hash, or a schema this build does not understand (spec §8.4).
+    CONTINUATION_INVALID = "continuation_invalid"
+    #: The provider was holding the conversation state and no longer is. Server-side resume is gone;
+    #: only a new session or a client-side replay remains (spec §26).
+    REMOTE_SESSION_EXPIRED = "remote_session_expired"
+    #: A response was requested in a structured shape and did not arrive in it.
+    STRUCTURED_OUTPUT_FAILED = "structured_output_failed"
+    #: The endpoint answered in a protocol other than the one the adapter speaks — an
+    #: OpenAI-compatible URL that turns out to serve something else, or a version skew.
+    PROTOCOL_MISMATCH = "protocol_mismatch"
     OUTPUT_LIMIT_EXCEEDED = "output_limit_exceeded"
+    #: The request never reached the provider: connection refused, DNS failure, no route. Distinct
+    #: from TIMEOUT (the endpoint accepted the connection and did not answer in time) and from
+    #: CONNECTION_LOST (a stream that had already delivered events). The distinction is what tells a
+    #: local-provider user to *start their server* rather than to wait (spec §8.2, §12.4).
+    NETWORK_UNAVAILABLE = "network_unavailable"
+    #: TLS negotiation failed — an untrusted or expired certificate, a hostname mismatch, a protocol
+    #: version refusal. Never retried and never downgraded: a remote endpoint that cannot prove its
+    #: identity is not one to send a credential to (spec §23.3, §27).
+    TLS_ERROR = "tls_error"
+
+    # --- local provider services (spec §12, §13) -------------------------------------------
+    #: The local server (Ollama, LM Studio) is not reachable. Not retried: a daemon that is down
+    #: stays down until someone starts it, and backing off just delays the message that says so.
+    LOCAL_SERVER_UNAVAILABLE = "local_server_unavailable"
+    #: The server is up and the model is not loaded into memory. Recoverable by an explicit,
+    #: user-approved load — never by OpenAgent loading it unasked.
+    LOCAL_MODEL_NOT_LOADED = "local_model_not_loaded"
+    #: The model could not be loaded or kept resident for want of memory. Retrying the same request
+    #: on the same machine reproduces it.
+    LOCAL_MODEL_OUT_OF_MEMORY = "local_model_out_of_memory"
+
+    # --- model catalog (spec §7, §25.3) ----------------------------------------------------
+    #: The catalog could not be read at all. Emphatically *not* the same as an empty catalog: the
+    #: wizard must offer a retry and a manual model ID, not report that the provider has no models.
+    CATALOG_UNAVAILABLE = "catalog_unavailable"
+    #: Some catalog entries parsed and others did not. The usable ones are still offered, labelled
+    #: as incomplete, rather than the whole list being discarded or the gap being hidden.
+    CATALOG_PARTIAL = "catalog_partial"
     #: The on-disk database was written by a newer OpenAgent whose domain shape this binary cannot
     #: safely read (spec §6). Distinct from a corrupt row (:data:`DATA_VALIDATION`) — the data is
     #: fine, the *reader* is too old.
@@ -66,19 +130,65 @@ class ErrorType(str, Enum):
     UNKNOWN = "unknown"
 
 
-#: Errors that are safe to retry automatically (spec §44).
+#: Errors that are safe to retry automatically (spec §8.3, §44).
+#:
+#: Deliberately small. An error belongs here only when the *same request* has a real chance of
+#: succeeding unchanged after a wait — a rate limit, an overloaded upstream, a timeout. Everything
+#: else either needs a different request or a human, and retrying it converts one clear failure into
+#: several slow identical ones while spending the user's quota.
 RETRYABLE = {
     ErrorType.PROVIDER_RATE_LIMITED,
     ErrorType.PROVIDER_OVERLOADED,
     ErrorType.TIMEOUT,
+    # A connection that never opened may be a transient DNS or routing failure, and no request was
+    # delivered, so replaying it cannot duplicate anything (spec §8.3 permits connection reset and
+    # temporary DNS). A genuinely down server exhausts the small retry budget and then reports
+    # honestly — the cost is one bounded backoff, not a wrong diagnosis.
+    ErrorType.NETWORK_UNAVAILABLE,
 }
 
-#: Errors that must never be retried (spec §44).
+#: Errors that must never be retried (spec §8.3, §44).
+#:
+#: This is an assertion, not a filter: :func:`is_retryable` already answers by membership in
+#: :data:`RETRYABLE`, so nothing here changes behaviour on its own. It exists so that a future
+#: change which adds one of these to ``RETRYABLE`` fails a test instead of quietly billing the user
+#: four times for the same rejected request. The two sets are asserted disjoint.
 NON_RETRYABLE = {
     ErrorType.AUTHENTICATION_FAILED,
     ErrorType.PERMISSION_DENIED,
+    ErrorType.PROVIDER_REGION_MISMATCH,
     ErrorType.INVALID_REQUEST,
+    ErrorType.UNSUPPORTED_PARAMETER,
     ErrorType.INSUFFICIENT_BALANCE,
+    # A 404 for a model, a retired alias, and a model that cannot do the thing are all settled
+    # facts about the request; waiting does not change any of them (spec §8.3).
+    ErrorType.MODEL_NOT_FOUND,
+    ErrorType.MODEL_DEPRECATED,
+    ErrorType.MODEL_CAPABILITY_MISSING,
+    ErrorType.CONTEXT_LIMIT,
+    ErrorType.OUTPUT_LIMIT_EXCEEDED,
+    # Malformed tool traffic is deterministic: the same schema and the same arguments produce the
+    # same rejection.
+    ErrorType.INVALID_TOOL_CALL,
+    ErrorType.INVALID_TOOL_ARGUMENTS,
+    ErrorType.TOOL_HISTORY_INCOMPLETE,
+    # Resume state is either valid or gone. Neither improves with a backoff.
+    ErrorType.CONTINUATION_INVALID,
+    ErrorType.REMOTE_SESSION_EXPIRED,
+    ErrorType.PROTOCOL_MISMATCH,
+    # A local daemon that is down stays down until someone starts it, and a model that did not fit
+    # in memory will not fit four seconds later.
+    ErrorType.LOCAL_SERVER_UNAVAILABLE,
+    ErrorType.LOCAL_MODEL_NOT_LOADED,
+    ErrorType.LOCAL_MODEL_OUT_OF_MEMORY,
+    # Replaying a stream that already delivered events would duplicate its text, tool calls and file
+    # changes. Recovery is a caller-level decision, never an automatic one (spec §44).
+    ErrorType.CONNECTION_LOST,
+    ErrorType.STREAM_INTERRUPTED,
+    ErrorType.USER_CANCELLED,
+    # A certificate that does not validate now will not validate on the next attempt, and retrying
+    # a TLS failure is how a downgrade gets normalized into "flaky network".
+    ErrorType.TLS_ERROR,
 }
 
 

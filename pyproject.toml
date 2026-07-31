@@ -110,6 +110,7 @@ testpaths = ["tests"]
 markers = [
     "integration: opt-in tests that hit live APIs (require API keys in env)",
     "live_cli: tests that invoke a real installed CLI (codex/claude/…)",
+    "live_provider: tests that spend real provider quota; opt-in, credential-gated, never on a PR",
     "container: tests that require an explicitly provisioned local Docker/Podman image",
     # Classification markers (spec: Aşama 0). CI splits on these so a fast PR gate can run the
     # unit/lint layer while the slower subprocess/multiprocess/migration layers run separately —

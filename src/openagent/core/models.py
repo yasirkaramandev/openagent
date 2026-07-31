@@ -34,9 +34,43 @@ class RuntimeType(str, Enum):
 
 
 class Protocol(str, Enum):
+    """The wire protocol a request is spoken in — *not* the vendor it is spoken to.
+
+    These are separate axes and conflating them is what makes provider adapters multiply. DeepSeek,
+    Kimi and GLM are three vendors sharing one protocol; LM Studio speaks three depending on how it
+    is configured. A provider names *who*; this names *how*, and only the how decides which adapter
+    serializes the request (spec §6-§7).
+    """
+
     OPENAI_CHAT = "openai-chat"
     OPENAI_RESPONSES = "openai-responses"
     ANTHROPIC_MESSAGES = "anthropic-messages"
+    GEMINI_INTERACTIONS = "gemini-interactions"
+    OLLAMA_NATIVE_CHAT = "ollama-native-chat"
+    LMSTUDIO_NATIVE_CHAT = "lmstudio-native-chat"
+
+
+#: Historical alias. ``TransportProtocol`` is the spec's name for this enum; ``Protocol`` is the
+#: name already persisted in provider rows, so the enum keeps its identity and gains an alias
+#: rather than being renamed under existing data.
+TransportProtocol = Protocol
+
+
+class DiscoveryStrategy(str, Enum):
+    """How a provider's model catalog is obtained (spec §7).
+
+    ``MANUAL_ONLY`` is a first-class outcome, not a failure state: a provider with no listable
+    catalog is still usable by typing a model ID, and saying so is better than presenting an empty
+    list as though the provider had no models.
+    """
+
+    OPENAI_MODELS = "openai-models"
+    GEMINI_MODELS = "gemini-models"
+    OPENROUTER_CATALOG = "openrouter-catalog"
+    OLLAMA_TAGS_SHOW = "ollama-tags-show"
+    LMSTUDIO_NATIVE = "lmstudio-native"
+    CURATED_CATALOG = "curated-catalog"
+    MANUAL_ONLY = "manual-only"
 
 
 class RunStatus(str, Enum):

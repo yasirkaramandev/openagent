@@ -549,6 +549,24 @@ Cancel really stops the agent, for both runtimes:
 
 A cancelled run records exactly one `run.cancelled`, and its artifacts stay readable.
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | how the pieces fit together |
+| [docs/providers.md](docs/providers.md) | the nine API providers, their protocols, regions, and **live verification status** |
+| [docs/cli-adapters.md](docs/cli-adapters.md) | the six CLI adapters, discovery, permissions, resume, updates |
+| [docs/session-resume.md](docs/session-resume.md) | the four resume modes, what is verified first, and the terminal contract |
+| [docs/doctor.md](docs/doctor.md) | Doctor's eleven sections and what each status means |
+| [docs/wizard.md](docs/wizard.md) | the Add-Agent wizard, capability badges and the probe gate |
+| [docs/migrations.md](docs/migrations.md) | the schema chain, and why 0015–0017 are held back |
+| [ROADMAP.md](ROADMAP.md) | what is shipped, what is next, and what is explicitly not done |
+
+A note that applies to all of them: **"supported" means the wire format is implemented and its offline
+contract suite passes.** Whether a given *model* can do a given thing is capability evidence, it is
+per model, and it is shown with its source. Nothing in the docs should be read as a claim about a
+model.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md). Highlights: OS-keychain credentials, minimal subprocess

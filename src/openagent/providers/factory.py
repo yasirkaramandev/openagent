@@ -7,6 +7,7 @@ and supplies default base URLs / protocols for known providers so the user only 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 from ..core.models import Protocol, ProviderConnection
@@ -132,6 +133,18 @@ PRESETS: dict[str, ProviderPreset] = {
         openai_base_url="http://localhost:1234/v1",
         needs_key=False,
     ),
+    # Gemini speaks its own protocol, so it has no OpenAI-compatible base URL. Without a preset it
+    # is implemented and unreachable: the wizard builds its provider list from this table.
+    "gemini": ProviderPreset(
+        "gemini",
+        "Google Gemini (Interactions API)",
+        Protocol.GEMINI_INTERACTIONS,
+        needs_key=True,
+        default_env_var="GEMINI_API_KEY",
+        credential_label="Gemini API key",
+        credential_hint="From Google AI Studio. Vertex AI (ADC) is a separate provider, not this one.",
+        docs_url="https://ai.google.dev/api",
+    ),
     "custom": ProviderPreset("custom", "Custom OpenAI-compatible endpoint", Protocol.OPENAI_CHAT),
 }
 
@@ -191,7 +204,23 @@ def resolve_base_url(provider: ProviderConnection) -> str:
 
 
 def build_adapter(provider: ProviderConnection, api_key: str | None) -> ProviderAdapter:
-    """Construct the concrete adapter for a provider connection."""
+    """Construct the concrete adapter for a provider connection.
+
+    The single chokepoint between a stored connection and something that can talk to it, which is
+    why the v0.2 routing decision lives here rather than in each caller: provider_service and
+    preflight both go through this, so a provider is either upgraded for both or for neither.
+
+    A provider with a :mod:`~.spec` entry is served by :class:`~.wire_adapter.WireProviderAdapter` —
+    the shared protocol wires, the evidence-aware probe, the region-bound endpoint resolution.
+    Everything else (openai, anthropic, nvidia-build, custom, and the generic OpenAI-compatible
+    presets) keeps the v0.1 adapters, which are still the right implementation for them.
+    """
+
+    from .spec import get_spec
+
+    spec = get_spec(provider.provider_type)
+    if spec is not None:
+        return _build_v2_adapter(provider, api_key, spec)
 
     base_url = resolve_base_url(provider)
     if provider.protocol is Protocol.ANTHROPIC_MESSAGES:
@@ -214,4 +243,37 @@ def build_adapter(provider: ProviderConnection, api_key: str | None) -> Provider
         provider_type=provider.provider_type,
         extra_headers=provider.extra_headers or None,
         compat=get_compat(provider.provider_type),
+    )
+
+
+def _build_v2_adapter(
+    provider: ProviderConnection, api_key: str | None, spec: Any
+) -> ProviderAdapter:
+    """Build a v0.2 adapter from a stored connection.
+
+    The connection's own protocol and region win over the spec's defaults — that is what makes the
+    row meaningful — but a row whose protocol the provider does not serve in that region must not
+    silently be served over a different one. ``spec.resolve`` raises for exactly that case, and the
+    error names both sides.
+
+    ``base_url`` is passed through when the row carries one, so a self-hosted endpoint or a gateway
+    keeps working; the region still says which credential population the key belongs to.
+    """
+
+    from .wire_adapter import WireProviderAdapter
+
+    protocol = provider.protocol if provider.protocol in spec.protocols else None
+    base_url = provider.base_url or provider.anthropic_base_url or None
+
+    return WireProviderAdapter(
+        spec=spec,
+        api_key=api_key,
+        region=provider.region or None,
+        protocol=protocol,
+        base_url=base_url,
+        workspace_id=provider.workspace_id or None,
+        extra_headers=provider.extra_headers or None,
+        # A local provider on a loopback address is exempt from the TLS requirement; anything else
+        # would need an explicit opt-in, which a stored row cannot grant on the user's behalf.
+        allow_insecure_http=False,
     )

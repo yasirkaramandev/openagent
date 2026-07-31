@@ -194,6 +194,16 @@ class AntigravityAdapter:
         # ``--dangerously-skip-permissions`` — an experimental, opt-in path (see module docstring).
         # So ``edits_files``/``runs_commands`` reflect whether that opt-in is actually enabled, and
         # the adapter is flagged ``experimental`` rather than pretending editing is verified & safe.
+        # Nothing is claimed for a binary that is not there: a capability is a statement about this
+        # installation, and the wizard would otherwise offer a CLI that cannot run.
+        if not self.executable:
+            return CliCapabilities(
+                structured_events=False,
+                resumable=False,
+                edits_files=False,
+                runs_commands=False,
+                experimental=True,
+            )
         editing = self.allow_experimental_edit or self.allow_dangerous_bypass
         return CliCapabilities(
             structured_events=True,

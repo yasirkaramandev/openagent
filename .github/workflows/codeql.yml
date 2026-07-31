@@ -11,13 +11,20 @@ name: CodeQL
 
 on:
   push:
-    branches: [main, release-candidate]
+    branches: [main, release-candidate, "release/**", "feat/**"]
+  # Two separate lessons, both kept.
+  #
   # Releases are prepared as a stack: a fix branch based on a release branch, merged down. Scanning
   # only PRs that target `main` meant an entire release candidate could be built, promoted, and
   # soaked without CodeQL ever seeing it — the scan arrived after the decisions it was meant to
-  # inform. Release and fix branches are therefore scanned as their own PR targets.
+  # inform.
+  #
+  # The same hole existed one level over, for integration branches. `pull_request.branches` filters
+  # on the PR's *base*, so PR #11 (base `feat/v0.2-integration`) was never scanned even though
+  # `fix/**` was already listed — that pattern matched its head, which this filter never looks at.
+  # A high-severity finding in that PR's own code surfaced the moment `feat/**` was added.
   pull_request:
-    branches: [main, release-candidate, "release/**", "fix/**"]
+    branches: [main, release-candidate, "release/**", "fix/**", "feat/**"]
   schedule:
     # Weekly, so a newly published query finds an existing vulnerability without waiting for the
     # next commit to this repository.

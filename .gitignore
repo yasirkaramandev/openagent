@@ -30,3 +30,7 @@ env/
 .idea/
 .vscode/
 *.swp
+
+# Coverage shard files. `coverage combine` on CI picks up any `.coverage.*` in the tree and
+# fails with "No source for code" when the shard records another machine's absolute paths.
+.coverage.*
