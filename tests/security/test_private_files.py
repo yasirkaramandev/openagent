@@ -75,12 +75,21 @@ def test_the_directory_is_removed_on_exit() -> None:
     assert not remembered.exists()
 
 
-def test_the_directory_survives_an_exception_only_as_cleanup() -> None:
+class _Boom(Exception):
+    """Distinct from PrivateFileError, which is a RuntimeError.
+
+    Raising RuntimeError here would let a *failure to create* the directory satisfy the
+    pytest.raises and leave the real assertion untested — which is exactly what happened on the
+    first Windows run of this suite.
+    """
+
+
+def test_the_directory_is_removed_even_when_the_body_raises() -> None:
     remembered: Path | None = None
-    with pytest.raises(RuntimeError):
+    with pytest.raises(_Boom):
         with private_directory("openagent-test-") as directory:
             remembered = directory
-            raise RuntimeError("boom")
+            raise _Boom("boom")
     assert remembered is not None
     assert not remembered.exists()
 

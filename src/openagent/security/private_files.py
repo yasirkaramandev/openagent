@@ -544,7 +544,7 @@ if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI le
         try:
             expected_user = _current_user_sid()
             owner = _sid_string(owner_pointer)
-            if not _advapi32.EqualSid(owner_pointer, ctypes.byref(expected_user)):
+            if not _advapi32.EqualSid(owner_pointer, expected_user):
                 findings.append(f"owner is {owner}, not the current user")
 
             control = wintypes.WORD()
@@ -561,23 +561,30 @@ if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI le
             else:
                 findings.append("could not read the security descriptor control flags")
 
-            trustees = _read_dacl_trustees(dacl_pointer, findings)
+            ace_sids = _read_dacl_aces(dacl_pointer, findings)
+            trustees = tuple(_sid_string(sid) for sid in ace_sids)
 
-            allowed = {
-                _sid_string(ctypes.cast(ctypes.byref(expected_user), ctypes.c_void_p)),
-                _sid_string(
-                    ctypes.cast(ctypes.byref(_well_known_sid(WinLocalSystemSid)), ctypes.c_void_p)
-                ),
-            }
-            forbidden = {
-                _sid_string(ctypes.cast(ctypes.byref(_well_known_sid(kind)), ctypes.c_void_p)): name
-                for kind, name in _FORBIDDEN_WELL_KNOWN.items()
-            }
-            for trustee in trustees:
-                if trustee in forbidden:
-                    findings.append(f"{forbidden[trustee]} has an ACE")
-                elif trustee not in allowed:
-                    findings.append(f"unexpected trustee {trustee} has an ACE")
+            # SIDs are compared with EqualSid on live pointers, never by rendering both sides to
+            # strings. An earlier revision built the comparison set with
+            # ``_sid_string(cast(byref(_well_known_sid(...)), c_void_p))``; the buffer that
+            # expression allocates is unreferenced by the time the cast is passed on, so the
+            # comparison ran against garbage and SYSTEM's own ACE was reported as an intruder.
+            # That failure was loud. The same construction on the *forbidden* side would have
+            # been silent, and would have passed a world-readable file.
+            system_sid = _well_known_sid(WinLocalSystemSid)
+            allowed = (expected_user, system_sid)
+            forbidden = [
+                (name, _well_known_sid(kind)) for kind, name in _FORBIDDEN_WELL_KNOWN.items()
+            ]
+
+            for sid, rendered in zip(ace_sids, trustees, strict=True):
+                named = next(
+                    (name for name, known in forbidden if _advapi32.EqualSid(sid, known)), None
+                )
+                if named is not None:
+                    findings.append(f"{named} has an ACE")
+                elif not any(_advapi32.EqualSid(sid, known) for known in allowed):
+                    findings.append(f"unexpected trustee {rendered} has an ACE")
 
             return SecurityVerification(
                 path=path,
@@ -592,7 +599,14 @@ if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI le
             if descriptor_pointer:
                 _kernel32.LocalFree(descriptor_pointer)
 
-    def _read_dacl_trustees(dacl: ctypes.c_void_p, findings: list[str]) -> tuple[str, ...]:
+    def _read_dacl_aces(dacl: ctypes.c_void_p, findings: list[str]) -> tuple[ctypes.c_void_p, ...]:
+        """Every ACE's SID, as a pointer into the caller's still-live security descriptor.
+
+        Pointers rather than strings, because the caller compares them with ``EqualSid``. They
+        are only valid until the descriptor is freed, which is why this is a private helper and
+        not part of the module's contract.
+        """
+
         if not dacl:
             findings.append("DACL is NULL (the object grants everyone access)")
             return ()
@@ -603,7 +617,7 @@ if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI le
             findings.append("could not enumerate the DACL")
             return ()
 
-        trustees: list[str] = []
+        sids: list[ctypes.c_void_p] = []
         for index in range(size.AceCount):
             ace = ctypes.c_void_p()
             if not _advapi32.GetAce(dacl, index, ctypes.byref(ace)):
@@ -619,8 +633,8 @@ if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI le
             if not _advapi32.IsValidSid(sid):
                 findings.append(f"ACE {index} has an invalid SID")
                 continue
-            trustees.append(_sid_string(sid))
-        return tuple(trustees)
+            sids.append(sid)
+        return tuple(sids)
 
 
 # --------------------------------------------------------------------------------- contract

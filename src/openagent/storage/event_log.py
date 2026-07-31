@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -104,6 +105,15 @@ class EventLog:
         # ``max_delay`` remains accepted so third-party callers do not break, but it no longer makes
         # a false timing promise. A real deadline would require an owned scheduler/timer lifecycle.
         self._legacy_max_delay = max(0.0, max_delay)
+        #: Guards the projection bookkeeping below. SQLite allocates sequence numbers atomically
+        #: (``BEGIN IMMEDIATE`` in ``EventIndexRepository.append_event``), and ``file_lock``
+        #: serialises exports *between processes* — but neither protects this instance's own
+        #: counters from two threads of one process. ``self._pending += 1`` is a read-modify-write,
+        #: and ``export()`` resets it to 0; interleave the two and an increment is lost, so
+        #: ``flush()`` later sees "nothing pending" and leaves events in SQLite that never reach
+        #: the file. Reproduced at roughly 1 run in 200 with 12 concurrent appenders: 12 rows
+        #: indexed, 11 lines exported.
+        self._state_lock = threading.RLock()
         #: Events committed to SQLite but not yet reflected in the JSONL projection.
         self._pending = 0
         #: The highest sequence this instance has written to the file, and the file size it left
@@ -129,9 +139,13 @@ class EventLog:
             atomic_write_lines(self.path, (item.to_json_line() for item in events), mode=0o600)
             return safe
 
+        # The SQLite append stays outside the lock: it is already atomic, it is the slow part, and
+        # holding a lock across it would serialise writers for no correctness gain.
         self.index.append_event(safe)
-        self._pending += 1
-        if self._should_export(safe):
+        with self._state_lock:
+            self._pending += 1
+            should_export = self._should_export(safe)
+        if should_export:
             try:
                 self.export()
             except Exception as exc:
@@ -170,19 +184,31 @@ class EventLog:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         _secure_dir(self.run_dir)
         # Take the lock *before* reading, so an older reader can never replace a newer snapshot.
-        with file_lock(self._lock_path(), timeout=EXPORT_LOCK_TIMEOUT_SECONDS):
-            resume = 0 if full else self._resume_point()
-            if resume > 0:
-                self._append_from(run_id, resume)
-            else:
-                self._rewrite(run_id)
-        self._pending = 0
+        # One export at a time within this process, and the counter is cleared under the same lock
+        # that appenders increment it under. Taking the file lock *inside* the state lock keeps the
+        # two orderings consistent, so an export cannot start while another is deciding what is
+        # still outstanding. ``_exported_seq``/``_exported_size``/``_exported_inode`` are written
+        # here too, and they are what ``_resume_point`` trusts to decide an append is safe.
+        with self._state_lock:
+            outstanding = self._pending
+            with file_lock(self._lock_path(), timeout=EXPORT_LOCK_TIMEOUT_SECONDS):
+                resume = 0 if full else self._resume_point()
+                if resume > 0:
+                    self._append_from(run_id, resume)
+                else:
+                    self._rewrite(run_id)
+            # Subtract what this export accounted for rather than assigning 0: an append that
+            # committed to SQLite while this export was running is genuinely still outstanding,
+            # and zeroing would drop it exactly the way the original bug did.
+            self._pending = max(0, self._pending - outstanding)
         return self.path
 
     def flush(self) -> Path:
         """Export only if something is pending. Cheap to call on shutdown paths."""
 
-        if self.index is not None and self._pending:
+        with self._state_lock:
+            outstanding = self.index is not None and self._pending
+        if outstanding:
             return self.export()
         return self.path
 
