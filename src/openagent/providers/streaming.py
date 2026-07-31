@@ -46,7 +46,38 @@ class FinishReason(str, Enum):
     CONTENT_FILTER = "content_filter"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
+    CONNECTION_LOST = "connection_lost"
+    MALFORMED_STREAM = "malformed_stream"
     UNKNOWN = "unknown"
+
+
+#: Reasons that mean "the provider never finished this turn". A turn ending in one of these has no
+#: executable tool calls, however well-formed the fragments that did arrive look (spec §7.1).
+NON_TERMINAL_REASONS = frozenset(
+    {
+        FinishReason.CANCELLED,
+        FinishReason.INTERRUPTED,
+        FinishReason.CONNECTION_LOST,
+        FinishReason.MALFORMED_STREAM,
+    }
+)
+
+
+class ToolNameStreaming(str, Enum):
+    """How a wire streams a tool name, which decides what a second name fragment *means*.
+
+    OpenAI-chat repeats the whole name on every chunk that carries one; Anthropic-style deltas split
+    it. Concatenating unconditionally turns a repeated ``ping`` into ``pingping`` — a tool that does
+    not exist, or worse, one that does. There is no way to tell the two apart from the fragments
+    alone, so the wire declares which it is.
+    """
+
+    #: Every chunk carries the complete name; a differing value is a contradiction, not a suffix.
+    FULL_VALUE = "full_value"
+    #: The name arrives in pieces that concatenate.
+    FRAGMENT = "fragment"
+    #: Only the first chunk carries a name; later ones are ignored.
+    FIRST_CHUNK_ONLY = "first_chunk_only"
 
 
 @dataclass
@@ -106,10 +137,47 @@ class AssembledTurn:
     finish_reason: FinishReason
     #: True when any accumulator hit its ceiling — the turn is usable but not the whole story.
     truncated: bool = False
+    #: Ways the stream contradicted itself about tool-call identity. Non-empty means no call in this
+    #: turn may run: the contradiction is about *which call is which*, so it is not confined to the
+    #: pair that collided (spec §7.2).
+    protocol_violations: tuple[str, ...] = ()
 
     @property
     def has_incomplete_tool_calls(self) -> bool:
         return any(not call.complete for call in self.tool_calls)
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the provider actually said this turn was over."""
+
+        return self.finish_reason not in NON_TERMINAL_REASONS
+
+    @property
+    def execution_refusal(self) -> str | None:
+        """Why no tool in this turn may run, or ``None`` when they may.
+
+        Kept as a reason rather than a bool so the refusal can be reported to the user with the
+        cause, instead of tool calls simply vanishing from a turn that visibly requested them.
+        """
+
+        if not self.is_terminal:
+            return (
+                f"the turn ended as {self.finish_reason.value} without a terminal event, so its "
+                f"tool calls may be a prefix of something the model had not finished saying"
+            )
+        if self.protocol_violations:
+            return "the provider contradicted itself about tool-call identity: " + "; ".join(
+                self.protocol_violations
+            )
+        return None
+
+    @property
+    def executable_tool_calls(self) -> tuple[ToolCall, ...]:
+        """The calls that are safe to run — empty whenever anything about the turn is in doubt."""
+
+        if self.execution_refusal is not None:
+            return ()
+        return tuple(call for call in self.tool_calls if call.complete)
 
 
 class StreamingTurnAssembler:
@@ -118,17 +186,59 @@ class StreamingTurnAssembler:
     Not thread-safe and not reusable: one instance per turn.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        tool_name_mode: ToolNameStreaming = ToolNameStreaming.FRAGMENT,
+        tool_names_are_fragments: bool | None = None,
+    ) -> None:
+        if tool_names_are_fragments is not None:
+            tool_name_mode = (
+                ToolNameStreaming.FRAGMENT
+                if tool_names_are_fragments
+                else ToolNameStreaming.FULL_VALUE
+            )
+        self._tool_name_mode = tool_name_mode
         self._text: list[str] = []
         self._text_bytes = 0
         self._reasoning: list[str] = []
         self._reasoning_bytes = 0
         self._tools: dict[int, ToolCallDraft] = {}
         self._by_id: dict[str, int] = {}
+        self._id_of_index: dict[int, str] = {}
         self._order: list[int] = []
         self._usage: Usage | None = None
         self._finish: FinishReason | None = None
         self._truncated = False
+        self._violations: list[str] = []
+        self._settled = False
+
+    # ------------------------------------------------------------------ identity integrity
+
+    def _violation(self, reason: str) -> None:
+        if reason not in self._violations:
+            self._violations.append(reason)
+
+    def _check_identity(self, *, index: int | None, tool_id: str | None) -> None:
+        """Reject the two ways a stream can make "which call is this?" unanswerable.
+
+        Both are recorded rather than raised: the turn still has to be assembled so the user can be
+        shown what arrived, and a raise here would be indistinguishable from a transport failure.
+        """
+
+        if tool_id is not None and index is not None:
+            bound_index = self._by_id.get(tool_id)
+            if bound_index is not None and bound_index != index:
+                self._violation(
+                    f"tool id {tool_id!r} was used at index {bound_index} and again at {index}"
+                )
+            bound_id = self._id_of_index.get(index)
+            if bound_id is not None and bound_id != tool_id:
+                self._violation(
+                    f"index {index} was used for tool id {bound_id!r} and again for {tool_id!r}"
+                )
+        if self._settled:
+            self._violation("tool-call fragments arrived after the turn reported it had finished")
 
     # ------------------------------------------------------------------ text / reasoning
 
@@ -164,6 +274,7 @@ class StreamingTurnAssembler:
         most recent call, which is the only remaining interpretation that is ever right.
         """
 
+        self._check_identity(index=index, tool_id=tool_id)
         if tool_id is not None and tool_id in self._by_id:
             return self._tools[self._by_id[tool_id]]
         if index is None:
@@ -179,9 +290,12 @@ class StreamingTurnAssembler:
             self._order.append(index)
         if tool_id is not None and draft.id is None:
             draft.id = tool_id
-            # A duplicate id across two indexes is a provider bug. The first binding wins; the
-            # second keeps its own slot rather than merging two distinct calls into one.
+            # A duplicate id across two indexes is a provider bug, already recorded by
+            # _check_identity. The first binding still wins here so the turn can be assembled and
+            # shown; it is _check_identity's violation, not this binding, that stops it running.
             self._by_id.setdefault(tool_id, draft.index)
+        if tool_id is not None:
+            self._id_of_index.setdefault(draft.index, tool_id)
         return draft
 
     def append_tool_name(
@@ -190,8 +304,34 @@ class StreamingTurnAssembler:
         draft = self._draft(index=index, tool_id=tool_id)
         if not name:
             return
-        # Names may also stream in fragments (rare, but Anthropic-style deltas can split them).
-        draft.name = name if draft.name is None else draft.name + name
+        if draft.name is None:
+            draft.name = name
+            return
+        if self._tool_name_mode is ToolNameStreaming.FRAGMENT:
+            draft.name += name
+            return
+        if self._tool_name_mode is ToolNameStreaming.FIRST_CHUNK_ONLY:
+            return
+        # FULL_VALUE: every chunk carries the whole name, so a repeat is a no-op and a *different*
+        # name means two chunks disagree about what is being called — exactly the case where
+        # concatenating would invent a third tool name that neither chunk asked for.
+        if name != draft.name:
+            self._violation(
+                f"tool name changed mid-stream from {draft.name!r} to {name!r} on the same call"
+            )
+
+    def set_tool_name(
+        self, *, name: str, index: int | None = None, tool_id: str | None = None
+    ) -> None:
+        """Set a name that the wire believes is final. Changing a settled name is a contradiction."""
+
+        draft = self._draft(index=index, tool_id=tool_id)
+        if draft.name is not None and draft.name != name:
+            self._violation(
+                f"tool name changed mid-stream from {draft.name!r} to {name!r} on the same call"
+            )
+            return
+        draft.name = name
 
     def append_tool_argument_fragment(
         self, fragment: str | None, *, index: int | None = None, tool_id: str | None = None
@@ -227,15 +367,23 @@ class StreamingTurnAssembler:
             return
         if isinstance(reason, FinishReason):
             self._finish = reason
-            return
-        try:
-            self._finish = FinishReason(reason)
-        except ValueError:
-            self._finish = _FINISH_ALIASES.get(reason.strip().lower(), FinishReason.UNKNOWN)
+        else:
+            try:
+                self._finish = FinishReason(reason)
+            except ValueError:
+                self._finish = _FINISH_ALIASES.get(reason.strip().lower(), FinishReason.UNKNOWN)
+        # Once the provider has said the turn is over, further tool fragments contradict it.
+        if self._finish not in NON_TERMINAL_REASONS:
+            self._settled = True
 
-    def mark_interrupted(self, *, cancelled: bool = False) -> None:
+    def mark_interrupted(
+        self, *, cancelled: bool = False, reason: FinishReason | None = None
+    ) -> None:
         """The stream ended without a finish reason — a drop, a timeout, or a cancellation."""
 
+        if reason is not None:
+            self._finish = reason
+            return
         self._finish = FinishReason.CANCELLED if cancelled else FinishReason.INTERRUPTED
 
     # ------------------------------------------------------------------ result
@@ -259,6 +407,7 @@ class StreamingTurnAssembler:
             usage=self._usage,
             finish_reason=finish,
             truncated=self._truncated or any(d.truncated for d in self._tools.values()),
+            protocol_violations=tuple(self._violations),
         )
 
 

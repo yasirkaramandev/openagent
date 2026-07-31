@@ -22,6 +22,7 @@ from ..core.cancellation import RunCancellation
 from ..core.errors import ErrorType, classify_http_status, is_retryable, redact_secrets
 from ..core.limits import RUNTIME_LIMITS
 from .retry import RETRYABLE_STATUSES, RetryBudget, RetryPolicy, extract_request_id
+from .sse import iter_sse_events
 
 _RETRY_STATUSES = RETRYABLE_STATUSES
 
@@ -210,8 +211,19 @@ class Transport:
                 )
             return data
 
-    async def stream_sse(self, path: str, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    async def stream_sse(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        sentinel: str | None = "[DONE]",
+    ) -> AsyncIterator[dict[str, Any]]:
         """POST and yield decoded SSE ``data:`` JSON objects.
+
+        Framing is :mod:`.sse`'s job and JSON is this method's; ``sentinel`` is the caller's, because
+        ``[DONE]`` is an OpenAI convention rather than part of SSE. Wires that do not use it pass
+        ``None`` and get every event, including any whose payload happens to be that literal string
+        (spec §8).
 
         A stream is only safe to replay **before the first event is yielded**. Once any event has
         been delivered to the caller, a mid-stream disconnect would duplicate text, tool calls, and
@@ -257,23 +269,16 @@ class Transport:
                             status=response.status_code,
                             request_id=self.last_request_id,
                         )
-                    async for line in response.aiter_lines():
+                    async for event in iter_sse_events(response.aiter_bytes()):
                         if budget.exhausted:
                             raise TransportError(
                                 ErrorType.TIMEOUT,
                                 f"provider stream exceeded {policy.total_budget:g} seconds",
                                 request_id=self.last_request_id,
                             )
-                        stripped = line.strip()
-                        if (
-                            not stripped
-                            or stripped.startswith(":")
-                            or not stripped.startswith("data:")
-                        ):
-                            continue
-                        payload_str = stripped[len("data:") :].strip()
+                        payload_str = event.data
                         data_lines += 1
-                        if payload_str == "[DONE]":
+                        if sentinel is not None and payload_str == sentinel:
                             return
                         try:
                             obj = json.loads(payload_str)

@@ -33,11 +33,12 @@ from ..compat.profiles_v2 import (
 )
 from ..continuation import ContinuationEnvelope, ContinuationStrategy
 from ..error_mapping import ProviderErrorSignal, map_provider_error
-from ..streaming import AssembledTurn, StreamingTurnAssembler, Usage
+from ..streaming import AssembledTurn, StreamingTurnAssembler, ToolNameStreaming, Usage
 from ..transport import Transport, TransportError
 from .base import (
     ToolPreparation,
     interrupted,
+    interruption_event,
     parse_openai_usage,
     prepare_tools,
     resolve_tool_choice,
@@ -279,7 +280,7 @@ class OpenAIChatWire:
         message = choice.get("message")
         message = message if isinstance(message, dict) else {}
 
-        assembler = StreamingTurnAssembler()
+        assembler = StreamingTurnAssembler(tool_name_mode=ToolNameStreaming.FULL_VALUE)
         text = message.get("content")
         if isinstance(text, str) and text:
             assembler.append_text(text)
@@ -325,7 +326,7 @@ class OpenAIChatWire:
         yield NormalizedModelEvent(type=ModelEventType.DONE, response_id=response_id)
 
     async def _stream(self, payload: dict[str, Any]) -> AsyncIterator[NormalizedModelEvent]:
-        assembler = StreamingTurnAssembler()
+        assembler = StreamingTurnAssembler(tool_name_mode=ToolNameStreaming.FULL_VALUE)
         response_id: str | None = None
         saw_finish = False
 
@@ -391,13 +392,8 @@ class OpenAIChatWire:
                 usage=_token_usage(turn.usage),
                 response_id=response_id,
             )
-        if interrupted(turn) and not turn.tool_calls:
-            yield NormalizedModelEvent(
-                type=ModelEventType.ERROR,
-                error_type=ErrorType.STREAM_INTERRUPTED.value,
-                error_message="the provider stopped streaming without a terminal event",
-                response_id=response_id,
-            )
+        if interrupted(turn):
+            yield interruption_event(turn, response_id=response_id)
             return
         yield NormalizedModelEvent(type=ModelEventType.DONE, response_id=response_id)
 

@@ -20,15 +20,12 @@ because its thinking blocks and signatures survive there and are lossy over its 
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from ..core.models import CredentialType, DiscoveryStrategy, Protocol
 from .compat.profiles_v2 import AuthScheme, get_profile
-
-#: Hosts a plain-HTTP connection is allowed to. Anything else must be TLS: a bearer token over
-#: cleartext to a non-loopback host is a credential on the wire (spec §23.3).
-LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"})
 
 
 @dataclass(frozen=True)
@@ -146,16 +143,39 @@ def requires_tls(url: str, *, local: bool) -> bool:
         return True
     if parsed.scheme == "https":
         return False
-    host = (parsed.hostname or "").lower()
-    if local and host in LOOPBACK_HOSTS:
+    if local and is_loopback(url):
         return False
     return True
 
 
 def is_loopback(url: str) -> bool:
+    """Whether ``url``'s host is provably on this machine.
+
+    Decided by :mod:`ipaddress` rather than by string matching. The list this replaces contained
+    ``0.0.0.0``, which is not loopback: it is the *unspecified* address, the wildcard a server binds
+    to in order to accept traffic from every interface. It is also the address a user is most likely
+    to paste, having read ``Listening on 0.0.0.0:11434`` in a server log — so the one host that most
+    strongly suggests the service is reachable from off-box was the one being handed the
+    plaintext-HTTP exemption.
+
+    The same list matched only ``127.0.0.1``, while the whole ``127.0.0.0/8`` block is loopback.
+    That erred safe (TLS was demanded where it need not be) but was still wrong.
+    """
+
     try:
-        return (urlsplit(url).hostname or "").lower() in LOOPBACK_HOSTS
+        host = (urlsplit(url).hostname or "").lower()
     except ValueError:
+        return False
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        # urlsplit already strips the brackets from an IPv6 literal.
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A name other than "localhost". It may well resolve to loopback, but resolving it here
+        # would make a security decision depend on DNS that an attacker may control.
         return False
 
 

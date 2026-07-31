@@ -11,9 +11,13 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**", "feat/v0.2-integration"]
+  # Integration branches are targets too, not just main. A stacked PR that lands security-relevant
+  # code on an integration branch and is only scanned once that branch opens its own PR to main
+  # gets its findings at the point where reverting is most expensive — and "CodeQL is green" was
+  # being read as a gate on the stacked PR, where it had in fact never run.
   pull_request:
-    branches: [main]
+    branches: [main, "release/**", "feat/v0.2-integration"]
   schedule:
     # Weekly, so a newly published query finds an existing vulnerability without waiting for the
     # next commit to this repository.

@@ -31,7 +31,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ from ...core.errors import ErrorType, classify_http_status
 from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
 from ...core.permissions import READ_ONLY, SAFE_EDIT
+from ...security.private_files import create_private_file, private_directory
 from ...security.process import (
     ManagedProcess,
     TerminationOutcome,
@@ -92,6 +94,8 @@ class GeminiPermissionMapping:
     sandbox: bool
     #: Tools to withhold. Empty means "whatever the CLI allows by default".
     denied_tools: tuple[str, ...] = ()
+    #: The allowlist that accompanies a denylist. Empty means no allowlist is imposed.
+    allowed_tools: tuple[str, ...] = ()
     #: Prepended to the prompt for profiles that are a *posture* rather than a flag.
     prompt_prefix: str = ""
     #: Why this mapping is what it is, for the wizard and Doctor to show.
@@ -101,14 +105,35 @@ class GeminiPermissionMapping:
 #: Write and shell tools, withheld for the read-only and plan postures. Named explicitly because
 #: "read-only" has to mean something enforceable, not just an approval prompt the model can talk
 #: its way past.
-_MUTATING_TOOLS = ("run_shell_command", "write_file", "replace")
+MUTATING_TOOLS = ("run_shell_command", "write_file", "replace")
+
+#: The tools a read-only posture *may* use. Sent as an allowlist (``tools.core``) alongside the
+#: denylist, because a denylist alone admits by default any tool a future CLI release adds — and the
+#: whole point of this profile is that what it can do is bounded now, not bounded as of today's
+#: release.
+READ_ONLY_TOOLS = (
+    "read_file",
+    "read_many_files",
+    "list_directory",
+    "glob",
+    "grep_search",
+)
+
+#: Redirects the CLI's *system* settings file. System settings sit above user and project settings
+#: in the documented hierarchy, which is the only layer a workspace's own ``.gemini/settings.json``
+#: cannot widen — and the workspace is the attacker-influenced input here.
+SYSTEM_SETTINGS_ENV = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
+
+#: Backwards-compatible alias for the internal name this constant used to have.
+_MUTATING_TOOLS = MUTATING_TOOLS
 
 _PERMISSION_MAPPINGS: dict[str, GeminiPermissionMapping] = {
     READ_ONLY: GeminiPermissionMapping(
         approval_mode=APPROVAL_DEFAULT,
         sandbox=True,
-        denied_tools=_MUTATING_TOOLS,
-        note="sandboxed; write and shell tools withheld",
+        denied_tools=MUTATING_TOOLS,
+        allowed_tools=READ_ONLY_TOOLS,
+        note="sandboxed; write and shell tools withheld by system-settings override",
     ),
     SAFE_EDIT: GeminiPermissionMapping(
         approval_mode=APPROVAL_AUTO_EDIT,
@@ -123,7 +148,8 @@ _PERMISSION_MAPPINGS: dict[str, GeminiPermissionMapping] = {
     "plan": GeminiPermissionMapping(
         approval_mode=APPROVAL_DEFAULT,
         sandbox=True,
-        denied_tools=_MUTATING_TOOLS,
+        denied_tools=MUTATING_TOOLS,
+        allowed_tools=READ_ONLY_TOOLS,
         prompt_prefix=(
             "Produce a plan only. Do not modify any file and do not run any command.\n\n"
         ),
@@ -143,6 +169,66 @@ def permission_mapping(profile_name: str) -> GeminiPermissionMapping:
     """
 
     return _PERMISSION_MAPPINGS.get(profile_name, _PERMISSION_MAPPINGS[READ_ONLY])
+
+
+def system_settings_document(mapping: GeminiPermissionMapping) -> dict[str, Any]:
+    """The settings OpenAgent imposes on one run, as the CLI's own documented schema.
+
+    Only the keys the profile actually constrains are emitted. A profile that is *meant* to edit
+    must not be handed a read-only allowlist just because the override mechanism exists.
+    """
+
+    document: dict[str, Any] = {
+        # The prompt carries the user's source. It does not go to a vendor telemetry endpoint
+        # because OpenAgent happened to launch the CLI.
+        "telemetry": {"enabled": False, "logPrompts": False},
+    }
+    if mapping.denied_tools:
+        document["tools"] = {
+            "core": list(mapping.allowed_tools),
+            "exclude": list(mapping.denied_tools),
+        }
+    return document
+
+
+@contextmanager
+def system_settings_file(mapping: GeminiPermissionMapping) -> Iterator[Path | None]:
+    """Materialize the policy as a private file for the lifetime of one run.
+
+    Outside the workspace, so a run cannot rewrite the policy that governs it through a relative
+    path; private to this user, so another local account cannot read or edit it between write and
+    exec; removed afterwards, because a stale policy file silently governing a later run is its
+    own bug.
+
+    "Private" is delegated to :mod:`openagent.security.private_files`, which means POSIX modes on
+    POSIX and a real DACL on Windows. It is deliberately not expressed as a mode here: passing
+    ``0o600`` to ``os.open`` on Windows produces a world-readable file and a mode of ``0o666``,
+    so the enforcement would be a comment rather than a control.
+
+    Yields ``None`` when the profile constrains nothing, so callers do not set the environment
+    variable — pointing the CLI at an empty system-settings file is a real change in behaviour
+    (it overrides whatever the user's actual system settings say).
+    """
+
+    document = system_settings_document(mapping)
+    if not document.get("tools"):
+        yield None
+        return
+
+    with private_directory("openagent-gemini-policy-") as directory:
+        path = directory / "settings.json"
+        # Creation fails closed: if the file cannot be proven private, no run starts believing it
+        # is governed by a policy an attacker could have rewritten.
+        create_private_file(path, json.dumps(document, indent=2).encode("utf-8"))
+        yield path
+
+
+def apply_system_settings(env: dict[str, str], path: Path | None) -> dict[str, str]:
+    """Point the CLI at the override, or leave the environment alone when there is none."""
+
+    if path is not None:
+        env[SYSTEM_SETTINGS_ENV] = str(path)
+    return env
 
 
 def build_command(
@@ -516,28 +602,34 @@ class GeminiCliAdapter:
         # The credential the *run* needs, and nothing else. A Gemini run must not receive
         # ANTHROPIC_API_KEY or OPENAI_API_KEY merely because the user has them exported (spec §19.2).
         env = minimal_environment(request.credential_env)
-        if mapping.denied_tools:
-            # Enforced by configuration rather than by an approval prompt: "read-only" has to mean
-            # something the model cannot talk its way past.
-            env["GEMINI_EXCLUDE_TOOLS"] = ",".join(mapping.denied_tools)
 
-        proc = ManagedProcess(argv, cwd=request.workspace, env=env)
-        self._processes[request.run_id] = proc
-        try:
-            if support.supported:
-                async for event in run_buffered_cli(
-                    proc=proc, run_id=request.run_id, source=SOURCE, parser=_parse_run_output
-                ):
-                    yield event
-            else:
-                # No structured output on this build. The text is still the answer; it is reported as
-                # one completed message, with structured_events already advertised as False.
-                async for event in run_buffered_cli(
-                    proc=proc, run_id=request.run_id, source=SOURCE, parser=_parse_plain_output
-                ):
-                    yield event
-        finally:
-            self._processes.pop(request.run_id, None)
+        # Enforced through the CLI's *system* settings layer, not an approval prompt and not an
+        # environment variable of our own invention. The previous implementation set
+        # GEMINI_EXCLUDE_TOOLS, which the CLI does not document — an unrecognised variable is
+        # ignored, so "read-only" was a label on a run that could still write files and spawn
+        # shells. System settings are also the one layer the workspace's own .gemini/settings.json
+        # cannot widen, and the workspace is attacker-influenced input (spec §12.3).
+        with system_settings_file(mapping) as policy_path:
+            apply_system_settings(env, policy_path)
+
+            proc = ManagedProcess(argv, cwd=request.workspace, env=env)
+            self._processes[request.run_id] = proc
+            try:
+                if support.supported:
+                    async for event in run_buffered_cli(
+                        proc=proc, run_id=request.run_id, source=SOURCE, parser=_parse_run_output
+                    ):
+                        yield event
+                else:
+                    # No structured output on this build. The text is still the answer; it is
+                    # reported as one completed message, with structured_events already advertised
+                    # as False.
+                    async for event in run_buffered_cli(
+                        proc=proc, run_id=request.run_id, source=SOURCE, parser=_parse_plain_output
+                    ):
+                        yield event
+            finally:
+                self._processes.pop(request.run_id, None)
 
     async def cancel(self, run_id: str) -> TerminationResult:
         """Terminate the run's own process tree.

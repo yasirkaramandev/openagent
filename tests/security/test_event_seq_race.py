@@ -142,3 +142,94 @@ def test_a_duplicate_event_id_is_rejected(db: Database, tmp_path: Path):
     with pytest.raises(Exception):  # noqa: B017 - any integrity failure is acceptable here
         log.append(event)
     assert index.sequences_for("run_dup") == [1]
+
+
+def test_an_append_that_lands_during_an_export_is_not_dropped(db: Database, tmp_path: Path):
+    """The regression for the projection counter, not for the sequence number.
+
+    Sequence allocation was already single-authority: ``append_event`` reads and bumps
+    ``event_sequences`` inside one ``BEGIN IMMEDIATE`` transaction, so two appenders can never be
+    handed the same number. What was still racing was the bookkeeping one level up.
+
+    ``export()`` finished its file work and *then* did ``self._pending = 0``. An append that
+    committed to SQLite in that gap incremented the counter first and had it wiped a moment later,
+    so ``flush()`` saw nothing outstanding and the event never reached ``events.jsonl``. Traced
+    from the real failure::
+
+        rewrite      -> _exported_seq 0 -> 2
+        append_from  -> _exported_seq 2 -> 3
+        append_from  -> _exported_seq 3 -> 11
+        final: 12 rows indexed, 11 lines exported, _pending 0
+
+    The asymmetry is what makes it harmful: SQLite keeps every event, the projection quietly drops
+    one, and everything that reads the file — the run console, the artifact bundle, recovery — sees
+    a run missing a step it took. Under threads it reproduces about once in 200 runs, which is how
+    it first showed up: as a flake.
+
+    So this test does not race for it. It holds an export open inside its file work, lets another
+    append commit, then releases — and asserts the event survived. Against the fixed code the
+    second appender blocks on the state lock instead, the bounded join below simply expires, and
+    both events still land.
+    """
+
+    index = EventIndexRepository(db)
+    run_dir = tmp_path / "run"
+    log = EventLog(run_dir, index=index)
+    run_id = "run_export_gap"
+
+    # Materialise the file first, so the appends below take the "no export needed" path and
+    # genuinely depend on _pending being right.
+    log.append(_event(run_id, 0))
+    log.append(_event(run_id, 1))
+    assert log.pending_export_count() == 1
+
+    file_work_done = threading.Event()
+    may_finish_export = threading.Event()
+    original_append_from = log._append_from
+
+    def blocking_append_from(rid: str, after_seq: int) -> None:
+        original_append_from(rid, after_seq)
+        # Parked between the file work and the counter reset: exactly the window the bug lived in.
+        file_work_done.set()
+        may_finish_export.wait(timeout=5)
+
+    log._append_from = blocking_append_from  # type: ignore[method-assign]
+
+    errors: list[BaseException] = []
+
+    def run_export() -> None:
+        try:
+            log.export()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+
+    def append_third() -> None:
+        try:
+            log.append(_event(run_id, 2))
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+
+    exporter = threading.Thread(target=run_export)
+    exporter.start()
+    assert file_work_done.wait(timeout=5), "the export never reached its file work"
+
+    appender = threading.Thread(target=append_third)
+    appender.start()
+    # Against the unfixed code this commits and bumps the counter that is about to be zeroed;
+    # against the fixed code it blocks on the state lock and the join expires harmlessly.
+    appender.join(timeout=0.5)
+
+    may_finish_export.set()
+    exporter.join(timeout=10)
+    appender.join(timeout=10)
+    log._append_from = original_append_from  # type: ignore[method-assign]
+    log.flush()
+
+    assert not errors, f"append or export raised: {errors[:2]}"
+    indexed = index.sequences_for(run_id)
+    exported = EventLog(run_dir).read_raw()
+    assert sorted(indexed) == [1, 2, 3]
+    assert len(exported) == 3, (
+        f"SQLite holds {len(indexed)} events but the projection has {len(exported)} lines — an "
+        "append that landed during an export had its pending increment discarded"
+    )
