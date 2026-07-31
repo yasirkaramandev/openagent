@@ -164,7 +164,7 @@ class CodexAdapter:
         plan = build_child_environment("codex")
         evidence = await asyncio.to_thread(probe_codex_auth, self.executable or "codex", plan)
         return AuthStatus(
-            authenticated=bool(evidence.authenticated),
+            authenticated=evidence.authenticated,
             detail=evidence.detail,
             blocking=evidence.blocking,
             environment_names=list(evidence.environment_names),

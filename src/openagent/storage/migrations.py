@@ -16,7 +16,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
-from ..core.errors import DatabaseReaderCompatibilityError
+from ..core.errors import DatabaseMetadataValidationError, DatabaseReaderCompatibilityError
 from ..core.versioning import compare_versions, version_at_least
 
 
@@ -942,6 +942,51 @@ def _m013_provider_ownership_and_api_binding(conn: Connection) -> None:
     conn.exec_driver_sql("ALTER TABLE agents_new RENAME TO agents")
 
 
+def _m014_provider_generation_ownership(conn: Connection) -> None:
+    """Backfill the immutable provider generation into a relational ownership column."""
+
+    if not _table_exists(conn, "provider_connections"):
+        return
+    if not _column_exists(conn, "provider_connections", "credential_revision"):
+        conn.exec_driver_sql(
+            "ALTER TABLE provider_connections "
+            "ADD COLUMN credential_revision VARCHAR NOT NULL DEFAULT ''"
+        )
+
+    rows = conn.exec_driver_sql("SELECT id, data FROM provider_connections").fetchall()
+    before_ids = {str(row[0]) for row in rows}
+    for provider_id, raw_data in rows:
+        payload = _decode_domain_json("provider_connections", provider_id, raw_data)
+        revision = payload.get("credential_revision")
+        if not isinstance(revision, str) or not revision.strip():
+            raise MigrationVerificationError(
+                "provider generation ownership metadata is missing or invalid for "
+                f"{_redacted_record_id(str(provider_id))}; no records were changed"
+            )
+        conn.execute(
+            text(
+                "UPDATE provider_connections SET credential_revision=:revision "
+                "WHERE id=:provider_id"
+            ),
+            {"revision": revision, "provider_id": provider_id},
+        )
+
+    after = conn.exec_driver_sql(
+        "SELECT id, credential_revision, data FROM provider_connections"
+    ).fetchall()
+    if {str(row[0]) for row in after} != before_ids:
+        raise MigrationVerificationError(
+            "provider generation migration changed the provider id set"
+        )
+    for provider_id, relational, raw_data in after:
+        payload = _decode_domain_json("provider_connections", provider_id, raw_data)
+        if relational != payload.get("credential_revision"):
+            raise MigrationVerificationError(
+                "provider generation ownership did not match the domain record for "
+                f"{_redacted_record_id(str(provider_id))}"
+            )
+
+
 _FORWARD = (
     "Local user data revisions are forward-only; restoration uses the reported online backup."
 )
@@ -1013,6 +1058,13 @@ MIGRATIONS: list[Migration] = [
         _m013_provider_ownership_and_api_binding,
         _FORWARD,
     ),
+    Migration(
+        "0014",
+        "0013",
+        "provider generation ownership",
+        _m014_provider_generation_ownership,
+        _FORWARD,
+    ),
 ]
 
 LATEST_REVISION = MIGRATIONS[-1].revision
@@ -1070,21 +1122,35 @@ def _check_reader_compatibility(conn: Connection) -> None:
     """
 
     recorded_min_reader = _read_meta(conn, "minimum_reader_version")
+    binary_version = _binary_version()
+    recorded_writer = _read_meta(conn, "last_writer_version")
+    if recorded_writer is not None and version_at_least(recorded_writer, recorded_writer) is None:
+        raise DatabaseMetadataValidationError(
+            metadata_key="last_writer_version",
+            invalid_state="not a parseable version",
+            binary_version=binary_version,
+            repair_commands=_repair_commands(),
+        )
     if recorded_min_reader is None:
         # A fresh DB, or one last written before this feature existed. Nothing to gate on: the
         # per-record decode boundary (spec §7.3) still catches a genuinely unreadable row.
         return
-    binary_version = _binary_version()
-    if version_at_least(binary_version, recorded_min_reader) is not False:
-        # True (satisfied) or None (unparseable) — do not brick on an unparseable version string;
-        # ``__version__`` and the constant are always PEP 440, so None does not occur in practice.
+    comparison = version_at_least(binary_version, recorded_min_reader)
+    if comparison is True:
         return
+    if comparison is None:
+        raise DatabaseMetadataValidationError(
+            metadata_key="minimum_reader_version",
+            invalid_state="not a parseable version",
+            binary_version=binary_version,
+            repair_commands=_repair_commands(),
+        )
     schema_row = _read_meta(conn, "version")
     raise DatabaseReaderCompatibilityError(
         database_schema=int(schema_row) if schema_row and schema_row.isdigit() else None,
         supported_schema_min=MINIMUM_SUPPORTED_SCHEMA,
         supported_schema_max=LATEST_VERSION,
-        database_writer_version=_read_meta(conn, "last_writer_version"),
+        database_writer_version=recorded_writer,
         minimum_reader_version=recorded_min_reader,
         binary_version=binary_version,
         binary_path=_active_binary_path(),
@@ -1148,8 +1214,11 @@ def current_revision(conn: Connection) -> str | None:
             try:
                 recorded_version = int(legacy_version[0])
             except (TypeError, ValueError) as exc:
-                raise UnknownRevisionError(
-                    f"invalid schema version mirror {legacy_version[0]!r}"
+                raise DatabaseMetadataValidationError(
+                    metadata_key="revision/version",
+                    invalid_state="not an integer schema mirror",
+                    binary_version=_binary_version(),
+                    repair_commands=_repair_commands(),
                 ) from exc
             if recorded_version > LATEST_VERSION:
                 raise SchemaTooNewError(
@@ -1157,8 +1226,11 @@ def current_revision(conn: Connection) -> str | None:
                     f"{LATEST_VERSION}; upgrade OpenAgent"
                 )
             if recorded_version != int(revision):
-                raise UnknownRevisionError(
-                    f"schema revision/version mismatch: {revision} vs {recorded_version}"
+                raise DatabaseMetadataValidationError(
+                    metadata_key="revision/version",
+                    invalid_state="internally inconsistent",
+                    binary_version=_binary_version(),
+                    repair_commands=_repair_commands(),
                 )
         return revision
     legacy = conn.exec_driver_sql("SELECT value FROM schema_meta WHERE key='version'").first()
@@ -1167,7 +1239,12 @@ def current_revision(conn: Connection) -> str | None:
     try:
         version = int(legacy[0])
     except (TypeError, ValueError) as exc:
-        raise UnknownRevisionError(f"invalid legacy schema version {legacy[0]!r}") from exc
+        raise DatabaseMetadataValidationError(
+            metadata_key="version",
+            invalid_state="not an integer schema version",
+            binary_version=_binary_version(),
+            repair_commands=_repair_commands(),
+        ) from exc
     revision = f"{version:04d}"
     if revision not in _BY_REVISION:
         if version > LATEST_VERSION:

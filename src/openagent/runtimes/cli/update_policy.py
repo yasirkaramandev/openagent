@@ -21,7 +21,6 @@ The fix needs care in two places, because the naive version of each is worse tha
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -30,8 +29,7 @@ from enum import Enum
 from pathlib import Path
 
 from ...core.models import CliInstallation, CliUpdateStatus
-from ...security.atomic import atomic_write_text
-from ...security.file_lock import LockTimeout, file_lock
+from ...security.locked_json_store import LockedJsonStore, LockedJsonStoreError
 
 
 class UpdateChoice(str, Enum):
@@ -41,6 +39,48 @@ class UpdateChoice(str, Enum):
     CONTINUE_WITHOUT_UPDATING = "continue"
     CANCEL_RUN = "cancel-run"
     SKIP_THIS_VERSION = "skip-this-version"
+
+
+class PostUpdateFailureChoice(str, Enum):
+    """Second decision after an explicitly requested update failed verification."""
+
+    CONTINUE_WITH_INSTALLED = "continue-with-installed"
+    CANCEL_RUN = "cancel-run"
+    OPEN_DOCTOR = "open-doctor"
+
+
+@dataclass(frozen=True)
+class PostUpdateFailurePrompt:
+    cli_type: str
+    installed_version: str | None
+    expected_version: str | None
+    install_source: str
+    failure_category: str
+    minimum_supported_version: str | None
+    installed_runnable: bool
+
+
+PostUpdateFailureCallback = Callable[[PostUpdateFailurePrompt], PostUpdateFailureChoice | None]
+
+
+def decide_post_update_failure(
+    prompt: PostUpdateFailurePrompt,
+    *,
+    callback: PostUpdateFailureCallback | None,
+) -> PostUpdateFailureChoice:
+    """Fail closed unless a runnable installed binary is explicitly chosen."""
+
+    if not prompt.installed_runnable or callback is None:
+        return PostUpdateFailureChoice.CANCEL_RUN
+    try:
+        choice = callback(prompt)
+    except Exception:
+        return PostUpdateFailureChoice.CANCEL_RUN
+    if choice is None:
+        return PostUpdateFailureChoice.CANCEL_RUN
+    if choice is PostUpdateFailureChoice.CONTINUE_WITH_INSTALLED and not prompt.installed_runnable:
+        return PostUpdateFailureChoice.CANCEL_RUN
+    return choice
 
 
 @dataclass(frozen=True)
@@ -109,6 +149,7 @@ _SUPPRESSION_TTL = timedelta(days=90)
 _SUPPRESSION_MAX_ENTRIES = 256
 #: Brief, because the critical section is a few KiB of JSON. A wait means another process is mid-write.
 _SUPPRESSION_LOCK_TIMEOUT = 5.0
+_SUPPRESSION_SECTION = "update_prompt_suppressions"
 
 
 class UpdatePromptSuppressions:
@@ -123,30 +164,23 @@ class UpdatePromptSuppressions:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-
-    def _lock_path(self) -> Path:
-        return self.path.with_name(self.path.name + ".lock")
+        self.store = LockedJsonStore(path, lock_timeout=_SUPPRESSION_LOCK_TIMEOUT)
+        try:
+            self.store.migrate_legacy_list(_SUPPRESSION_SECTION)
+        except LockedJsonStoreError:
+            # Suppression is optional state: a busy/unsafe file means the prompt may be shown again.
+            pass
 
     def _load(self) -> list[dict[str, str]]:
         """Every record on disk, migrating the pre-timestamp flat-string format forward."""
 
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+            raw = self.store.get_section(_SUPPRESSION_SECTION, [])
+        except LockedJsonStoreError:
             # Malformed or missing: treat as empty. Never surface the raw bytes — they are opaque
             # fingerprints, and echoing a corrupt config is both useless and a disclosure risk.
             return []
-        if not isinstance(raw, list):
-            return []
-        now = datetime.now(timezone.utc)
-        records: list[dict[str, str]] = []
-        for item in raw:
-            if isinstance(item, str):
-                # Legacy flat key: adopt it with a fresh window rather than dropping the user's answer.
-                records.append(_suppression_record(item, now))
-            elif isinstance(item, dict) and isinstance(item.get("fingerprint"), str):
-                records.append({str(k): str(v) for k, v in item.items()})
-        return records
+        return self._decode_records(raw)
 
     def _active(self, records: list[dict[str, str]], now: datetime) -> list[dict[str, str]]:
         active: list[dict[str, str]] = []
@@ -166,22 +200,37 @@ class UpdatePromptSuppressions:
         return any(r.get("fingerprint") == key for r in self._active(self._load(), now))
 
     def add(self, key: str) -> None:
+        def update(document: dict[str, object]) -> None:
+            raw = document.get(_SUPPRESSION_SECTION, [])
+            records = self._decode_records(raw)
+            now = datetime.now(timezone.utc)
+            records = self._active(records, now)
+            records = [r for r in records if r.get("fingerprint") != key]
+            records.append(_suppression_record(key, now))
+            # Bounded eviction by age: keep the most-recently-created, not the hash-alphabetical
+            # tail the old ``sorted(keys)[-256:]`` produced.
+            records.sort(key=lambda r: r.get("created_at") or "")
+            document[_SUPPRESSION_SECTION] = records[-_SUPPRESSION_MAX_ENTRIES:]
+
         try:
-            with file_lock(self._lock_path(), timeout=_SUPPRESSION_LOCK_TIMEOUT):
-                now = datetime.now(timezone.utc)
-                # Re-read *inside* the lock so a concurrent add is not lost, and drop expired entries.
-                records = self._active(self._load(), now)
-                records = [r for r in records if r.get("fingerprint") != key]
-                records.append(_suppression_record(key, now))
-                # Bounded eviction by age: keep the most-recently-created, not the hash-alphabetical
-                # tail the old ``sorted(keys)[-256:]`` produced.
-                records.sort(key=lambda r: r.get("created_at") or "")
-                records = records[-_SUPPRESSION_MAX_ENTRIES:]
-                atomic_write_text(self.path, json.dumps(records, indent=2), mode=0o600)
-        except LockTimeout:
+            self.store.update(update)
+        except LockedJsonStoreError:
             # A suppression is a convenience, not a correctness guarantee: if another process holds
             # the lock, the worst case is that this prompt is asked again. Never block the run on it.
             return
+
+    @staticmethod
+    def _decode_records(raw: object) -> list[dict[str, str]]:
+        if not isinstance(raw, list):
+            return []
+        now = datetime.now(timezone.utc)
+        records: list[dict[str, str]] = []
+        for item in raw:
+            if isinstance(item, str):
+                records.append(_suppression_record(item, now))
+            elif isinstance(item, dict) and isinstance(item.get("fingerprint"), str):
+                records.append({str(k): str(v) for k, v in item.items()})
+        return records
 
 
 def _suppression_record(fingerprint: str, now: datetime) -> dict[str, str]:

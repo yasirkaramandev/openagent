@@ -136,7 +136,7 @@ def test_agent_validation_failure_leaves_no_provider(tmp_path: Path) -> None:
     assert oa.providers.get("ds") is None
 
 
-def test_openagent_md_write_failure_rolls_back_provider_and_agent(
+def test_openagent_md_write_failure_keeps_committed_provider_and_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     oa = _app(tmp_path)
@@ -145,19 +145,20 @@ def test_openagent_md_write_failure_rolls_back_provider_and_agent(
         raise OSError("disk full")
 
     monkeypatch.setattr("openagent.services.agent_service.write_openagent_md", boom)
-    with pytest.raises(OSError):
-        oa.agents.create_with_new_provider(
-            provider_name="ds",
-            provider_type="custom",
-            base_url="https://api.test/v1",
-            key_env="DS_KEY",
-            credential_source="env",
-            model="m",
-            name="ds-coder",
-        )
-    # Provider row rolled back, agent row rolled back.
-    assert oa.providers.get("ds") is None
-    assert oa.agents.get("ds-coder") is None
+    created = oa.agents.create_with_new_provider(
+        provider_name="ds",
+        provider_type="custom",
+        base_url="https://api.test/v1",
+        key_env="DS_KEY",
+        credential_source="env",
+        model="m",
+        name="ds-coder",
+    )
+    # DB state is authoritative; only the derived document projection is deferred.
+    assert created.name == "ds-coder"
+    assert oa.providers.get("ds") is not None
+    assert oa.agents.get("ds-coder") is not None
+    assert [operation.kind for operation in oa.journal.pending()] == ["agent_document_sync"]
 
 
 def test_keychain_write_failure_persists_nothing(

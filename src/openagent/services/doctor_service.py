@@ -250,7 +250,13 @@ class DoctorService:
                     f"{name} authentication",
                     OK if entry.authenticated else WARN,
                     entry.auth_detail
-                    or ("authenticated" if entry.authenticated else "not detected"),
+                    or (
+                        "authenticated"
+                        if entry.authenticated is True
+                        else "unauthenticated"
+                        if entry.authenticated is False
+                        else "unknown"
+                    ),
                 )
             )
             caps = (
@@ -562,27 +568,64 @@ class DoctorService:
             "up to date" if synced else "stale; re-run `openagent add`/`remove`",
         )
 
+    @staticmethod
+    def _recovery_state(kind: str, stage: str) -> str:
+        """A redacted, human-readable recovery state for one pending operation.
+
+        Distinguishes the provider-recovery outcomes a user (or an operator triaging a support
+        report) needs to tell apart — a preserved-but-ambiguous ownership, a still-pending
+        legacy-secret cleanup on an otherwise-committed provider, a genuine rollback, a superseded
+        generation — without ever rendering the payload (which can carry a credential ref, header
+        or URL).
+        """
+
+        from ..services.provider_service import (
+            STAGE_COMMIT_DURABLE,
+            STAGE_LEGACY_CLEANUP_PENDING,
+            STAGE_OWNED_COMPENSATION,
+            STAGE_RECOVERY_AMBIGUOUS,
+            STAGE_ROLLBACK_PENDING,
+            STAGE_SUPERSEDED_GENERATION,
+        )
+
+        if kind == "agent_document_sync":
+            return "OPENAGENT.md sync pending"
+        if kind in {"provider_add", "provider_remove"}:
+            return {
+                STAGE_ROLLBACK_PENDING: "provider rollback pending",
+                STAGE_OWNED_COMPENSATION: "provider rollback pending",
+                STAGE_COMMIT_DURABLE: "provider legacy credential cleanup pending",
+                STAGE_LEGACY_CLEANUP_PENDING: "provider legacy credential cleanup pending",
+                STAGE_RECOVERY_AMBIGUOUS: "provider recovery ownership ambiguous",
+                STAGE_SUPERSEDED_GENERATION: "provider generation superseded",
+            }.get(stage, "provider recovery retry pending")
+        return f"{kind} pending"
+
     def _journal_check(self) -> Check:
         """Pending compensating operations left behind by an interrupted write.
 
         These are normally invisible: startup replays them. One that *stays* pending across
         restarts means the replay itself keeps failing — most often an OPENAGENT.md conflict, which
-        recovery deliberately skips rather than letting it block startup. Without this check that
-        situation is completely silent.
+        recovery deliberately skips rather than letting it block startup, or a provider whose
+        ownership recovery could not verify (which recovery deliberately preserves rather than
+        risk deleting committed data). Without this check that situation is completely silent.
         """
 
         pending = self.app.journal.pending()
         if not pending:
             return Check("Operation journal", OK, "no interrupted operations")
         kinds: dict[str, int] = {}
+        states: dict[str, int] = {}
         for operation in pending:
             kinds[operation.kind] = kinds.get(operation.kind, 0) + 1
-        summary = ", ".join(f"{kind} x{count}" for kind, count in sorted(kinds.items()))
+            state = self._recovery_state(operation.kind, operation.stage)
+            states[state] = states.get(state, 0) + 1
+        summary = ", ".join(f"{state} x{count}" for state, count in sorted(states.items()))
         return Check(
             "Operation journal",
             WARN,
             f"{len(pending)} operation(s) still pending after recovery: {summary}",
-            data={"pending": len(pending), "kinds": kinds},
+            data={"pending": len(pending), "kinds": kinds, "states": states},
         )
 
     def _provider_agent_integrity_check(self) -> Check:

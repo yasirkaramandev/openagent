@@ -154,6 +154,7 @@ class ProviderRepository:
                         enabled=1 if provider.enabled else 0,
                         state_revision=0,
                         updated_at=_now_iso(),
+                        credential_revision=provider.credential_revision,
                         data=provider.model_dump(mode="json"),
                     )
                 )
@@ -185,6 +186,7 @@ class ProviderRepository:
                         enabled=1 if provider.enabled else 0,
                         state_revision=next_revision,
                         updated_at=_now_iso(),
+                        credential_revision=provider.credential_revision,
                         data=provider.model_dump(mode="json"),
                     )
                 )
@@ -203,6 +205,17 @@ class ProviderRepository:
             ).first()
         return int(row[0]) if row else None
 
+    def credential_revision_of(self, provider_id: str) -> str | None:
+        """Read the authoritative generation token without decoding the JSON projection."""
+
+        with self.db.engine.connect() as conn:
+            row = conn.execute(
+                select(t.provider_connections.c.credential_revision).where(
+                    t.provider_connections.c.id == provider_id
+                )
+            ).first()
+        return str(row[0]) if row else None
+
     def upsert(self, provider: ProviderConnection) -> None:
         """Create-or-replace, kept for callers that genuinely own the record exclusively.
 
@@ -220,6 +233,7 @@ class ProviderRepository:
             "provider_type": provider.provider_type,
             "enabled": 1 if provider.enabled else 0,
             "updated_at": _now_iso(),
+            "credential_revision": provider.credential_revision,
             "data": provider.model_dump(mode="json"),
         }
         with self.db.engine.begin() as conn:
@@ -305,6 +319,46 @@ class ProviderRepository:
             conn.execute(
                 sa_delete(t.provider_connections).where(t.provider_connections.c.id == provider_id)
             )
+
+    def delete_owned(self, provider_id: str, expected_credential_revision: str) -> bool:
+        """Delete only the provider generation owned by the compensating operation."""
+
+        with self.db.engine.begin() as conn:
+            result = conn.execute(
+                sa_delete(t.provider_connections).where(
+                    t.provider_connections.c.id == provider_id,
+                    t.provider_connections.c.credential_revision == expected_credential_revision,
+                )
+            )
+        return bool(result.rowcount)
+
+    def delete_owned_with_probes(self, provider_id: str, expected_credential_revision: str) -> bool:
+        """Delete one owned generation and only probes produced for that generation."""
+
+        try:
+            with self.db.engine.begin() as conn:
+                current = conn.execute(
+                    select(t.provider_connections.c.credential_revision).where(
+                        t.provider_connections.c.id == provider_id
+                    )
+                ).scalar_one_or_none()
+                if current != expected_credential_revision:
+                    return False
+                conn.execute(
+                    sa_delete(t.model_probes).where(
+                        t.model_probes.c.provider_id == provider_id,
+                    )
+                )
+                result = conn.execute(
+                    sa_delete(t.provider_connections).where(
+                        t.provider_connections.c.id == provider_id,
+                        t.provider_connections.c.credential_revision
+                        == expected_credential_revision,
+                    )
+                )
+        except IntegrityError as exc:
+            raise ProviderInUseByAgentError(provider_id) from exc
+        return bool(result.rowcount)
 
     def delete_with_probes(self, provider_id: str) -> bool:
         """Delete a provider and its cached probes, in one transaction.

@@ -60,6 +60,9 @@ provider_connections = Table(
     #: cannot silently overwrite each other.
     Column("state_revision", Integer, nullable=False, default=0, server_default="0"),
     Column("updated_at", String, nullable=False, default="", server_default=""),
+    #: Immutable provider-generation ownership token. Provider ids are name-derived and therefore
+    #: reused after remove/re-add; compensation must compare this relational value first.
+    Column("credential_revision", String, nullable=False, server_default=""),
     Column("data", JSON, nullable=False),
 )
 

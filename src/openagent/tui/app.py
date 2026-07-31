@@ -37,7 +37,12 @@ from .markup import safe_markup
 from .screens.add_agent import AddAgentScreen
 from .screens.doctor import DoctorScreen
 from .screens.lists import AgentsScreen, CliToolsScreen, ProvidersScreen, RunsScreen
-from .screens.modals import ApprovalModal, QuestionModal
+from .screens.modals import (
+    ApprovalModal,
+    CliUpdateFailureModal,
+    CliUpdatePromptModal,
+    QuestionModal,
+)
 from .screens.run_console import RunSetupScreen
 
 _MENU = [
@@ -263,6 +268,8 @@ class OpenAgentTUI(App):
     def __init__(self, oa: OpenAgentApp | None = None) -> None:
         super().__init__()
         self.oa = oa or OpenAgentApp.create()
+        self.oa.update_prompt = self._prompt_for_cli_update
+        self.oa.update_failure_prompt = self._prompt_after_cli_update_failure
         #: Runs this app is executing right now, keyed by run id.
         self.live_runs: dict[str, LiveRun] = {}
         #: The approval/question modal a run is currently blocked on, so cancel can release it.
@@ -467,6 +474,18 @@ class OpenAgentTUI(App):
         finally:
             self._open_modals.pop(run_id, None)
 
+    def _prompt_for_cli_update(self, prompt):
+        return self.call_from_thread(self._ask_cli_update, prompt)
+
+    async def _ask_cli_update(self, prompt):
+        return await self.push_screen_wait(CliUpdatePromptModal(prompt))
+
+    def _prompt_after_cli_update_failure(self, prompt):
+        return self.call_from_thread(self._ask_cli_update_failure, prompt)
+
+    async def _ask_cli_update_failure(self, prompt):
+        return await self.push_screen_wait(CliUpdateFailureModal(prompt))
+
     def _close_modal(self, run_id: str) -> None:
         modal = self._open_modals.pop(run_id, None)
         if modal is not None:
@@ -493,4 +512,31 @@ class OpenAgentTUI(App):
 
 
 def run_tui() -> None:
-    OpenAgentTUI().run()
+    try:
+        OpenAgentTUI().run()
+    except Exception as exc:
+        from ..core.errors import (
+            DatabaseMetadataValidationError,
+            DatabaseReaderCompatibilityError,
+            DataValidationError,
+        )
+        from ..storage.migrations import (
+            MigrationFailedError,
+            MigrationVerificationError,
+            SchemaTooNewError,
+            UnknownRevisionError,
+        )
+        from .recovery import DatabaseRecoveryTUI
+
+        recoverable = (
+            DatabaseReaderCompatibilityError,
+            DatabaseMetadataValidationError,
+            SchemaTooNewError,
+            UnknownRevisionError,
+            MigrationFailedError,
+            MigrationVerificationError,
+            DataValidationError,
+        )
+        if not isinstance(exc, recoverable):
+            raise
+        DatabaseRecoveryTUI(exc).run()

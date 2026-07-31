@@ -522,6 +522,9 @@ def _pre_0012_database(path: Path, providers, agents) -> None:
                     "name": name,
                     "provider_type": "openai",
                     "credential": {"type": "none"},
+                    # A real revision-0011 database has already passed migration 0005, which
+                    # backfilled this value from the provider id.
+                    "credential_revision": f"legacy-{provider_id}",
                 }
             )
             conn.execute(

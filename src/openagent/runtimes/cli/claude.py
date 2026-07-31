@@ -102,7 +102,7 @@ class ClaudeAdapter:
         plan = build_child_environment("claude")
         evidence = await asyncio.to_thread(probe_claude_auth, self.executable or "claude", plan)
         return AuthStatus(
-            authenticated=bool(evidence.authenticated),
+            authenticated=evidence.authenticated,
             detail=evidence.detail,
             blocking=evidence.blocking,
             environment_names=list(evidence.environment_names),

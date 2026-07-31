@@ -306,5 +306,7 @@ def test_legacy_flat_string_format_is_migrated(tmp_path: Path) -> None:
     suppressions.add("new-key")
     # After a write the file is the new record shape, and the legacy answers are preserved.
     reloaded = json.loads(path.read_text(encoding="utf-8"))
-    assert all(isinstance(entry, dict) and "fingerprint" in entry for entry in reloaded)
-    assert {e["fingerprint"] for e in reloaded} >= {"legacy-key-a", "legacy-key-b", "new-key"}
+    records = reloaded["update_prompt_suppressions"]
+    assert reloaded["schema_version"] == 1
+    assert all(isinstance(entry, dict) and "fingerprint" in entry for entry in records)
+    assert {e["fingerprint"] for e in records} >= {"legacy-key-a", "legacy-key-b", "new-key"}
