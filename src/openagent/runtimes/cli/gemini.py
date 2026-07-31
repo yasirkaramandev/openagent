@@ -31,8 +31,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
-import tempfile
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,6 +41,7 @@ from ...core.errors import ErrorType, classify_http_status
 from ...core.events import EventType, NormalizedEvent
 from ...core.models import CliInstallation
 from ...core.permissions import READ_ONLY, SAFE_EDIT
+from ...security.private_files import create_private_file, private_directory
 from ...security.process import (
     ManagedProcess,
     TerminationOutcome,
@@ -197,9 +196,14 @@ def system_settings_file(mapping: GeminiPermissionMapping) -> Iterator[Path | No
     """Materialize the policy as a private file for the lifetime of one run.
 
     Outside the workspace, so a run cannot rewrite the policy that governs it through a relative
-    path; ``0700`` directory and ``0600`` file, so another local user cannot read or edit it between
-    write and exec; removed afterwards, because a stale policy file silently governing a later run
-    is its own bug.
+    path; private to this user, so another local account cannot read or edit it between write and
+    exec; removed afterwards, because a stale policy file silently governing a later run is its
+    own bug.
+
+    "Private" is delegated to :mod:`openagent.security.private_files`, which means POSIX modes on
+    POSIX and a real DACL on Windows. It is deliberately not expressed as a mode here: passing
+    ``0o600`` to ``os.open`` on Windows produces a world-readable file and a mode of ``0o666``,
+    so the enforcement would be a comment rather than a control.
 
     Yields ``None`` when the profile constrains nothing, so callers do not set the environment
     variable — pointing the CLI at an empty system-settings file is a real change in behaviour
@@ -211,20 +215,12 @@ def system_settings_file(mapping: GeminiPermissionMapping) -> Iterator[Path | No
         yield None
         return
 
-    directory = Path(tempfile.mkdtemp(prefix="openagent-gemini-policy-"))
-    try:
-        os.chmod(directory, 0o700)
+    with private_directory("openagent-gemini-policy-") as directory:
         path = directory / "settings.json"
-        # Created 0600 from the start rather than chmod'ed after: between an 0644 create and the
-        # chmod there is a window in which another local user can read or replace it.
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(document, handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Creation fails closed: if the file cannot be proven private, no run starts believing it
+        # is governed by a policy an attacker could have rewritten.
+        create_private_file(path, json.dumps(document, indent=2).encode("utf-8"))
         yield path
-    finally:
-        shutil.rmtree(directory, ignore_errors=True)
 
 
 def apply_system_settings(env: dict[str, str], path: Path | None) -> dict[str, str]:

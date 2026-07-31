@@ -17,6 +17,8 @@ import json
 import os
 import stat
 
+import pytest
+
 from openagent.runtimes.cli.gemini import (
     MUTATING_TOOLS,
     READ_ONLY_TOOLS,
@@ -25,6 +27,7 @@ from openagent.runtimes.cli.gemini import (
     system_settings_document,
     system_settings_file,
 )
+from openagent.security.private_files import verify_private_directory, verify_private_file
 
 # --------------------------------------------------------------------------- the document
 
@@ -75,15 +78,47 @@ def test_a_writing_profile_does_not_get_a_read_only_allowlist() -> None:
 
 
 def test_the_settings_file_is_private_and_removed_afterwards() -> None:
+    """Privacy is asserted through the platform's own model, not through POSIX mode bits.
+
+    The mode-bit form of this test passed on Linux and macOS and failed on Windows with
+    ``0666`` — not because the file was less private there, but because ``stat.S_IMODE`` does not
+    describe Windows security at all. Relaxing the assertion to accept ``0666`` would have turned
+    a real check into a decorative one, so it asks
+    :mod:`openagent.security.private_files` instead, which answers per platform. The
+    platform-specific mechanics are covered in ``test_private_files.py``.
+    """
+
     with system_settings_file(permission_mapping("read-only")) as path:
         assert path is not None
-        mode = stat.S_IMODE(path.stat().st_mode)
-        assert mode == 0o600, f"settings file is {mode:o}, not 0600"
-        directory_mode = stat.S_IMODE(path.parent.stat().st_mode)
-        assert directory_mode == 0o700, f"settings dir is {directory_mode:o}, not 0700"
+        verification = verify_private_file(path)
+        assert verification.ok, f"settings file is not private: {verification.findings}"
+        directory = verify_private_directory(path.parent)
+        assert directory.ok, f"settings dir is not private: {directory.findings}"
         assert json.loads(path.read_text())["tools"]["exclude"]
         remembered = path
     assert not remembered.exists(), "the policy file outlived the run it applied to"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_the_settings_file_carries_posix_0600() -> None:
+    """On POSIX the contract is still exactly 0600/0700, and stays asserted as such."""
+
+    with system_settings_file(permission_mapping("read-only")) as path:
+        assert path is not None
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL")
+def test_the_settings_file_carries_a_private_windows_dacl() -> None:
+    """On Windows the contract is a protected DACL naming nobody but this user and SYSTEM."""
+
+    with system_settings_file(permission_mapping("read-only")) as path:
+        assert path is not None
+        verification = verify_private_file(path)
+        assert verification.ok, verification.findings
+        assert verification.inheritance_disabled is True
+        assert verification.trustees
 
 
 def test_the_environment_points_at_the_override() -> None:
