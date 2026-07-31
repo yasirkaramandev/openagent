@@ -1,0 +1,233 @@
+{
+  "product": "OpenCalc Studio",
+  "engine_contract": {
+    "modules": [
+      "src/calculator/types.ts",
+      "src/calculator/decimal.ts",
+      "src/calculator/tokenizer.ts",
+      "src/calculator/parser.ts",
+      "src/calculator/evaluator.ts",
+      "src/calculator/scientific.ts"
+    ],
+    "public_functions": [
+      "tokenize(input): Token[]",
+      "parse(tokens): Node",
+      "evaluate(node, ctx): Decimal",
+      "format(value, opts): string"
+    ],
+    "errors": [
+      "DivisionByZero",
+      "DomainError",
+      "Overflow",
+      "SyntaxError",
+      "InvalidFactorial",
+      "MismatchedParens"
+    ],
+    "angle_mode": "ctx.angleMode ('DEG' | 'RAD')"
+  },
+  "integration_order": [
+    "calc-task-001",
+    "calc-task-002",
+    "calc-task-003",
+    "calc-task-004",
+    "calc-task-005",
+    "calc-task-006",
+    "calc-task-007",
+    "calc-task-008",
+    "calc-task-009"
+  ],
+  "tasks": [
+    {
+      "id": "calc-task-001",
+      "title": "Engine core: types, decimal, tokenizer, parser, evaluator",
+      "agent": "agy-frontend",
+      "depends_on": [],
+      "deliverables": [
+        "src/calculator/types.ts with Token/Node/EvalContext/FormatOptions and CalcError hierarchy (DivisionByZero, Overflow, SyntaxError, MismatchedParens)",
+        "src/calculator/decimal.ts config-driven Decimal shim and precision helpers",
+        "src/calculator/tokenizer.ts implementing tokenize(input): Token[]",
+        "src/calculator/parser.ts implementing parse(tokens): Node",
+        "src/calculator/evaluator.ts implementing evaluate(node, ctx): Decimal",
+        "format(value, opts): string exported from the calculator barrel",
+        "Vitest unit tests for the tokenize->parse->evaluate->format pipeline"
+      ],
+      "acceptance": [
+        "Strict-mode tsc --noEmit clean; no any/casts in engine modules",
+        "Pipeline tested for core arithmetic and the four basic error kinds",
+        "No DOM/React/global dependencies in src/calculator/**",
+        "EvalContext carries angleMode and precision; no global state"
+      ]
+    },
+    {
+      "id": "calc-task-002",
+      "title": "Scientific functions and DEG/RAD angle handling",
+      "agent": "agy-frontend",
+      "depends_on": ["calc-task-001"],
+      "deliverables": [
+        "src/calculator/scientific.ts with trig, inverse trig, hyperbolic, log/exp, powers/roots, factorial",
+        "InvalidFactorial and DomainError error kinds wired through the evaluator",
+        "DEG/RAD normalization via ctx.angleMode for angle-dependent functions",
+        "Unit tests for scientific function correctness across both angle modes"
+      ],
+      "acceptance": [
+        "sin/cos/tan honor angleMode; asin/acos/atan return in active mode",
+        "0.5!, (-3)! and non-integer factorial args raise InvalidFactorial",
+        "sqrt(-1), log(-5), asin(2) raise DomainError",
+        "Overflow raised for demonstrably large exponentials/factorials",
+        "Hyperbolic functions are dimensionless and ignore angle mode"
+      ]
+    },
+    {
+      "id": "calc-task-003",
+      "title": "Standard calculator UI: keypad, display, shell, error surfacing",
+      "agent": "agy-frontend",
+      "depends_on": ["calc-task-001"],
+      "deliverables": [
+        "src/components/Keypad, Display, Shell accessible widgets",
+        "State adapter wrapping tokenize->parse->evaluate->format",
+        "CalcError.code -> localized message mapping",
+        "aria-live region for result and error announcement",
+        "Component-level RTL tests"
+      ],
+      "acceptance": [
+        "All controls keyboard-operable with visible focus",
+        "Result region is aria-live polite; errors announced",
+        "Responsive at 320/768/1280 px without horizontal scroll",
+        "No console errors during a standard session",
+        "Pure engine contract unchanged by UI work"
+      ]
+    },
+    {
+      "id": "calc-task-004",
+      "title": "History, settings, theme, and PWA offline",
+      "agent": "agy-frontend",
+      "depends_on": ["calc-task-002", "calc-task-003"],
+      "deliverables": [
+        "History component storing expression + canonical result + ctx snapshot",
+        "Settings for angle mode, precision, theme, privacy/telemetry toggle",
+        "Web App Manifest and service worker for app-shell + engine-bundle caching",
+        "Offline-capable install + non-intrusive update flow",
+        "History replay verification tests"
+      ],
+      "acceptance": [
+        "History entry replayable offline to reproduce recorded result",
+        "Settings changes reflected on next evaluation",
+        "App fully functional with network unplugged after first install",
+        "Installable manifest valid across Chromium and Firefox",
+        "No auto-reload disrupting in-flight sessions"
+      ]
+    },
+    {
+      "id": "calc-task-005",
+      "title": "QA: engine unit, angle-mode parity, error matrix, and UI RTL suites",
+      "agent": "agy-qa",
+      "depends_on": [
+        "calc-task-001",
+        "calc-task-002",
+        "calc-task-003",
+        "calc-task-004"
+      ],
+      "deliverables": [
+        "Vitest engine suite covering pipeline, every error kind, both angle modes",
+        "Angle-mode parity fixture set with known-good reference values",
+        "Accessibility-oriented RTL component tests for keypad/display/history/settings",
+        "Determinism test: identical inputs + ctx yield byte-identical format output",
+        "Coverage report and failing-case triage notes"
+      ],
+      "acceptance": [
+        "Engine statement coverage >= 90%",
+        "Every CalcError.code has at least one triggered test case",
+        "DEG/RAD results match reference values within configured precision",
+        "RTL suite asserts keyboard operability and aria-live announcements",
+        "No flaky tests on three consecutive clean runs"
+      ]
+    },
+    {
+      "id": "calc-task-006",
+      "title": "Security review: input limits, engine surface, PWA scope",
+      "agent": "agy-security",
+      "depends_on": ["calc-task-004", "calc-task-005"],
+      "deliverables": [
+        "Threat-model document covering input limits, decimal-stack overflow, history tampering, service-worker scope, offline/sandbox escape",
+        "Verification of maxNodeDepth and input-length enforcement",
+        "CI grep gate confirming no eval/new Function/dynamic import of user input",
+        "Dependency manifest review (postinstall scripts, engine requirements)",
+        "PWA caching-scope and same-origin verification"
+      ],
+      "acceptance": [
+        "No eval/Function/dynamic-import of user input exists in codebase",
+        "Oversize/deep input fails closed with a typed error, no renderer crash",
+        "Service worker caches same-origin assets only; no open-redirect surfaces",
+        "No credentials/telemetry read, transmitted, or persisted",
+        "Threat-model mitigations documented for every identified risk"
+      ]
+    },
+    {
+      "id": "calc-task-007",
+      "title": "Documentation: user guide, keyboard reference, accessibility, engine extension",
+      "agent": "agy-docs",
+      "depends_on": ["calc-task-002", "calc-task-003", "calc-task-004"],
+      "deliverables": [
+        "User guide covering keypad usage, keyboard shortcuts, scientific functions, DEG/RAD",
+        "Error-message reference listing every CalcError.code with sample input and surfaced message",
+        "Accessibility statement with supported AT, contrast modes, keyboard model",
+        "Engine-extension guide for adding scientific functions and error kinds",
+        "In-app help content consistent with shipped features"
+      ],
+      "acceptance": [
+        "Keyboard reference matches actual bindings",
+        "Every CalcError.code documented with example",
+        "Accessibility statement references WCAG 2.1 AA conformance claims",
+        "Extension guide shows the tokenize->parse->evaluate contract preservation",
+        "Docs reviewed for consistency with shipped feature set"
+      ]
+    },
+    {
+      "id": "calc-task-008",
+      "title": "Integration review: cross-phase contract verification and acceptance matrix walkthrough",
+      "agent": "agy-qa",
+      "depends_on": [
+        "calc-task-001",
+        "calc-task-002",
+        "calc-task-003",
+        "calc-task-004",
+        "calc-task-005",
+        "calc-task-006",
+        "calc-task-007"
+      ],
+      "deliverables": [
+        "Signed acceptance-matrix walkthrough against acceptance-criteria.md",
+        "Cross-phase contract verification: engine exports, EvalContext shape, FormatOptions shape, CalcError.code set stable across consumers",
+        "End-to-end pipeline integration test (UI -> adapter -> engine -> format)",
+        "Open-item log with explicit waivers and rationale",
+        "Integration review report"
+      ],
+      "acceptance": [
+        "Every acceptance-criteria.md section satisfied or formally waived with rationale",
+        "No consumer built against a stale engine contract",
+        "End-to-end test passes for calculate, history replay, settings, and offline mode",
+        "All open items recorded for release hardening"
+      ]
+    },
+    {
+      "id": "calc-task-009",
+      "title": "Release hardening: strict-mode build, bundle budget, a11y/PWA audit, release notes",
+      "agent": "agy-qa",
+      "depends_on": ["calc-task-008"],
+      "deliverables": [
+        "tsc --noEmit strict cleanliness verification",
+        "Bundle-size budget verification (engine + UI gzipped)",
+        "Lighthouse performance, accessibility, and PWA category re-audit",
+        "Reproducible build verification (npm ci && npm run build && npm test twice)",
+        "Release notes enumerating changes, known limitations, and waivers"
+      ],
+      "acceptance": [
+        "tsc --noEmit clean with strict: true",
+        "Bundle within agreed gzipped budget",
+        "Lighthouse performance >= 90 and PWA fully passing",
+        "axe-core zero serious violations on calculator route",
+        "Clean build reproducible twice on a supported Node version"
+      ]
+    }
+  ]
+}

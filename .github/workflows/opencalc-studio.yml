@@ -1,0 +1,61 @@
+name: OpenCalc Studio
+
+on:
+  push:
+    paths:
+      - "examples/opencalc-studio/**"
+      - ".github/workflows/opencalc-studio.yml"
+  pull_request:
+    paths:
+      - "examples/opencalc-studio/**"
+      - ".github/workflows/opencalc-studio.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: examples/opencalc-studio
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/opencalc-studio/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/opencalc-studio/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: >-
+          npx playwright test
+          --project=chromium
+          --project=firefox
+          --project=webkit
+          --reporter=list,html
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: examples/opencalc-studio/playwright-report/
+          retention-days: 7

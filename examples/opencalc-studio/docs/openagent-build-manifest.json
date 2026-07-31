@@ -1,0 +1,346 @@
+{
+  "product": "OpenCalc Studio",
+  "note": "Provenance compiled by the OpenAgent orchestration operator from REAL OpenAgent run records (`openagent runs --json`, per-run artifacts under .openagent/runs/, and the run worktree branches). The GLM provider (z-ai/glm-5.2 via NVIDIA Build) was quota-exhausted (HTTP 429) before this manifest could itself be authored by an agent, so it is operator-compiled from verifiable run data rather than agent-authored. All PRODUCT and PLAN source files listed below were authored by agent runs; no product source was hand-written.",
+  "branch": "example/opencalc-studio",
+  "base_commit": "f5abf2666a41f5548c1ed4fe3bf5bcef91097aef",
+  "provider": "z-ai/glm-5.2 (nvidia-build, openai-chat)",
+  "status": "COMPLETE: engine, premium standard+scientific UI, history/memory/settings, offline PWA, QA (49 unit/component + 18 E2E x3 browsers + axe), security review (strict CSP, safe paste, 0 audit findings), documentation, and lint/format/CI - all authored by OpenAgent agent runs and operator-verified.",
+  "tasks": [
+    {
+      "task_id": "calc-plan-001",
+      "agent": "glm-orchestrator",
+      "openagent_run_id": "run_3bc9d9d80d23",
+      "run_status": "completed",
+      "base_commit": "f5abf2666a41f5548c1ed4fe3bf5bcef91097aef",
+      "result_commit": "5786d69c87b3945fc935358266af6b62637a9617",
+      "integration_commit": "2e0f9d80aad35adca1c54eb4b2c2aad6599dfafe",
+      "prompt_artifact": ".openagent/runs/run_3bc9d9d80d23/request.json",
+      "output_artifact": ".openagent/runs/run_3bc9d9d80d23/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/docs/openagent-task-graph.json",
+        "examples/opencalc-studio/docs/architecture.md",
+        "examples/opencalc-studio/docs/acceptance-criteria.md"
+      ],
+      "reviewed_by": ["operator (json validity + structure verified)"],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-001",
+      "agent": "agy-frontend",
+      "openagent_run_id": "run_e38ed3f90b82",
+      "run_status": "failed (HTTP 429 after all deliverables were written; files salvaged from the run worktree)",
+      "base_commit": "2e0f9d80aad35adca1c54eb4b2c2aad6599dfafe",
+      "result_commit": null,
+      "integration_commit": "28994d06314afbf12e6edf0af760d978772da7d4",
+      "prompt_artifact": ".openagent/runs/run_e38ed3f90b82/request.json",
+      "output_artifact": ".openagent/runs/run_e38ed3f90b82/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/package.json",
+        "examples/opencalc-studio/tsconfig.json",
+        "examples/opencalc-studio/vitest.config.ts",
+        "examples/opencalc-studio/src/calculator/types.ts",
+        "examples/opencalc-studio/src/calculator/decimal.ts",
+        "examples/opencalc-studio/src/calculator/tokenizer.ts",
+        "examples/opencalc-studio/src/calculator/parser.ts",
+        "examples/opencalc-studio/src/calculator/scientific.ts",
+        "examples/opencalc-studio/src/calculator/evaluator.ts",
+        "examples/opencalc-studio/src/calculator/index.ts",
+        "examples/opencalc-studio/src/calculator/engine.test.ts"
+      ],
+      "verification": "operator ran `npm install && npx vitest run` (not modified): 43 passed / 1 failed (44 total)",
+      "reviewed_by": ["operator (vitest execution)"],
+      "known_issue": "engine.test.ts expects a trailing ')' to throw MismatchedParens; the agent's parser throws SyntaxError. RESOLVED by calc-task-fix-001.",
+      "status": "accepted-with-known-issue (resolved by calc-task-fix-001)"
+    },
+    {
+      "task_id": "calc-task-fix-001",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_c342f8b000ae",
+      "run_status": "completed",
+      "base_commit": "2a60aa38a0a2ff91d50d9c3de95e07dab2e41043",
+      "result_commit": "b9c13cfeb44e6a15d4343a46f8005a0f8c57e745",
+      "integration_commit": "b9c13cfeb44e6a15d4343a46f8005a0f8c57e745 (fast-forward into example/opencalc-studio)",
+      "prompt_artifact": ".openagent/runs/run_c342f8b000ae/request.json",
+      "output_artifact": ".openagent/runs/run_c342f8b000ae/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/src/calculator/parser.ts",
+        "examples/opencalc-studio/src/calculator/types.ts",
+        "examples/opencalc-studio/src/calculator/evaluator.ts",
+        "examples/opencalc-studio/src/calculator/scientific.ts"
+      ],
+      "verification": "operator ran (unmodified) `npm test` -> 44 passed / 0 failed (44 total); `npm run typecheck` -> clean. Diff scope verified: all changes within examples/opencalc-studio/src/calculator/.",
+      "resolves": "calc-task-001 known_issue (trailing ')' now throws typed MismatchedParens) and the 5 TS18048/TS2345 'possibly undefined' errors in scientific.ts.",
+      "provider_note": "GLM (z-ai/glm-5.2 via nvidia-build) endpoint was timing out (4-min no-response). Codex CLI was upgraded 0.142.5 -> 0.145.0 via `openagent cli update codex` so the account's gpt-5.6-sol model is supported; this task ran on the codex Sol agent.",
+      "reviewed_by": [
+        "operator (diff-scope review + npm test + npm run typecheck)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-003",
+      "title": "premium standard calculator UI (React + Vite)",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_6b0c03761868",
+      "run_status": "completed",
+      "base_commit": "b9c13cfeb44e6a15d4343a46f8005a0f8c57e745",
+      "result_commit": "a452131fb9a64765bbb008f2fc9a599b10922975",
+      "integration_commit": "a452131fb9a64765bbb008f2fc9a599b10922975 (fast-forward into example/opencalc-studio)",
+      "prompt_artifact": ".openagent/runs/run_6b0c03761868/request.json",
+      "output_artifact": ".openagent/runs/run_6b0c03761868/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/index.html",
+        "examples/opencalc-studio/vite.config.ts",
+        "examples/opencalc-studio/src/main.tsx",
+        "examples/opencalc-studio/src/App.tsx",
+        "examples/opencalc-studio/src/ui/Calculator.tsx",
+        "examples/opencalc-studio/src/ui/Keypad.tsx",
+        "examples/opencalc-studio/src/ui/Display.tsx",
+        "examples/opencalc-studio/src/ui/CalculatorButton.tsx",
+        "examples/opencalc-studio/src/ui/ThemeControl.tsx",
+        "examples/opencalc-studio/src/ui/useTheme.ts",
+        "examples/opencalc-studio/src/ui/styles.css",
+        "examples/opencalc-studio/package.json",
+        "examples/opencalc-studio/tsconfig.json",
+        "examples/opencalc-studio/.gitignore"
+      ],
+      "verification": "operator ran (unmodified): npm test -> 44/44; npm run typecheck -> clean; npm run build -> success (dist/ produced, 44 modules). LIVE browser check via vite preview: UI renders premium calculator; computed 7 x 8 = 56 correctly; all buttons carry screen-reader aria-labels (Seven, Multiply, Equals, ...); light/system/dark theme toggle present.",
+      "provider_note": "codex Sol agent (gpt-5.6-sol) after codex CLI upgrade; wired to existing engine in src/calculator/ (no math reimplemented).",
+      "reviewed_by": [
+        "operator (diff-scope review + npm test/typecheck/build + live browser functional + a11y check)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-004",
+      "title": "scientific mode + history + memory + settings",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_7d13fdffadd2",
+      "run_status": "completed",
+      "base_commit": "a452131fb9a64765bbb008f2fc9a599b10922975",
+      "result_commit": "57b8742b0a34f6d224ef8b1ab625b384d3f2963b",
+      "integration_commit": "57b8742b0a34f6d224ef8b1ab625b384d3f2963b (fast-forward)",
+      "prompt_artifact": ".openagent/runs/run_7d13fdffadd2/request.json",
+      "output_artifact": ".openagent/runs/run_7d13fdffadd2/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/src/App.tsx",
+        "examples/opencalc-studio/src/ui/Calculator.tsx",
+        "examples/opencalc-studio/src/ui/Display.tsx",
+        "examples/opencalc-studio/src/ui/HistoryPanel.tsx",
+        "examples/opencalc-studio/src/ui/Keypad.tsx",
+        "examples/opencalc-studio/src/ui/ScientificKeypad.tsx",
+        "examples/opencalc-studio/src/ui/SettingsPanel.tsx",
+        "examples/opencalc-studio/src/ui/ThemeControl.tsx",
+        "examples/opencalc-studio/src/ui/history.ts",
+        "examples/opencalc-studio/src/ui/settings.ts",
+        "examples/opencalc-studio/src/ui/styles.css",
+        "examples/opencalc-studio/src/ui/useTheme.ts"
+      ],
+      "verification": "operator ran (unmodified): npm test -> 44/44; npm run typecheck -> clean; npm run build -> success. LIVE browser check: STD/SCI toggle works; SCI mode shows DEG/RAD toggle + scientific grid (sin/cos/tan/asin/acos/atan/ln/log/sqrt/x^2/x^y/1/x/x!/pi/e); memory row MC/MR/M+/M-/MS present with aria-labels; History button ('Open history, N entries') and Settings gear present; header reflects settings (decimal places).",
+      "provider_note": "codex Sol agent (gpt-5.6-sol); wired to existing engine scientific.ts; no math reimplemented.",
+      "reviewed_by": [
+        "operator (diff-scope review + npm test/typecheck/build + live browser SCI/history/settings + a11y check)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-005",
+      "title": "offline PWA (manifest + service worker + icons)",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_5f864b41af99",
+      "run_status": "completed",
+      "result_commit": "840e003816688302c5613666875e50790692f29d",
+      "integration_commit": "840e003816688302c5613666875e50790692f29d (fast-forward)",
+      "prompt_artifact": ".openagent/runs/run_5f864b41af99/request.json",
+      "output_artifact": ".openagent/runs/run_5f864b41af99/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/vite.config.ts",
+        "examples/opencalc-studio/src/pwa.ts",
+        "examples/opencalc-studio/src/ui/PwaUpdatePrompt.tsx",
+        "examples/opencalc-studio/src/main.tsx",
+        "examples/opencalc-studio/index.html",
+        "examples/opencalc-studio/public/ (icons)",
+        "examples/opencalc-studio/scripts/generate-pwa-icons.mjs",
+        "examples/opencalc-studio/package.json"
+      ],
+      "verification": "operator ran (unmodified): npm test 44/44; typecheck clean; npm run build -> success with vite-plugin-pwa precache 13 entries (204 KiB). dist/ contains manifest.webmanifest, sw.js, workbox-*.js, and icons/. Calculations are pure client-side (engine) so work offline.",
+      "provider_note": "codex Sol agent; used vite-plugin-pwa (workbox) for versioned SW + manifest.",
+      "reviewed_by": [
+        "operator (diff-scope + npm test/typecheck/build + dist PWA-artifact verification)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-006",
+      "title": "QA: component + Playwright (chromium/firefox/webkit) + axe accessibility",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_84f9de36ba9e",
+      "run_status": "completed",
+      "result_commit": "4744453e7d24eea95966c0c2f17b4507619fd917",
+      "integration_commit": "4744453e7d24eea95966c0c2f17b4507619fd917 (fast-forward)",
+      "prompt_artifact": ".openagent/runs/run_84f9de36ba9e/request.json",
+      "output_artifact": ".openagent/runs/run_84f9de36ba9e/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/playwright.config.ts",
+        "examples/opencalc-studio/e2e/calculator.spec.ts",
+        "examples/opencalc-studio/e2e/accessibility.spec.ts",
+        "examples/opencalc-studio/src/ui/Calculator.test.tsx",
+        "examples/opencalc-studio/vitest.config.ts",
+        "examples/opencalc-studio/package.json"
+      ],
+      "verification": "operator ran (unmodified): npm test -> 49 passed (44 engine + 5 component); npm run typecheck -> clean; npm run build -> success; `npx playwright test` -> 18 passed across chromium(6)/firefox(6)/webkit(6), including axe 'no serious/critical accessibility violations' on all 3 browsers, keyboard-only entry, history reuse, and mobile-viewport usability. Browsers installed by the agent via `npx playwright install`.",
+      "provider_note": "codex Sol agent (agy-qa would use the timing-out GLM API).",
+      "reviewed_by": [
+        "operator (diff-scope + npm test/typecheck/build + INDEPENDENT `npx playwright test` run across 3 browsers)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-007",
+      "title": "security review + CSP + safe paste + dependency audit",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_eff1b50e098b",
+      "run_status": "completed",
+      "result_commit": "96afbb788f03cf84d13dcdb0d8ea3e12461a04c5",
+      "integration_commit": "96afbb788f03cf84d13dcdb0d8ea3e12461a04c5 (fast-forward)",
+      "prompt_artifact": ".openagent/runs/run_eff1b50e098b/request.json",
+      "output_artifact": ".openagent/runs/run_eff1b50e098b/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/index.html (CSP meta)",
+        "examples/opencalc-studio/src/ui/paste.ts",
+        "examples/opencalc-studio/src/ui/Calculator.tsx",
+        "examples/opencalc-studio/src/ui/Calculator.test.tsx",
+        "examples/opencalc-studio/docs/security-review.md",
+        "examples/opencalc-studio/vitest.config.ts",
+        "examples/opencalc-studio/package.json"
+      ],
+      "verification": "operator INDEPENDENTLY verified: grep over src/+index.html finds NO eval / new Function / dangerouslySetInnerHTML / remote <script src=https> / analytics. CSP meta enforced: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'. `npm audit` = 0 vulnerabilities (prod AND dev). npm test 49 passed; typecheck clean; build ok; and `npx playwright test` -> 18 passed across chromium/firefox/webkit UNDER the CSP (proving the policy does not break the app or the service worker).",
+      "reviewed_by": [
+        "operator (independent grep + CSP inspection + npm audit + full E2E re-run under CSP)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-008",
+      "title": "documentation (README, architecture, precision, shortcuts)",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_4802af4bfe75",
+      "run_status": "completed",
+      "result_commit": "6826de3717b1173711d59a10c0f49074e228e11f",
+      "integration_commit": "6826de3717b1173711d59a10c0f49074e228e11f (fast-forward)",
+      "prompt_artifact": ".openagent/runs/run_4802af4bfe75/request.json",
+      "output_artifact": ".openagent/runs/run_4802af4bfe75/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/README.md",
+        "examples/opencalc-studio/docs/architecture.md",
+        "examples/opencalc-studio/docs/precision.md",
+        "examples/opencalc-studio/docs/shortcuts.md"
+      ],
+      "verification": "operator ran: npm test 49 passed; typecheck clean; build ok. Docs accuracy spot-checked against source: shortcuts.md key list (Enter/Escape/Backspace/Delete/digits/operators/Ctrl+V paste/Tab) matches the actual key handling in src/ui/. 672 doc lines total.",
+      "reviewed_by": ["operator (gates + docs-vs-source accuracy spot check)"],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-009",
+      "title": "lint + format + CI matrix (build/test + 3-browser E2E)",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_5043b8c0f746",
+      "run_status": "completed",
+      "result_commit": "b8a2246baf92fefaf2e88c362f82516c378538c9",
+      "integration_commit": "merged into example/opencalc-studio",
+      "prompt_artifact": ".openagent/runs/run_5043b8c0f746/request.json",
+      "output_artifact": ".openagent/runs/run_5043b8c0f746/output.md",
+      "files_changed": [
+        ".github/workflows/opencalc-studio.yml",
+        "examples/opencalc-studio/eslint.config.js",
+        "examples/opencalc-studio/prettier.config.js",
+        "examples/opencalc-studio/.prettierignore",
+        "examples/opencalc-studio/package.json",
+        "(prettier reformat across src/, e2e/, docs/)"
+      ],
+      "verification": "operator verified the calculator-source changes are PURE prettier reflow (git diff -w shows only line-wrapping/union-collapsing; no logic change) and then ran the full gate set: format:check OK, lint 0 errors, typecheck clean, npm test 49 passed, npm run build success, npm audit --omit=dev 0 vulnerabilities, and `npx playwright test` 18 passed across chromium/firefox/webkit. CI workflow has build-test (ci/format/lint/typecheck/test/build/audit) and e2e (playwright install + 3-browser run + report artifact) jobs with a paths filter.",
+      "reviewed_by": [
+        "operator (formatting-only diff proof + full gate set + E2E re-run)"
+      ],
+      "status": "accepted"
+    },
+    {
+      "task_id": "calc-task-010",
+      "title": "final integration review (VERDICT: SHIP)",
+      "agent": "Sol (codex-cli, gpt-5.6-sol)",
+      "openagent_run_id": "run_a097d4abb523",
+      "run_status": "completed",
+      "result_commit": "33cf452401779fc8005e81dc88cf96a4d1747765",
+      "integration_commit": "merged into example/opencalc-studio",
+      "prompt_artifact": ".openagent/runs/run_a097d4abb523/request.json",
+      "output_artifact": ".openagent/runs/run_a097d4abb523/output.md",
+      "files_changed": [
+        "examples/opencalc-studio/docs/integration-review.md",
+        "examples/opencalc-studio/src/calculator/tokenizer.ts",
+        "examples/opencalc-studio/src/calculator/decimal.ts",
+        "examples/opencalc-studio/src/calculator/index.ts",
+        "examples/opencalc-studio/src/calculator/engine.test.ts",
+        "examples/opencalc-studio/src/ui/Calculator.tsx",
+        "examples/opencalc-studio/src/ui/paste.ts",
+        "examples/opencalc-studio/src/ui/Calculator.test.tsx",
+        "examples/opencalc-studio/e2e/*.spec.ts",
+        "examples/opencalc-studio/src/ui/styles.css"
+      ],
+      "findings": "Blockers: none. MAJOR (fixed): scientific-notation results such as 1e-5 produced by format() could not be re-tokenized/re-parsed, so reusing such a result (e.g. from history) failed; tokenizer + decimal parser now accept exponent form, with regression tests. Minor/nit items documented in docs/integration-review.md (e.g. history does not snapshot angle-mode context).",
+      "verdict": "SHIP",
+      "verification": "operator ran the full gate set after merge: format:check OK, lint 0 errors, typecheck clean, npm test 49 passed (44 engine + 5 UI), npm run build success, npm audit --omit=dev 0 vulnerabilities, npx playwright test 18 passed across chromium/firefox/webkit.",
+      "reviewed_by": ["operator (scope check + full gate set + E2E re-run)"],
+      "status": "accepted"
+    }
+  ],
+  "not_completed": {
+    "reason": "GLM/nvidia-build provider quota exhaustion (repeated HTTP 429) after ~8 runs, plus per-turn slowness and tool-argument unreliability. Resumable when quota resets.",
+    "outstanding_tasks": [
+      "calc-task-002 scientific-mode UI",
+      "calc-task-003 standard calculator UI (React)",
+      "calc-task-004 history/settings/theme/PWA",
+      "calc-task-005 QA (vitest expansion, playwright, axe)",
+      "calc-task-006 security review",
+      "calc-task-007 documentation",
+      "calc-task-008 integration review",
+      "calc-task-009 release hardening + CI workflow"
+    ]
+  },
+  "failed_or_superseded_runs": [
+    {
+      "run_id": "run_28b3ab86d62e",
+      "agent": "glm-orchestrator",
+      "status": "failed",
+      "cause": "provider stream >120s (pre-timeout-raise)"
+    },
+    {
+      "run_id": "run_49c06bcf1152",
+      "agent": "glm-orchestrator",
+      "status": "failed",
+      "cause": "provider stream >120s after writing task graph (pre-timeout-raise)"
+    },
+    {
+      "run_id": "run_6be865059cc0",
+      "agent": "glm-orchestrator",
+      "status": "completed-empty",
+      "cause": "premature text-only turn ended loop before writing files"
+    },
+    {
+      "run_id": "run_29bcb1abfc89",
+      "agent": "glm-orchestrator",
+      "status": "failed",
+      "cause": "write_file content passed as object not string; stream disconnect"
+    },
+    {
+      "run_id": "run_af50a11af338",
+      "agent": "agy-frontend",
+      "status": "failed",
+      "cause": "HTTP 429 quota"
+    },
+    {
+      "run_id": "run_7b918783984c",
+      "agent": "agy-frontend",
+      "status": "failed",
+      "cause": "HTTP 429 quota"
+    }
+  ]
+}
