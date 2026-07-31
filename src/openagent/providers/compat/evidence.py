@@ -63,6 +63,15 @@ class EvidenceSource(str, Enum):
     PROVIDER_CATALOG = "provider_catalog"
     VERIFIED_FIXTURE = "verified_fixture"
     CURATED_PRESET = "curated_preset"
+    #: What an older build believed, carried across by migration 0016. The weakest automatic
+    #: source by construction: it records a v0.1 boolean, not something observed under the current
+    #: probe definition. Recording those as LIVE_PROBE would have been a lie with consequences —
+    #: live probe is the strongest automatic source, so a v0.1 guess would have outranked every
+    #: real catalog reading from then on.
+    #:
+    #: This member was missing while migration 0016 already wrote ``legacy_migration`` into the
+    #: source column, so every row the migration produced raised ValueError on read.
+    LEGACY_MIGRATION = "legacy_migration"
     MANUAL_OVERRIDE = "manual_override"
 
 
@@ -71,6 +80,7 @@ _RANK = {
     EvidenceSource.PROVIDER_CATALOG: 30,
     EvidenceSource.VERIFIED_FIXTURE: 20,
     EvidenceSource.CURATED_PRESET: 10,
+    EvidenceSource.LEGACY_MIGRATION: 5,
 }
 
 #: A human deliberately saying "yes it does, I checked" outranks every automatic source. It is also

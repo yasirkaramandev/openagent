@@ -476,23 +476,58 @@ class TestMigration0016:
             count = conn.exec_driver_sql("SELECT COUNT(*) FROM capability_evidence").scalar()
         assert count == 0
 
-    def test_the_unique_constraint_keeps_one_row_per_source(self, db) -> None:
-        """A probe and a catalog may both speak about one capability; two probes may not stack."""
+    def test_identical_observations_collide_but_different_ones_do_not(self, db) -> None:
+        """Deduplication is by explicit observation_key, not by a UNIQUE over the columns.
+
+        A UNIQUE spanning the identity columns deduplicates nothing where it matters: SQLite never
+        treats two NULLs as equal, and region, workspace_id and model_revision are nullable — so
+        the rows most likely to repeat were exactly the ones that never collided, and re-running
+        the backfill inserted each of them again.
+        """
+
+        from openagent.storage.migrations_v2 import observation_key
+
+        def key(**overrides):
+            base = dict(
+                provider_id="p1",
+                model_id="m",
+                capability="tool_calling",
+                source="live_probe",
+                protocol="openai-chat",
+                base_url_fingerprint="fp",
+                credential_revision="revA",
+                region=None,
+                workspace_id=None,
+                probe_version=1,
+                model_revision=None,
+            )
+            base.update(overrides)
+            return observation_key(**base)
 
         with db.begin() as conn:
             _m0016_capability_evidence(conn)
             _insert_provider(conn, "p1", "deepseek", {"provider_type": "deepseek"})
-            for source in ("live_probe", "provider_catalog", "live_probe"):
+            for observation in (
+                key(),  # first observation
+                key(),  # byte-identical repeat -> collides
+                key(source="provider_catalog"),  # a different source is a different fact
+                key(credential_revision="revB"),  # a rotated credential is a different fact
+                key(region="eu"),  # NULL vs "eu" must still be two rows
+            ):
                 conn.execute(
                     text(
                         "INSERT OR IGNORE INTO capability_evidence "
-                        "(provider_id, model_id, capability, status, source, observed_at) "
-                        "VALUES ('p1','m','tool_calling','supported',:source,'2026-01-01')"
+                        "(provider_id, model_id, capability, status, source, observed_at, "
+                        " observation_key) "
+                        "VALUES ('p1','m','tool_calling','supported','live_probe','2026-01-01',"
+                        " :key)"
                     ),
-                    {"source": source},
+                    {"key": observation},
                 )
             count = conn.exec_driver_sql("SELECT COUNT(*) FROM capability_evidence").scalar()
-        assert count == 2
+
+        # Five inserts, one an exact repeat: four rows.
+        assert count == 4
 
 
 # =========================================================================== 0017

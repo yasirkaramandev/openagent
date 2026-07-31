@@ -577,3 +577,39 @@ class Session(BaseModel):
     provider_session_id: str | None = None
     workspace: str = ""
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class CapabilityEvidenceRecord(BaseModel):
+    """One persisted capability observation, with everything needed to invalidate it (spec §8.2).
+
+    Separate from the in-memory ``CapabilityEvidence`` the ledger reasons about: that one carries
+    the *semantic* claim, this one adds the storage scope — which endpoint, which credential, which
+    probe definition produced it. Keeping them apart stops scope fields leaking into the ranking
+    logic and stops the ranking logic deciding what is worth persisting.
+
+    ``observed_at`` is nullable on purpose. A legacy row migrated from a v0.1 boolean genuinely
+    does not know when it was observed, and writing an empty string into a datetime field is not
+    "unknown" — it is a parse error deferred to whoever reads it next.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    provider_id: str
+    model_id: str
+    capability: str
+    status: str
+    source: str
+    observed_at: datetime | None = None
+    probe_version: int = 1
+    provider_version: str | None = None
+    model_revision: str | None = None
+    credential_revision: str = ""
+    #: Endpoint identity — evidence is only valid for the endpoint that produced it.
+    protocol: str = ""
+    #: A fingerprint, never the URL: a base URL can carry a key in a query string or a tenant in a
+    #: host, and this record is read by Doctor and printed.
+    base_url_fingerprint: str = ""
+    region: str | None = None
+    workspace_id: str | None = None
+    detail: str = ""

@@ -23,6 +23,7 @@ from ..core.events import EventType, NormalizedEvent
 from ..core.limits import RUNTIME_LIMITS
 from ..core.models import (
     AgentProfile,
+    CapabilityEvidenceRecord,
     CliInstallation,
     ModelProfile,
     Project,
@@ -34,6 +35,7 @@ from ..core.models import (
 )
 from . import db as t
 from .db import Database
+from .migrations_v2 import observation_key
 
 
 class DuplicateNameError(RuntimeError):
@@ -1791,3 +1793,231 @@ class Repositories:
         self.sessions = SessionRepository(database)
         self.event_index = EventIndexRepository(database)
         self.model_probes = ModelProbeRepository(database)
+        #: v0.2 capability authority. ``model_probes`` above stays as a compatibility cache for
+        #: older callers; it is no longer where a capability verdict comes from.
+        self.capability_evidence = CapabilityEvidenceRepository(database)
+
+
+class CapabilityEvidenceRepository:
+    """Append-only storage for capability observations (spec §8.5).
+
+    Append-only, not upsert. Two observations of the same model under different credentials, or
+    from different regions, are two facts — a destructive UNIQUE across the observation columns
+    would make them collide, and the loser would either be rejected or silently overwrite the
+    winner. Keeping both means invalidation is a *query* ("which rows still apply?") rather than a
+    delete, so the history that explains a verdict survives the verdict changing.
+
+    Nothing here decides which evidence wins. That is the resolver's job; this only stores and
+    filters.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    # ------------------------------------------------------------------ writing
+
+    def append(self, record: CapabilityEvidenceRecord) -> int:
+        """Store one observation. Returns its row id."""
+
+        return self.append_many([record])[0]
+
+    def append_many(self, records: Sequence[CapabilityEvidenceRecord]) -> list[int]:
+        if not records:
+            return []
+        ids: list[int] = []
+        with self.db.engine.begin() as conn:
+            for record in records:
+                result = conn.execute(
+                    insert(t.capability_evidence).values(**_evidence_values(record))
+                )
+                key = result.inserted_primary_key
+                if key is None:  # pragma: no cover - SQLite always returns one for AUTOINCREMENT
+                    raise RuntimeError("capability_evidence insert returned no primary key")
+                ids.append(int(key[0]))
+        return ids
+
+    # ------------------------------------------------------------------ reading
+
+    def get(self, record_id: int) -> CapabilityEvidenceRecord | None:
+        with self.db.engine.connect() as conn:
+            row = (
+                conn.execute(
+                    select(t.capability_evidence).where(t.capability_evidence.c.id == record_id)
+                )
+                .mappings()
+                .first()
+            )
+        return _decode_evidence(row) if row else None
+
+    def list_for_model(self, provider_id: str, model_id: str) -> list[CapabilityEvidenceRecord]:
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(t.capability_evidence)
+                    .where(
+                        t.capability_evidence.c.provider_id == provider_id,
+                        t.capability_evidence.c.model_id == model_id,
+                    )
+                    .order_by(t.capability_evidence.c.id)
+                )
+                .mappings()
+                .all()
+            )
+        return [_decode_evidence(row) for row in rows]
+
+    def list_for_provider(self, provider_id: str) -> list[CapabilityEvidenceRecord]:
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(t.capability_evidence)
+                    .where(t.capability_evidence.c.provider_id == provider_id)
+                    .order_by(t.capability_evidence.c.id)
+                )
+                .mappings()
+                .all()
+            )
+        return [_decode_evidence(row) for row in rows]
+
+    def list_valid(
+        self,
+        *,
+        provider_id: str,
+        model_id: str,
+        credential_revision: str,
+        protocol: str,
+        base_url_fingerprint: str,
+        region: str | None = None,
+        workspace_id: str | None = None,
+        probe_version: int | None = None,
+    ) -> list[CapabilityEvidenceRecord]:
+        """Only the rows whose scope still matches the endpoint being asked about (spec §8.6).
+
+        This is the whole point of storing endpoint identity. A row observed under a rotated
+        credential, a different protocol, or a different base URL described a different question,
+        and answering today's question with it is how a capability the user does not have gets
+        reported as supported.
+        """
+
+        table = t.capability_evidence
+        conditions = [
+            table.c.provider_id == provider_id,
+            table.c.model_id == model_id,
+            table.c.credential_revision == credential_revision,
+            table.c.protocol == protocol,
+            table.c.base_url_fingerprint == base_url_fingerprint,
+        ]
+        # region/workspace are scope only when the endpoint actually has them.
+        conditions.append(table.c.region.is_(None) if region is None else table.c.region == region)
+        conditions.append(
+            table.c.workspace_id.is_(None)
+            if workspace_id is None
+            else table.c.workspace_id == workspace_id
+        )
+        if probe_version is not None:
+            conditions.append(table.c.probe_version >= probe_version)
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(select(table).where(*conditions).order_by(table.c.id)).mappings().all()
+            )
+        return [_decode_evidence(row) for row in rows]
+
+    def decode_report(self) -> tuple[list[CapabilityEvidenceRecord], list[dict[str, object]]]:
+        """Every decodable row plus a redacted descriptor per undecodable one (spec §21).
+
+        Doctor has to survey a store that a strict read would refuse. Descriptors carry the record
+        id and the problem, never the payload.
+        """
+
+        good: list[CapabilityEvidenceRecord] = []
+        bad: list[dict[str, object]] = []
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(select(t.capability_evidence).order_by(t.capability_evidence.c.id))
+                .mappings()
+                .all()
+            )
+        for row in rows:
+            try:
+                good.append(_decode_evidence(row))
+            except (ValidationError, ValueError) as exc:
+                bad.append(
+                    {
+                        "table": "capability_evidence",
+                        "record_id": str(row.get("id")),
+                        "problem": type(exc).__name__,
+                    }
+                )
+        return good, bad
+
+    # ------------------------------------------------------------------ invalidation
+
+    def delete_for_provider(self, provider_id: str) -> int:
+        with self.db.engine.begin() as conn:
+            result = conn.execute(
+                sa_delete(t.capability_evidence).where(
+                    t.capability_evidence.c.provider_id == provider_id
+                )
+            )
+        return int(result.rowcount or 0)
+
+    def count_superseded_by_credential(self, provider_id: str, credential_revision: str) -> int:
+        """How many rows a credential rotation has just made non-effective.
+
+        Rotation does not delete: the rows stay as audit history. They simply stop matching the
+        scope filter, which is what "invalidated" means here.
+        """
+
+        with self.db.engine.connect() as conn:
+            return int(
+                conn.execute(
+                    select(func.count())
+                    .select_from(t.capability_evidence)
+                    .where(
+                        t.capability_evidence.c.provider_id == provider_id,
+                        t.capability_evidence.c.credential_revision != credential_revision,
+                    )
+                ).scalar()
+                or 0
+            )
+
+
+def _evidence_values(record: CapabilityEvidenceRecord) -> dict[str, object]:
+    return {
+        "provider_id": record.provider_id,
+        "model_id": record.model_id,
+        "capability": record.capability,
+        "status": record.status,
+        "source": record.source,
+        # NULL, not "", when unknown — see CapabilityEvidenceRecord.observed_at.
+        "observed_at": record.observed_at.isoformat() if record.observed_at else None,
+        "probe_version": record.probe_version,
+        "provider_version": record.provider_version,
+        "model_revision": record.model_revision,
+        "credential_revision": record.credential_revision,
+        "protocol": record.protocol,
+        "base_url_fingerprint": record.base_url_fingerprint,
+        "region": record.region,
+        "workspace_id": record.workspace_id,
+        "detail": record.detail,
+        "observation_key": observation_key(
+            provider_id=record.provider_id,
+            model_id=record.model_id,
+            capability=record.capability,
+            source=record.source,
+            protocol=record.protocol,
+            base_url_fingerprint=record.base_url_fingerprint,
+            credential_revision=record.credential_revision,
+            region=record.region,
+            workspace_id=record.workspace_id,
+            probe_version=record.probe_version,
+            model_revision=record.model_revision,
+        ),
+    }
+
+
+def _decode_evidence(row: Any) -> CapabilityEvidenceRecord:
+    data = dict(row)
+    data.pop("observation_key", None)
+    observed = data.get("observed_at")
+    data["observed_at"] = datetime.fromisoformat(observed) if observed else None
+    return CapabilityEvidenceRecord.model_validate(data)

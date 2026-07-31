@@ -253,10 +253,18 @@ CREATE TABLE capability_evidence (
     region VARCHAR,
     workspace_id VARCHAR,
     detail VARCHAR NOT NULL DEFAULT '',
-    -- Uniqueness includes protocol and endpoint identity for the same reason: two probes of one
-    -- model over two protocols are two facts, and collapsing them onto one row would let the
-    -- second silently overwrite the first.
-    UNIQUE (provider_id, model_id, capability, source, protocol, base_url_fingerprint)
+    -- Deduplication is an explicit fingerprint column, not a UNIQUE over the identity columns.
+    --
+    -- SQLite never treats two NULLs as equal in a UNIQUE constraint, and region, workspace_id and
+    -- model_revision are all nullable. A UNIQUE spanning them therefore deduplicates nothing for
+    -- exactly the rows most likely to repeat — re-running the migration inserted the legacy rows a
+    -- second time, because every NULL made each row "distinct" from its own twin.
+    --
+    -- observation_key COALESCEs the whole identity into one NOT NULL string, so byte-identical
+    -- re-observations collide (making the backfill a genuine no-op) while two facts that differ in
+    -- any dimension -- a rotated credential, another region, a newer probe -- stay two rows.
+    observation_key TEXT NOT NULL,
+    UNIQUE (observation_key)
 )
 """
 
@@ -316,8 +324,21 @@ def _m0016_capability_evidence(conn: Connection) -> None:
     if provider_column is None:
         return
 
+    # The provider's own endpoint identity, so a legacy capability row records the endpoint it was
+    # actually observed against (spec §8.8). Recording blanks would leave it looking valid against
+    # every endpoint forever, which is the opposite of what the scope columns are for.
     known_providers = {
-        str(row[0]) for row in conn.exec_driver_sql("SELECT id FROM provider_connections")
+        str(row["id"]): {
+            "credential_revision": row["credential_revision"] or "",
+            "protocol": row["protocol"] or "",
+            "base_url_fingerprint": _base_url_fingerprint(_payload(row["data"])),
+            "region": row["region"],
+            "workspace_id": row["workspace_id"],
+        }
+        for row in conn.exec_driver_sql(
+            "SELECT id, credential_revision, protocol, region, workspace_id, data "
+            "FROM provider_connections"
+        ).mappings()
     }
 
     for row in conn.exec_driver_sql(
@@ -332,7 +353,10 @@ def _m0016_capability_evidence(conn: Connection) -> None:
         capabilities = payload.get("capabilities")
         if not isinstance(capabilities, dict):
             continue
-        observed_at = _text(payload.get("capabilities_tested_at")) or ""
+        # NULL, never "". A legacy row genuinely does not know when it was observed, and an empty
+        # string in a timestamp column is not "unknown" -- it is a parse error handed to whoever
+        # reads it next.
+        observed_at = _text(payload.get("capabilities_tested_at"))
         remote_model = _text(payload.get("remote_model_id")) or str(row["id"])
 
         for legacy_field, capability in _LEGACY_CAPABILITY_FIELDS.items():
@@ -341,27 +365,131 @@ def _m0016_capability_evidence(conn: Connection) -> None:
                 # None means "never determined" in the v0.1 model too. Writing a row for it would
                 # turn an absence of knowledge into a record of one.
                 continue
+            scope = _provider_scope(known_providers, provider_id)
+            values = {
+                "provider": provider_id,
+                "model": remote_model,
+                "capability": capability,
+                "status": "supported" if value is True else "unsupported",
+                "source": LEGACY_SOURCE,
+                "observed": observed_at,
+                # probe_version 0 marks "produced by no probe definition we still run", so a
+                # freshness check treats it as stale rather than current.
+                "credential": scope["credential_revision"],
+                "protocol": scope["protocol"],
+                "fingerprint": scope["base_url_fingerprint"],
+                "region": scope["region"],
+                "workspace": scope["workspace_id"],
+                "detail": "migrated from a pre-v0.2 capability flag",
+            }
             conn.execute(
                 text(
                     "INSERT OR IGNORE INTO capability_evidence "
                     "(provider_id, model_id, capability, status, source, observed_at, "
-                    " probe_version, model_revision, credential_revision, detail) "
+                    " probe_version, model_revision, credential_revision, protocol, "
+                    " base_url_fingerprint, region, workspace_id, detail, observation_key) "
                     "VALUES (:provider, :model, :capability, :status, :source, :observed, "
-                    " 0, NULL, :credential, :detail)"
+                    " 0, NULL, :credential, :protocol, :fingerprint, :region, :workspace, "
+                    " :detail, :key)"
                 ),
                 {
-                    "provider": provider_id,
-                    "model": remote_model,
-                    "capability": capability,
-                    "status": "supported" if value is True else "unsupported",
-                    "source": LEGACY_SOURCE,
-                    "observed": observed_at,
-                    "credential": "",
-                    # probe_version 0 marks "produced by no probe definition we still run", so a
-                    # freshness check treats it as stale rather than current.
-                    "detail": "migrated from a pre-v0.2 capability flag",
+                    **values,
+                    "key": observation_key(
+                        provider_id=provider_id,
+                        model_id=remote_model,
+                        capability=capability,
+                        source=LEGACY_SOURCE,
+                        protocol=scope["protocol"],
+                        base_url_fingerprint=scope["base_url_fingerprint"],
+                        credential_revision=scope["credential_revision"],
+                        region=scope["region"],
+                        workspace_id=scope["workspace_id"],
+                        probe_version=0,
+                        model_revision=None,
+                    ),
                 },
             )
+
+
+def observation_key(
+    *,
+    provider_id: str,
+    model_id: str,
+    capability: str,
+    source: str,
+    protocol: str,
+    base_url_fingerprint: str,
+    credential_revision: str,
+    region: str | None,
+    workspace_id: str | None,
+    probe_version: int,
+    model_revision: str | None,
+) -> str:
+    """A deterministic identity for one observation, as a NOT NULL string.
+
+    Exists because SQLite never treats two NULLs as equal in a UNIQUE constraint, and three of the
+    identity columns are nullable. A UNIQUE spanning them deduplicates nothing precisely for the
+    rows most likely to repeat, so re-running the backfill inserted every legacy row a second time.
+
+    Collapsing the identity into one string makes the comparison explicit rather than dependent on
+    SQL NULL semantics: byte-identical re-observations collide, and two facts differing in any
+    dimension stay two rows.
+    """
+
+    parts = (
+        provider_id,
+        model_id,
+        capability,
+        source,
+        protocol,
+        base_url_fingerprint,
+        credential_revision,
+        region or "",
+        workspace_id or "",
+        str(probe_version),
+        model_revision or "",
+    )
+    return "\x1f".join(parts)
+
+
+def _base_url_fingerprint(payload: dict[str, Any]) -> str:
+    """A stable, secret-free identifier for an endpoint.
+
+    The URL itself is never stored in evidence: it can carry a key in a query string or a tenant
+    name in a host, and this table is read by Doctor and printed. Scheme+host+port is enough to
+    tell two endpoints apart, which is all the scope check needs.
+    """
+
+    from hashlib import sha256
+    from urllib.parse import urlsplit
+
+    url = _text(payload.get("base_url")) or _text(payload.get("anthropic_base_url"))
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    origin = f"{parts.scheme}://{(parts.hostname or '').lower()}:{parts.port or ''}"
+    return sha256(origin.encode("utf-8")).hexdigest()[:32]
+
+
+def _provider_scope(known: dict[str, Any], provider_id: str) -> dict[str, Any]:
+    """The endpoint identity a legacy capability row inherits from its provider (spec §8.8).
+
+    Legacy evidence was observed against whatever endpoint that provider pointed at, so recording
+    the provider's actual protocol/region/credential is what makes the row invalidatable later.
+    Recording blanks would make it look valid against every endpoint forever.
+    """
+
+    row = known.get(provider_id) or {}
+    return {
+        "credential_revision": row.get("credential_revision") or "",
+        "protocol": row.get("protocol") or "",
+        "base_url_fingerprint": row.get("base_url_fingerprint") or "",
+        "region": row.get("region"),
+        "workspace_id": row.get("workspace_id"),
+    }
 
 
 # --------------------------------------------------------------------------- 0017

@@ -18,6 +18,7 @@ from sqlalchemy import (
     Column,
     Float,
     ForeignKey,
+    Index,
     Integer,
     MetaData,
     String,
@@ -81,6 +82,70 @@ provider_connections = Table(
     Column("profile_version", String, nullable=False, server_default="2"),
     Column("data", JSON, nullable=False),
 )
+
+#: Capability claims with their provenance (spec §8, migration 0016).
+#:
+#: Append-only. There is deliberately no destructive UNIQUE across the observation columns: a
+#: broad one would make two genuinely different observations — the same model probed under two
+#: credentials, or from two regions — collide, and the second would either be rejected or silently
+#: overwrite the first. The resolver picks the strongest still-valid row instead, so history is
+#: kept and invalidation is a query rather than a delete.
+capability_evidence = Table(
+    "capability_evidence",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "provider_id",
+        String,
+        ForeignKey("provider_connections.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("model_id", String, nullable=False),
+    Column("capability", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("source", String, nullable=False),
+    #: NULL when a legacy row genuinely did not record a time. An empty string in a datetime
+    #: column is not "unknown", it is a parse error waiting to happen.
+    Column("observed_at", String, nullable=True),
+    Column("probe_version", Integer, nullable=False, server_default="1"),
+    Column("provider_version", String, nullable=True),
+    Column("model_revision", String, nullable=True),
+    Column("credential_revision", String, nullable=False, server_default=""),
+    #: Endpoint identity. Evidence is only valid for the endpoint that produced it — the same
+    #: model id behind a different protocol, base URL, region or workspace is a different question.
+    Column("protocol", String, nullable=False, server_default=""),
+    Column("base_url_fingerprint", String, nullable=False, server_default=""),
+    Column("region", String, nullable=True),
+    Column("workspace_id", String, nullable=True),
+    Column("detail", String, nullable=False, server_default=""),
+    #: Deterministic identity of one observation, as a NOT NULL string.
+    #:
+    #: A UNIQUE over the identity *columns* would deduplicate nothing: SQLite never treats two
+    #: NULLs as equal, and region, workspace_id and model_revision are all nullable — so re-running
+    #: the backfill inserted every legacy row a second time, each NULL making a row "distinct" from
+    #: its own twin. Collapsing the identity into one string makes the comparison explicit instead
+    #: of dependent on SQL NULL semantics.
+    Column("observation_key", String, nullable=False, server_default=""),
+    UniqueConstraint("observation_key", name="uq_capability_evidence_observation"),
+)
+
+Index(
+    "ix_capability_evidence_model",
+    capability_evidence.c.provider_id,
+    capability_evidence.c.model_id,
+)
+Index(
+    "ix_capability_evidence_credential",
+    capability_evidence.c.provider_id,
+    capability_evidence.c.credential_revision,
+)
+Index(
+    "ix_capability_evidence_endpoint",
+    capability_evidence.c.provider_id,
+    capability_evidence.c.protocol,
+    capability_evidence.c.base_url_fingerprint,
+)
+Index("ix_capability_evidence_observed", capability_evidence.c.observed_at)
 
 projects = Table(
     "projects",
