@@ -258,12 +258,9 @@ def test_fallback_treats_settings_json_as_unknown_not_authenticated(
     assert evidence.source is CliCredentialSource.UNKNOWN
 
 
-def test_fallback_treats_real_credential_store_as_authenticated(
+def test_fallback_treats_empty_credential_store_as_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """~/.claude/.credentials.json is a genuine credential store, not config — its presence is
-    real evidence of a login even when `claude auth status` cannot be consulted (§11.1)."""
-
     _clear_claude_env(monkeypatch)
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     (tmp_path / ".claude").mkdir()
@@ -273,8 +270,75 @@ def test_fallback_treats_real_credential_store_as_authenticated(
         str(tmp_path / "claude-missing"), build_child_environment("claude")
     )
 
+    assert evidence.authenticated is None
+    assert evidence.source is CliCredentialSource.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "{not json",
+        "[]",
+    ],
+)
+def test_fallback_treats_invalid_credential_store_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+) -> None:
+    _clear_claude_env(monkeypatch)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text(content, encoding="utf-8")
+
+    evidence = probe_claude_auth(
+        str(tmp_path / "claude-missing"), build_child_environment("claude")
+    )
+
+    assert evidence.authenticated is None
+    if content:
+        assert content not in evidence.detail
+
+
+def test_fallback_validates_stored_login_metadata_without_rendering_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_claude_env(monkeypatch)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    (tmp_path / ".claude").mkdir()
+    secret = "prefixless-claude-oauth-secret"
+    (tmp_path / ".claude" / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": secret, "expiresAt": 9999999999999}}),
+        encoding="utf-8",
+    )
+
+    evidence = probe_claude_auth(
+        str(tmp_path / "claude-missing"), build_child_environment("claude")
+    )
+
     assert evidence.authenticated is True
     assert evidence.source is CliCredentialSource.CLI_LOGIN
+    assert secret not in evidence.detail
+
+
+async def test_claude_adapter_preserves_unknown_auth_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openagent.runtimes.cli import claude as claude_module
+    from openagent.runtimes.cli.claude import ClaudeAdapter
+    from openagent.runtimes.cli.cli_auth import CliAuthEvidence
+
+    evidence = CliAuthEvidence(
+        cli_type="claude",
+        authenticated=None,
+        source=CliCredentialSource.UNKNOWN,
+        detail="status unavailable",
+    )
+    monkeypatch.setattr(claude_module, "probe_claude_auth", lambda *_a, **_k: evidence)
+
+    status = await ClaudeAdapter("/missing/claude").inspect_auth()
+
+    assert status.authenticated is None
+    assert status.blocking is False
 
 
 def test_fallback_with_no_evidence_is_not_authenticated(

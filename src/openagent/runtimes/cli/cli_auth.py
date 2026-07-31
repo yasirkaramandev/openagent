@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -368,13 +369,25 @@ def _claude_fallback(
         )
 
     credentials_file = Path.home() / ".claude" / ".credentials.json"
-    if credentials_file.exists():
-        # A real credential store, not a config file: its presence is genuine evidence of a login.
+    stored = _claude_stored_credential_state(credentials_file)
+    if stored is True:
         return CliAuthEvidence(
             cli_type="claude",
             authenticated=True,
             source=CliCredentialSource.CLI_LOGIN,
             detail=f"{detail}; stored credentials present at ~/.claude/.credentials.json",
+            executable=executable,
+            environment_names=[],
+        )
+    if stored is None:
+        return CliAuthEvidence(
+            cli_type="claude",
+            authenticated=None,
+            source=CliCredentialSource.UNKNOWN,
+            detail=(
+                f"{detail}; the stored Claude credential file is invalid or unreadable. "
+                "Run `claude auth login` to repair it"
+            ),
             executable=executable,
             environment_names=[],
         )
@@ -407,6 +420,52 @@ def _claude_fallback(
         executable=executable,
         environment_names=[],
     )
+
+
+_CLAUDE_CREDENTIAL_MAX_BYTES = 1024 * 1024
+
+
+def _claude_stored_credential_state(path: Path) -> bool | None:
+    """True for recognized login metadata, False when absent, None when invalid.
+
+    Secret values are inspected only for type/non-emptiness and never leave this function.
+    """
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_size <= 0
+        or info.st_size > _CLAUDE_CREDENTIAL_MAX_BYTES
+    ):
+        return None
+    try:
+        raw = path.read_bytes()
+        if len(raw) > _CLAUDE_CREDENTIAL_MAX_BYTES:
+            return None
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    oauth = payload.get("claudeAiOauth")
+    if isinstance(oauth, dict) and any(
+        isinstance(oauth.get(key), str) and bool(oauth.get(key))
+        for key in ("accessToken", "refreshToken")
+    ):
+        return True
+    # Older Claude credential stores used a top-level key. Recognize only known field names, never
+    # arbitrary strings that could be unrelated configuration.
+    if any(
+        isinstance(payload.get(key), str) and bool(payload.get(key))
+        for key in ("apiKey", "oauthToken")
+    ):
+        return True
+    return None
 
 
 def probe_codex_auth(

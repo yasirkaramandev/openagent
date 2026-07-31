@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -101,6 +102,10 @@ class GitTimeout(GitError):
 
 class GitMissing(GitError):
     """git is not installed or not on PATH."""
+
+
+class UnsafeGitFilterConfiguration(GitError):
+    """Effective content-filter configuration could not be resolved safely."""
 
 
 @dataclass(frozen=True)
@@ -185,14 +190,17 @@ def git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 #: turns them off wholesale — each named filter must be neutralised individually. The name is what we
 #: have to discover; the command it would run is the thing we override to a harmless identity.
 _FILTER_ATTR_RE = re.compile(r"(?:^|\s)filter=([^\s]+)")
-_FILTER_SECTION_RE = re.compile(r'^\s*\[\s*filter\s+"([^"]+)"\s*\]', re.MULTILINE)
 #: A filter name we are willing to emit on a ``-c`` line. Git config keys are dot-delimited, so a
-#: name containing a dot, whitespace, ``=`` or a control character could smuggle extra config or a
-#: value separator into the override. Such a name cannot be a real registered filter anyway.
-_SAFE_FILTER_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+#: name containing whitespace, ``=`` or a control character could smuggle extra config or a value
+#: separator into the override. Dots are valid inside Git filter subsections and are supported.
+_SAFE_FILTER_NAME_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,128}\Z")
 #: Cap on any single attributes/config file we parse for names. A pathological multi-megabyte file is
 #: not going to hold a legitimate filter binding, and reading it on every git call would be the cost.
 _ATTR_READ_LIMIT = 1024 * 1024
+_ATTR_TOTAL_LIMIT = 4 * 1024 * 1024
+_ATTR_FILE_LIMIT = 256
+_CONFIG_DISCOVERY_TIMEOUT = 10
+_CONFIG_DISCOVERY_OUTPUT = 1024 * 1024
 
 
 def _read_text_capped(path: Path, limit: int = _ATTR_READ_LIMIT) -> str:
@@ -202,6 +210,39 @@ def _read_text_capped(path: Path, limit: int = _ATTR_READ_LIMIT) -> str:
     except OSError:
         pass
     return ""
+
+
+def _config_query(cwd: Path, args: Sequence[str]) -> list[str]:
+    """Run Git's read-only local config parser with includes, fixed argv and bounded output."""
+
+    argv = ["git", "--no-pager", "-c", f"core.hooksPath={_empty_hooks_dir()}"]
+    for setting in _GIT_SAFE_CONFIG:
+        argv += ["-c", setting]
+    argv += ["config", "--local", "--includes", *args]
+    try:
+        result = run_capture(
+            argv,
+            cwd=cwd,
+            env=git_environment(),
+            timeout=_CONFIG_DISCOVERY_TIMEOUT,
+            shell=False,
+            max_output_bytes=_CONFIG_DISCOVERY_OUTPUT,
+        )
+    except FileNotFoundError as exc:
+        raise GitMissing("git is not installed or not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(
+            f"git config discovery timed out after {_CONFIG_DISCOVERY_TIMEOUT}s"
+        ) from exc
+    except (OSError, OutputLimitExceeded) as exc:
+        raise UnsafeGitFilterConfiguration(
+            "unsafe or unresolvable content filter configuration"
+        ) from exc
+    if result.returncode == 1:
+        return []
+    if result.returncode != 0:
+        raise UnsafeGitFilterConfiguration("unsafe or unresolvable content filter configuration")
+    return [line for line in (result.stdout or "").splitlines() if line]
 
 
 def _git_dirs(cwd: Path) -> list[Path]:
@@ -240,6 +281,61 @@ def _git_dirs(cwd: Path) -> list[Path]:
     return dirs
 
 
+def _attribute_sources(cwd: Path) -> list[Path]:
+    """Bounded effective attribute sources, refusing links and paths outside the repository."""
+
+    sources: list[Path] = []
+    count = 0
+    total = 0
+    root = cwd.resolve()
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        # Git internals are handled explicitly below; OpenAgent runtime state is not repository
+        # content and can be arbitrarily large.
+        dirnames[:] = [name for name in dirnames if name not in {".git", ".openagent"}]
+        if ".gitattributes" not in filenames:
+            continue
+        path = Path(directory) / ".gitattributes"
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            ) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            )
+        count += 1
+        total += info.st_size
+        if count > _ATTR_FILE_LIMIT or info.st_size > _ATTR_READ_LIMIT or total > _ATTR_TOTAL_LIMIT:
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            )
+        sources.append(path)
+
+    for gitdir in _git_dirs(cwd):
+        info_attributes = gitdir / "info" / "attributes"
+        if info_attributes.exists():
+            sources.append(info_attributes)
+
+    for raw in _config_query(cwd, ["--path", "--get-all", "core.attributesFile"]):
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        try:
+            info = candidate.lstat()
+            if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+                raise ValueError("attributes file is not a direct regular file")
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            ) from exc
+        sources.append(resolved)
+    return sources
+
+
 def _discover_filter_names(cwd: Path) -> set[str]:
     """Every content-filter name that could actually run against this working tree.
 
@@ -252,17 +348,62 @@ def _discover_filter_names(cwd: Path) -> set[str]:
     """
 
     names: set[str] = set()
-    attr_sources = [_read_text_capped(cwd / ".gitattributes")]
-    for gitdir in _git_dirs(cwd):
-        for section in _FILTER_SECTION_RE.findall(_read_text_capped(gitdir / "config")):
-            names.add(section)
-        attr_sources.append(_read_text_capped(gitdir / "info" / "attributes"))
-    for text in attr_sources:
+    keys = _config_query(
+        cwd,
+        [
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ],
+    )
+    for key in keys:
+        match = re.fullmatch(r"filter\.(.+)\.(clean|smudge|process|required)", key)
+        if match is None or _SAFE_FILTER_NAME_RE.fullmatch(match.group(1)) is None:
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            )
+        names.add(match.group(1))
+
+    seen: set[Path] = set()
+    total = 0
+    for path in _attribute_sources(cwd):
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _ATTR_READ_LIMIT:
+                raise UnsafeGitFilterConfiguration(
+                    "unsafe or unresolvable content filter configuration"
+                )
+            total += info.st_size
+            if len(seen) > _ATTR_FILE_LIMIT or total > _ATTR_TOTAL_LIMIT:
+                raise UnsafeGitFilterConfiguration(
+                    "unsafe or unresolvable content filter configuration"
+                )
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            ) from exc
+        except OSError as exc:
+            raise UnsafeGitFilterConfiguration(
+                "unsafe or unresolvable content filter configuration"
+            ) from exc
         for line in text.splitlines():
             if line.lstrip().startswith("#"):
                 continue
-            names.update(_FILTER_ATTR_RE.findall(line))
-    return {name for name in names if _SAFE_FILTER_NAME_RE.match(name)}
+            for name in _FILTER_ATTR_RE.findall(line):
+                if _SAFE_FILTER_NAME_RE.fullmatch(name) is None:
+                    raise UnsafeGitFilterConfiguration(
+                        "unsafe or unresolvable content filter configuration"
+                    )
+                names.add(name)
+            if "filter=" in line and not _FILTER_ATTR_RE.search(line):
+                raise UnsafeGitFilterConfiguration(
+                    "unsafe or unresolvable content filter configuration"
+                )
+    return names
 
 
 def _filter_neutralization_config(names: set[str]) -> list[str]:

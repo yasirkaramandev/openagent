@@ -43,6 +43,34 @@ if TYPE_CHECKING:
 #: How long a capability probe stays trusted before it must be re-run (spec §16).
 PROBE_CACHE_TTL = timedelta(hours=24)
 
+# --- Provider-add operation lifecycle (spec §6) -----------------------------------------------
+# A provider_add journal operation advances through these durable stages. Startup recovery
+# (:meth:`OpenAgentApp._recover_operations`) decides whether to keep or compensate a provider row
+# from the *stage*, never from the presence of the row alone: after ``commit()`` the DB row is
+# durable but the journal file lingers until it is unlinked, so a committed provider and a
+# crashed-mid-add provider are otherwise indistinguishable. See
+# docs/recovery-provider-transaction.md for the full state machine and why every ambiguity is
+# resolved in favour of preserving committed data.
+STAGE_BEGUN = "begun"
+STAGE_SECRET_WRITE_INTENT = "secret_write_intent"
+STAGE_SECRET_WRITTEN = "secret_written"
+STAGE_DB_WRITTEN = "db_written"
+STAGE_COMMIT_DURABLE = "commit_durable"
+STAGE_LEGACY_CLEANUP_PENDING = "legacy_cleanup_pending"
+STAGE_ROLLBACK_PENDING = "rollback_pending"
+STAGE_OWNED_COMPENSATION = "owned_compensation"
+STAGE_SUPERSEDED_GENERATION = "superseded_generation"
+STAGE_RECOVERY_AMBIGUOUS = "recovery_ambiguous"
+
+#: Stages that prove the transaction reached a durable commit. The provider row and its new
+#: revision-scoped credential MUST be preserved; recovery may only finish the (non-atomic)
+#: legacy-secret cleanup.
+PROVIDER_COMMIT_PROVEN_STAGES = frozenset({STAGE_COMMIT_DURABLE, STAGE_LEGACY_CLEANUP_PENDING})
+
+#: Stages that prove the transaction entered its rollback path. Its owned generation may be deleted,
+#: but only while the live row still belongs to that same generation.
+PROVIDER_ROLLBACK_PROVEN_STAGES = frozenset({STAGE_ROLLBACK_PENDING, STAGE_OWNED_COMPENSATION})
+
 
 class ProviderValidationError(ValueError):
     """A provider's credential configuration is invalid (missing key/env var, illegal 'none').
@@ -108,6 +136,7 @@ class ProviderTransaction:
             "provider_add",
             {
                 "provider_id": self.provider.id,
+                "credential_revision": self.provider.credential_revision,
                 "credential": credential.model_dump(mode="json"),
                 "legacy_credential": (
                     self._legacy_credential.model_dump(mode="json")
@@ -116,6 +145,8 @@ class ProviderTransaction:
                 ),
             },
         )
+        self._operation.payload["operation_id"] = self._operation.id
+        self._operation.advance("begun")
         if self._api_key and credential.type is CredentialType.KEYCHAIN:
             # Capture the *value* that was there before (needed to restore it byte-for-byte), then
             # overwrite it. Held only until commit()/rollback.
@@ -149,14 +180,37 @@ class ProviderTransaction:
         return self
 
     def commit(self) -> None:
-        """Mark the transaction durable and immediately forget the previous secret (§6.1)."""
+        """Mark the transaction durably committed, then best-effort clean the legacy secret (§6.1).
+
+        A committed provider row must survive *any* later failure, so the durable
+        ``commit_durable`` journal stage is written **before** the fallible legacy-credential
+        cleanup. Startup recovery keys off that marker and never mistakes a committed provider for an
+        incomplete add — the pre-fix code wrote no post-durability marker at all, so a committed
+        provider whose journal was not yet unlinked (a crash, or the legacy ``delete_secret`` below
+        raising) looked identical to a never-committed one and was deleted on the next start.
+
+        Legacy-credential cleanup is deliberately **not** part of the atomic commit. When it fails
+        the provider and its new revision-scoped credential are kept and the operation is left at
+        ``legacy_cleanup_pending`` for recovery/Doctor to retry; the leftover is the user's *old*
+        pre-revision secret, never the live one.
+        """
 
         self._committed = True
         self._forget()
+        operation = self._operation
+        if operation is None:  # pragma: no cover - __enter__ always sets the operation first
+            return
+        operation.advance(STAGE_COMMIT_DURABLE)
         if self._legacy_credential is not None:
-            self._credentials.delete_secret(self._legacy_credential, strict=True)
-        if self._operation is not None:
-            self._operation.complete()
+            try:
+                self._credentials.delete_secret(self._legacy_credential, strict=True)
+            except Exception:
+                # The provider is already durable; a failed legacy-secret cleanup must not undo it.
+                # Leave the operation pending at a stage recovery treats as "committed, finish the
+                # legacy cleanup", never as "roll back".
+                operation.advance(STAGE_LEGACY_CLEANUP_PENDING)
+                return
+        operation.complete()
 
     def __exit__(
         self,
@@ -167,7 +221,15 @@ class ProviderTransaction:
         # Returns None → never suppresses the in-flight exception; an uncommitted transaction is
         # rolled back exactly (keychain restored, half-written provider row removed).
         if not self._committed:
+            operation = self._operation
+            if operation is None:  # pragma: no cover - __enter__ always sets the operation first
+                return
+            # Durably record that this generation entered the rollback path *before* touching the
+            # keychain or the row. Recovery deletes an owned generation only on this proof; a bare
+            # ``db_written`` (a crash before __exit__ ever ran) stays ambiguous and is preserved.
+            operation.advance(STAGE_ROLLBACK_PENDING)
             restore_error: BaseException | None = None
+            compensation_error: BaseException | None = None
             try:
                 self._restore()
             except BaseException as restore_exc:
@@ -177,10 +239,19 @@ class ProviderTransaction:
                 restore_error = restore_exc
             finally:
                 self._forget()
-            with contextlib.suppress(Exception):
-                self._repos.providers.delete(self.provider.id)
-            if self._operation is not None and restore_error is None:
-                self._operation.complete()
+            try:
+                deleted = self._repos.providers.delete_owned_with_probes(
+                    self.provider.id, self.provider.credential_revision
+                )
+                operation.advance(
+                    STAGE_OWNED_COMPENSATION if deleted else STAGE_SUPERSEDED_GENERATION
+                )
+            except Exception as delete_exc:
+                # Keep the original partner-write exception authoritative. The durable journal has
+                # all immutable ownership fields startup recovery needs to retry safely.
+                compensation_error = delete_exc
+            if restore_error is None and compensation_error is None:
+                operation.complete()
             if restore_error is not None:
                 raise restore_error
 
@@ -421,19 +492,28 @@ class ProviderService:
             "provider_remove",
             {
                 "provider_id": provider.id,
+                "credential_revision": provider.credential_revision,
                 "credential": provider.credential.model_dump(mode="json"),
             },
         )
+        operation.payload["operation_id"] = operation.id
+        operation.advance("begun")
         # Purge this connection's probes before the row goes: the id is derived from the name, so a
         # re-add under the same name reuses it. The credential revision would reject the inherited
         # rows anyway; deleting them keeps the store from accumulating verdicts for a connection
         # that no longer exists (spec §22).
         try:
-            self.repos.providers.delete_with_probes(provider.id)
+            deleted = self.repos.providers.delete_owned_with_probes(
+                provider.id, provider.credential_revision
+            )
         except ProviderInUseByAgentError as exc:
             # The constraint caught a dependent this transaction could not see when it started.
             operation.complete()
             raise ProviderInUseError(name, self.agents_using(name)) from exc
+        if not deleted:
+            operation.advance("superseded_generation")
+            operation.complete()
+            return False
         operation.advance("db_deleted")
         if provider.credential.type is CredentialType.KEYCHAIN:
             self.credentials.delete_secret(provider.credential, strict=True)

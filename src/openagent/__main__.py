@@ -21,7 +21,11 @@ def main() -> None:
 
         app()
     except Exception as exc:
-        from .core.errors import DatabaseReaderCompatibilityError, DataValidationError
+        from .core.errors import (
+            DatabaseMetadataValidationError,
+            DatabaseReaderCompatibilityError,
+            DataValidationError,
+        )
         from .storage.migrations import (
             MigrationFailedError,
             MigrationVerificationError,
@@ -41,6 +45,8 @@ def main() -> None:
             )
         if isinstance(exc, DatabaseReaderCompatibilityError):
             _database_startup_failure(exc, argv, exit_code=2, kind="database_incompatible")
+        if isinstance(exc, DatabaseMetadataValidationError):
+            _database_startup_failure(exc, argv, exit_code=2, kind="database_metadata_invalid")
         if isinstance(exc, DataValidationError):
             _database_startup_failure(exc, argv, exit_code=2, kind="data_validation")
         if isinstance(exc, (MigrationVerificationError, SchemaTooNewError, UnknownRevisionError)):
@@ -57,6 +63,7 @@ def _debug_enabled() -> bool:
 _KIND_CHECK_NAME = {
     "migration_failed": "Database migration",
     "database_incompatible": "Database compatibility",
+    "database_metadata_invalid": "Database metadata",
     "data_validation": "Database record",
 }
 

@@ -14,7 +14,7 @@ from ..core.models import (
     RuntimeType,
 )
 from ..core.permissions import get_profile
-from ..reporting.openagent_md import OpenAgentMdConflict, write_openagent_md
+from ..reporting.openagent_md import write_openagent_md
 from ..storage.repositories import ConcurrentModificationError, DuplicateNameError
 
 if TYPE_CHECKING:
@@ -132,17 +132,13 @@ class AgentService:
             operation.complete()
             raise AgentError(f"agent {name!r} already exists") from exc
         operation.advance("db_written")
-        try:
-            self.sync_openagent_md()
-        except Exception:
-            # The row was just created by this operation, so deleting it here rolls back only our own
-            # write. (The committed-agent projection semantics for update/remove — where the DB is
-            # source of truth and a projection conflict is deferred, not rolled back — are tracked
-            # separately; this create path owns the row it removes.)
-            self.repos.agents.delete(name)
-            operation.complete()
-            raise
-        operation.complete()
+        # The insert is committed database state. OPENAGENT.md is a derived projection and may be
+        # regenerated later; rolling the row back here is not ownership-safe because another
+        # process can update it between this insert and the projection failure. In that race an
+        # unconditional delete removes the later writer's revision. Keep the journal pending on a
+        # projection conflict and let startup recovery/Doctor own the follow-up, exactly as update
+        # and remove already do.
+        self._project_committed(operation)
         return agent
 
     def create_with_new_provider(
@@ -294,7 +290,7 @@ class AgentService:
 
         try:
             self.sync_openagent_md()
-        except OpenAgentMdConflict:
+        except Exception:
             # Committed-with-projection-warning: leave the journal entry pending (do not complete),
             # so the retry path and doctor own the follow-up. The caller's operation still succeeded.
             return

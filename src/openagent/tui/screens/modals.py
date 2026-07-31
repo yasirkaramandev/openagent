@@ -19,6 +19,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 from textual.widgets.button import ButtonVariant
 
+from ...runtimes.cli.update_policy import (
+    PostUpdateFailureChoice,
+    PostUpdateFailurePrompt,
+    UpdateChoice,
+    UpdatePrompt,
+)
 from ...security.approvals import ApprovalRequest
 from ..markup import safe_markup
 
@@ -236,3 +242,97 @@ class InPlaceConfirmModal(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class CliUpdatePromptModal(ModalScreen[UpdateChoice]):
+    """Accessible first decision for an available CLI update."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel run")]
+    DEFAULT_CSS = """
+    CliUpdatePromptModal { align: center middle; }
+    CliUpdatePromptModal #box { width: 94%; max-width: 78; height: 90%; border: thick $warning; background: $panel; padding: 1 2; }
+    CliUpdatePromptModal #modal-content { height: 1fr; min-height: 0; }
+    CliUpdatePromptModal #buttons { height: auto; align-horizontal: right; }
+    CliUpdatePromptModal Button { margin: 0 0 0 1; }
+    """
+
+    def __init__(self, prompt: UpdatePrompt) -> None:
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        p = self.prompt
+        with Vertical(id="box"):
+            with VerticalScroll(id="modal-content"):
+                yield Label("CLI update available", id="title")
+                yield Static(safe_markup(p.question(), 500))
+                yield Static(f"[b]Source:[/b] {safe_markup(p.install_source, 100)}")
+                yield Static(f"[b]Details:[/b] {safe_markup(p.detail, 500)}")
+            with Horizontal(id="buttons"):
+                yield Button("Cancel run", id="cancel")
+                yield Button("Continue installed", id="continue")
+                yield Button("Skip this version", id="skip")
+                yield Button("Update now", id="update", variant="warning")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        choices = {
+            "cancel": UpdateChoice.CANCEL_RUN,
+            "continue": UpdateChoice.CONTINUE_WITHOUT_UPDATING,
+            "skip": UpdateChoice.SKIP_THIS_VERSION,
+            "update": UpdateChoice.UPDATE_NOW,
+        }
+        self.dismiss(choices[event.button.id or "cancel"])
+
+    def action_cancel(self) -> None:
+        self.dismiss(UpdateChoice.CANCEL_RUN)
+
+
+class CliUpdateFailureModal(ModalScreen[PostUpdateFailureChoice]):
+    """Second decision after update verification failed."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel run")]
+    DEFAULT_CSS = """
+    CliUpdateFailureModal { align: center middle; }
+    CliUpdateFailureModal #box { width: 94%; max-width: 78; height: 90%; border: thick $error; background: $panel; padding: 1 2; }
+    CliUpdateFailureModal #modal-content { height: 1fr; min-height: 0; }
+    CliUpdateFailureModal #buttons { height: 3; align-horizontal: right; }
+    CliUpdateFailureModal Button { margin: 0 0 0 1; }
+    """
+
+    def __init__(self, prompt: PostUpdateFailurePrompt) -> None:
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        p = self.prompt
+        with Vertical(id="box"):
+            with VerticalScroll(id="modal-content"):
+                yield Label("Update failed verification", id="title")
+                yield Static(
+                    f"[b]Installed:[/b] {safe_markup(p.installed_version or 'unknown', 100)}\n"
+                    f"[b]Expected:[/b] {safe_markup(p.expected_version or 'unknown', 100)}\n"
+                    f"[b]Source:[/b] {safe_markup(p.install_source, 100)}\n"
+                    f"[b]Failure:[/b] {safe_markup(p.failure_category, 100)}\n"
+                    f"[b]Minimum:[/b] "
+                    f"{safe_markup(p.minimum_supported_version or 'not specified', 100)}\n"
+                    f"[b]Installed runnable:[/b] {'yes' if p.installed_runnable else 'no'}"
+                )
+            with Horizontal(id="buttons"):
+                yield Button("Cancel run", id="cancel", variant="error")
+                yield Button("Doctor details", id="doctor")
+                yield Button(
+                    "Continue installed",
+                    id="continue",
+                    disabled=not p.installed_runnable,
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        choices = {
+            "cancel": PostUpdateFailureChoice.CANCEL_RUN,
+            "doctor": PostUpdateFailureChoice.OPEN_DOCTOR,
+            "continue": PostUpdateFailureChoice.CONTINUE_WITH_INSTALLED,
+        }
+        self.dismiss(choices[event.button.id or "cancel"])
+
+    def action_cancel(self) -> None:
+        self.dismiss(PostUpdateFailureChoice.CANCEL_RUN)

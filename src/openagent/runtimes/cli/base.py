@@ -59,12 +59,11 @@ class CliRunRequest:
 class AuthStatus:
     """The preflight-facing summary of a CLI's authentication state.
 
-    ``authenticated`` stays a plain bool for callers that only need a yes/no, but it is derived
-    from :class:`~.cli_auth.CliAuthEvidence`, which distinguishes "definitely not authenticated"
-    from "could not determine". Only the former blocks a run — see ``blocking``.
+    ``authenticated`` is deliberately three-valued. ``None`` means the adapter could not determine
+    the state; only a definite ``False`` blocks a run.
     """
 
-    authenticated: bool
+    authenticated: bool | None
     detail: str = ""
     #: ``False`` only when a credential is known to be absent. An indeterminate probe (no status
     #: surface, a timeout, unparseable output) must not stop a run: the CLI's own error message is

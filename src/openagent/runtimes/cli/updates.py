@@ -23,8 +23,8 @@ from ...core.models import (
     CliUpdateStatus,
 )
 from ...core.versioning import is_newer as _is_newer
-from ...security.atomic import atomic_write_text
 from ...security.file_lock import LockTimeout, file_lock
+from ...security.locked_json_store import LockedJsonStore, LockedJsonStoreError
 from ...security.process import minimal_environment
 from .locator import CommandResult, CommandRunner, run_bounded
 
@@ -49,14 +49,10 @@ class CliUpdateConfig(BaseModel):
 
 
 def load_update_config(config_dir: Path) -> CliUpdateConfig:
-    path = config_dir / "config.json"
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        section = LockedJsonStore(config_dir / "config.json").get_section("cli_updates", {})
+    except LockedJsonStoreError:
         return CliUpdateConfig()
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return CliUpdateConfig()
-    section = raw.get("cli_updates", {}) if isinstance(raw, dict) else {}
     try:
         return CliUpdateConfig.model_validate(section)
     except ValidationError:
@@ -64,15 +60,9 @@ def load_update_config(config_dir: Path) -> CliUpdateConfig:
 
 
 def save_update_config(config_dir: Path, config: CliUpdateConfig) -> None:
-    path = config_dir / "config.json"
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError):
-        existing = {}
-    if not isinstance(existing, dict):
-        existing = {}
-    existing["cli_updates"] = config.model_dump(mode="json")
-    atomic_write_text(path, json.dumps(existing, indent=2), mode=0o600)
+    LockedJsonStore(config_dir / "config.json").update_section(
+        "cli_updates", config.model_dump(mode="json")
+    )
 
 
 def update_environment(parent: Mapping[str, str] | None = None) -> dict[str, str]:

@@ -42,8 +42,11 @@ from ..runtimes.cli.antigravity import AntigravityAdapter
 from ..runtimes.cli.locator import locate_candidates, run_bounded
 from ..runtimes.cli.registry import build_cli_adapter, known_cli_types
 from ..runtimes.cli.update_policy import (
+    PostUpdateFailureChoice,
+    PostUpdateFailurePrompt,
     UpdateChoice,
     UpdatePromptSuppressions,
+    decide_post_update_failure,
     decide_update,
 )
 from ..runtimes.cli.updates import cache_valid
@@ -290,10 +293,10 @@ class PreflightService:
             # is what blocked correctly-configured users before v0.1.5.
             report.add(
                 "Authentication detected",
-                auth.authenticated or not auth.blocking,
+                auth.authenticated is True,
                 auth.detail,
                 error_type="authentication_failed",
-                mandatory=auth.blocking,
+                mandatory=auth.authenticated is False,
             )
             for conflict in auth.conflicts:
                 report.add("Credential precedence", True, conflict, mandatory=False)
@@ -436,9 +439,55 @@ class PreflightService:
                 cli_type,
                 exclude_run_ids=([run_id] if run_id else []),
             )
+            failed = result.status.state in {
+                CliUpdateState.BLOCKED,
+                CliUpdateState.CHECK_FAILED,
+            }
+            if failed:
+                minimum = installation.minimum_version
+                runnable = (
+                    version_at_least(installation.version, minimum) is True
+                    if minimum
+                    else version_at_least(installation.version, installation.version) is True
+                )
+                second = decide_post_update_failure(
+                    PostUpdateFailurePrompt(
+                        cli_type=cli_type,
+                        installed_version=installation.version,
+                        expected_version=getattr(status, "latest_version", None),
+                        install_source=installation.install_source.value,
+                        failure_category=result.status.state.value,
+                        minimum_supported_version=minimum,
+                        installed_runnable=runnable,
+                    ),
+                    callback=self.app.update_failure_prompt,
+                )
+                if second is PostUpdateFailureChoice.CONTINUE_WITH_INSTALLED:
+                    report.add(
+                        "CLI update failed verification",
+                        False,
+                        "explicitly continuing with the supported installed version",
+                        mandatory=False,
+                    )
+                    return
+                if second is PostUpdateFailureChoice.OPEN_DOCTOR:
+                    report.add(
+                        "CLI update",
+                        False,
+                        "Doctor/update details requested; run `openagent doctor --json`",
+                        error_type="cli_update_doctor_requested",
+                    )
+                    return
+                report.add(
+                    "CLI update",
+                    False,
+                    "update failed verification and this run was cancelled",
+                    error_type="cli_update_failed",
+                )
+                return
             report.add(
                 "CLI update",
-                result.status.state not in {CliUpdateState.BLOCKED, CliUpdateState.CHECK_FAILED},
+                True,
                 result.detail or result.status.detail,
                 mandatory=False,
             )

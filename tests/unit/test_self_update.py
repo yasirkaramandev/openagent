@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from openagent.cli.app import app
@@ -13,6 +14,15 @@ from openagent.services.self_update import (
     check_self_update,
     perform_self_update,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_install_metadata(monkeypatch):
+    """These legacy tests model installs *without* ``install.json``; never read the real home."""
+
+    monkeypatch.setattr(
+        "openagent.services.self_update.read_install_metadata", lambda *a, **k: None
+    )
 
 
 def _active(path: Path) -> Path:
@@ -115,6 +125,11 @@ def _git_runner(
     return runner
 
 
+# The source-checkout tests below exercise the opt-in developer workflow (``local_dev=True``). As of
+# the checkout-independent updater (spec §5, §10), a legacy ``file://`` install *without* that opt-in
+# no longer consults the checkout at all — it migrates to the official channel — so these tests set
+# ``local_dev=True`` to reach the source-checkout code path they cover. See
+# ``test_self_update_channels.py`` for the default migration behavior.
 def test_official_clean_source_checkout_fast_forwards_and_reinstalls(tmp_path: Path) -> None:
     root = _source_checkout(tmp_path / "Open Agent Source", version="0.1.4")
     active = _active(tmp_path / "tool" / "openagent")
@@ -125,6 +140,7 @@ def test_official_clean_source_checkout_fast_forwards_and_reinstalls(tmp_path: P
         direct_url={"url": root.as_uri(), "dir_info": {}},
         runner=_git_runner(root, head_after_pull="a" * 40),
         platform="darwin",
+        local_dev=True,
     )
 
     assert plan.source == "source-checkout"
@@ -146,6 +162,7 @@ def test_dirty_or_non_official_source_is_blocked(tmp_path: Path) -> None:
         direct_url={"url": root.as_uri(), "dir_info": {}},
         runner=_git_runner(root, dirty=True),
         platform="linux",
+        local_dev=True,
     )
     remote = check_self_update(
         active_executable=str(active),
@@ -169,6 +186,7 @@ def test_source_update_rejects_unencrypted_official_origin(tmp_path: Path) -> No
         direct_url={"url": root.as_uri(), "dir_info": {}},
         runner=_git_runner(root, origin="http://github.com/yasirkaramandev/openagent.git"),
         platform="linux",
+        local_dev=True,
     )
 
     assert plan.can_update is False
@@ -196,6 +214,7 @@ def _current_checkout_plan(
         runner=_git_runner(root, head_after_pull="b" * 40),  # HEAD == ls-remote "b"*40
         platform="linux",
         repair=repair,
+        local_dev=True,
     )
 
 
@@ -256,6 +275,7 @@ def test_source_checkout_without_parseable_source_version_is_blocked(tmp_path: P
         direct_url={"url": root.as_uri(), "dir_info": {}},
         runner=_git_runner(root, head_after_pull="b" * 40),
         platform="linux",
+        local_dev=True,
     )
 
     assert plan.can_update is False
@@ -458,7 +478,8 @@ def test_cli_update_dry_run_and_confirmed_json(monkeypatch, tmp_path: Path) -> N
     )
     monkeypatch.setattr("openagent.services.self_update.check_self_update", lambda **_kw: plan)
     monkeypatch.setattr(
-        "openagent.services.self_update.perform_self_update", lambda value: completed
+        "openagent.services.self_update.perform_self_update",
+        lambda value, **_kw: completed,
     )
 
     runner = CliRunner()

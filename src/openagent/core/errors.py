@@ -59,6 +59,7 @@ class ErrorType(str, Enum):
     #: safely read (spec §6). Distinct from a corrupt row (:data:`DATA_VALIDATION`) — the data is
     #: fine, the *reader* is too old.
     DATABASE_INCOMPATIBLE = "database_incompatible"
+    DATABASE_METADATA_INVALID = "database_metadata_invalid"
     #: A persisted record could not be decoded into its current domain model. The store is otherwise
     #: intact; the single record is quarantined rather than crashing the surface that read it.
     DATA_VALIDATION = "data_validation"
@@ -138,6 +139,32 @@ class DatabaseReaderCompatibilityError(OpenAgentError):
             f"Repair:\n{repair}"
         )
         super().__init__(ErrorType.DATABASE_INCOMPATIBLE, message)
+
+
+class DatabaseMetadataValidationError(OpenAgentError):
+    """Compatibility metadata is present but cannot be evaluated safely."""
+
+    def __init__(
+        self,
+        *,
+        metadata_key: str,
+        invalid_state: str,
+        binary_version: str,
+        repair_commands: list[str] | None = None,
+    ) -> None:
+        self.metadata_key = metadata_key
+        self.invalid_state = invalid_state
+        self.binary_version = binary_version
+        self.repair_commands = repair_commands or ["openagent update --repair"]
+        commands = "\n".join(f"  {command}" for command in self.repair_commands)
+        message = (
+            f"Database compatibility metadata {metadata_key!r} is {invalid_state}; "
+            "OpenAgent cannot prove this binary can read the database safely.\n"
+            f"Active binary version: {binary_version}\n"
+            "Run `openagent doctor --json` and restore/repair from a verified backup if needed.\n"
+            f"Safe repair command:\n{commands}"
+        )
+        super().__init__(ErrorType.DATABASE_METADATA_INVALID, message)
 
 
 class DataValidationError(OpenAgentError):
