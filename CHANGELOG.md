@@ -4,14 +4,21 @@ All notable changes to OpenAgent are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.6rc5] — unreleased
+## [0.1.6] — 2026-07-31
 
-Fifth release candidate. rc4 changed how the updater behaves, so it gets its own version rather
-than a second binary under the same name. Everything here is a case where the updater or the
-installer answered a question it could not actually answer, and the wrong answer was the permissive
-one. Each defect below has a regression test that was written first and observed failing against
-rc4. This is not the final `0.1.6`: remote CI across the supported matrix and a fresh RC soak on
-the exact rc5 commit remain release gates.
+First stable 0.1.6. The content is exactly what soaked as `0.1.6rc5` — the runtime tree of this
+release is byte-identical to candidate `2f5ef15`, and the only files that differ are this
+changelog, the version constant, and a governance workflow. Nothing was added after the soak
+started, which is the point: a release note that describes code the soak never ran is not
+evidence.
+
+Everything below is a case where the updater or the installer answered a question it could not
+actually answer, and the wrong answer was the permissive one. Each defect has a regression test
+that was written first and observed failing against rc4.
+
+Both release gates are met: remote CI across the supported matrix, and a five-day RC soak on the
+exact rc5 commit (started 2026-07-26T19:40Z, candidate SHA unchanged throughout, no critical
+failures recorded).
 
 ### Updater safety
 
