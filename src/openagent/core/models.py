@@ -199,6 +199,34 @@ class ProviderConnection(BaseModel):
     #: from the secret: §22 forbids persisting the key or any hash of it. Raw legacy rows are
     #: backfilled by migrations; every newly constructed provider gets a non-empty generation.
     credential_revision: str = Field(default_factory=lambda: uuid4().hex)
+    #: How this connection's catalog is listed. Promoted from the JSON blob to a real field (and a
+    #: real column) because the provider list, Doctor and the wizard *filter* on it.
+    model_discovery: DiscoveryStrategy = DiscoveryStrategy.OPENAI_MODELS
+    #: Whether the provider is allowed to retain conversation state for resume. Off by default
+    #: everywhere, on every provider that supports it: turning it on sends the conversation to
+    #: someone else's storage, which is a privacy decision the user makes knowingly (spec §10.4).
+    server_state_enabled: bool = False
+    #: Which CompatibilityProfile shape produced this row's behaviour, so a profile change can be
+    #: reasoned about after the fact.
+    profile_version: str = "2"
+
+    @property
+    def is_local(self) -> bool:
+        """Whether this connection points at a service on this machine.
+
+        A **derived** property, never a stored input. It decides the loopback exemption from
+        requiring TLS, so a caller that could set it directly could turn off transport security for
+        a remote endpoint by asserting the endpoint is local — which is the whole protection.
+
+        Derived from the same :func:`~openagent.providers.spec.is_loopback` every other caller
+        uses, so ``0.0.0.0`` is correctly *not* local: it is the unspecified address a server binds
+        to in order to accept traffic from every interface, and it is the host a user is most
+        likely to paste after reading it in a server log.
+        """
+
+        from ..providers.spec import is_loopback
+
+        return any(is_loopback(url) for url in (self.base_url, self.anthropic_base_url) if url)
 
 
 class ModelProfile(BaseModel):

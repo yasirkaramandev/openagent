@@ -63,6 +63,22 @@ provider_connections = Table(
     #: Immutable provider-generation ownership token. Provider ids are name-derived and therefore
     #: reused after remove/re-add; compensation must compare this relational value first.
     Column("credential_revision", String, nullable=False, server_default=""),
+    #: The 0015 columns. They must be declared here as well as in the migration, or a *fresh*
+    #: database (created from this metadata) and an *upgraded* one (created by the migration) end
+    #: up with different schemas — and the difference only shows up for users who installed before
+    #: the migration, which is the hardest population to reproduce against.
+    #:
+    #: These are what provider queries filter on: which connections are local, which speak a given
+    #: protocol, which region a key belongs to. Inside the JSON blob they are unqueryable.
+    Column("protocol", String, nullable=False, server_default="openai-chat"),
+    Column("model_discovery", String, nullable=False, server_default="openai-models"),
+    Column("region", String, nullable=True),
+    Column("workspace_id", String, nullable=True),
+    Column("server_state_enabled", Integer, nullable=False, default=0, server_default="0"),
+    #: Derived from the base URL, never accepted from a caller — it decides the loopback exemption
+    #: from requiring TLS. Stored so it can be filtered on, recomputed on every write.
+    Column("is_local", Integer, nullable=False, default=0, server_default="0"),
+    Column("profile_version", String, nullable=False, server_default="2"),
     Column("data", JSON, nullable=False),
 )
 

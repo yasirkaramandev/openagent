@@ -649,3 +649,96 @@ class TestTheFragmentAppliesInOrder:
         with db.connect() as conn:
             assert conn.exec_driver_sql("PRAGMA integrity_check").scalar() == "ok"
             assert conn.exec_driver_sql("SELECT COUNT(*) FROM provider_connections").scalar() == 1
+
+
+class TestProviderStorageParity:
+    """Relational columns and the JSON aggregate are two encodings of one fact (spec §6.4).
+
+    They used to disagree: 0015 wrote the columns and nothing wrote them into ``data``, because
+    ProviderConnection was ``extra="forbid"`` and declared none of the fields. The domain model now
+    declares them, so the migration projects both and the repository refuses a row where they
+    differ.
+
+    Silently preferring one side is the outcome worth preventing. The domain model is rebuilt from
+    ``data`` while queries filter on the columns, so "which connections are local" and "is this
+    connection local" could answer differently for the same row, and which answer a caller got
+    would depend on the code path it happened to take.
+    """
+
+    def test_a_created_provider_agrees_with_itself(self) -> None:
+        from openagent.core.models import DiscoveryStrategy, Protocol, ProviderConnection
+        from openagent.storage.db import Database
+        from openagent.storage.repositories import Repositories
+
+        db = Database.in_memory()
+        repos = Repositories(db)
+        repos.providers.create(
+            ProviderConnection(
+                id="p1",
+                name="Parity",
+                provider_type="openai",
+                protocol=Protocol.OPENAI_CHAT,
+                model_discovery=DiscoveryStrategy.OPENAI_MODELS,
+                region="us",
+                server_state_enabled=True,
+            )
+        )
+        # Reading through the parity decoder is the assertion: it raises if they disagree.
+        loaded = repos.providers.get("p1")
+        assert loaded is not None
+        assert loaded.region == "us"
+        assert loaded.server_state_enabled is True
+        assert repos.providers.list()[0].id == "p1"
+
+    def test_a_tampered_column_is_refused_rather_than_silently_preferred(self) -> None:
+        from openagent.core.models import ProviderConnection
+        from openagent.storage.db import Database
+        from openagent.storage.repositories import ProviderStorageMismatch, Repositories
+
+        db = Database.in_memory()
+        repos = Repositories(db)
+        repos.providers.create(
+            ProviderConnection(id="p2", name="Tampered", provider_type="openai", region="us")
+        )
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql("UPDATE provider_connections SET region='eu' WHERE id='p2'")
+
+        with pytest.raises(ProviderStorageMismatch) as caught:
+            repos.providers.get("p2")
+        assert "region" in caught.value.fields
+        # The record is named; the values never are — they include base URLs and headers.
+        assert "eu" not in str(caught.value)
+        assert "us" not in str(caught.value)
+
+    def test_is_local_is_derived_from_the_url_not_settable(self) -> None:
+        """0.0.0.0 is not loopback, and no caller can assert that it is."""
+
+        from openagent.core.models import ProviderConnection
+
+        assert ProviderConnection(
+            id="a", name="A", provider_type="ollama", base_url="http://127.0.0.1:11434"
+        ).is_local
+        assert ProviderConnection(
+            id="b", name="B", provider_type="ollama", base_url="http://[::1]:11434"
+        ).is_local
+        assert ProviderConnection(
+            id="c", name="C", provider_type="ollama", base_url="http://127.0.0.2:11434"
+        ).is_local
+        for remote in ("http://0.0.0.0:11434", "http://192.168.1.20:11434", "http://example.com"):
+            assert not ProviderConnection(
+                id="r", name="R", provider_type="ollama", base_url=remote
+            ).is_local, f"{remote} must not be treated as local"
+
+    def test_is_local_cannot_be_supplied_as_a_field(self) -> None:
+        from pydantic import ValidationError
+
+        from openagent.core.models import ProviderConnection
+
+        with pytest.raises(ValidationError):
+            ProviderConnection(
+                id="x",
+                name="X",
+                provider_type="ollama",
+                base_url="http://example.com",
+                is_local=True,
+            )

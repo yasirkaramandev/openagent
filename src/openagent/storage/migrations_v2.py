@@ -134,23 +134,29 @@ def _m0015_provider_protocol_and_region(conn: Connection) -> None:
         state = payload.get("server_state_enabled") is True
         local = _looks_local(payload)
 
-        # NOT mirrored into the JSON aggregate here, though §7.3 asks for that invariant.
+        # Relational columns and the JSON aggregate are written in the same statement, because
+        # they are two encodings of one fact and this migration is the moment both are set.
         #
-        # Attempting it fails the migration's own domain-validation gate: ProviderConnection is
-        # declared extra="forbid" and has no model_discovery / server_state_enabled / is_local /
-        # profile_version field, so writing them into `data` makes every provider row unparseable
-        # and the whole migration rolls back. (Confirmed against a real user database.)
+        # This was previously left undone: ProviderConnection was extra="forbid" and declared none
+        # of these fields, so writing them into `data` made every provider row unparseable and
+        # rolled the migration back. The domain model now declares them, so the projection is
+        # possible and the invariant holds.
         #
-        # The invariant is therefore blocked on work this migration cannot do alone: the fields
-        # have to exist on the domain model, the repository encode/decode, and the service first.
-        # Until then the columns are authoritative for queries and `data` simply does not carry
-        # them — which is a documented gap, not a disagreement between two stored copies.
+        # `is_local` is deliberately absent from the JSON: it is a derived property on the domain
+        # model, not stored state. Persisting it would create a second, settable source of truth
+        # for a flag that decides the plaintext-HTTP exemption.
+        payload["protocol"] = protocol
+        payload["model_discovery"] = discovery
+        payload["region"] = region
+        payload["workspace_id"] = workspace
+        payload["server_state_enabled"] = state
+        payload["profile_version"] = "2"
 
         conn.execute(
             text(
                 "UPDATE provider_connections SET protocol=:protocol, model_discovery=:discovery, "
                 "region=:region, workspace_id=:workspace, server_state_enabled=:state, "
-                "is_local=:local, profile_version='2' WHERE id=:id"
+                "is_local=:local, profile_version='2', data=:data WHERE id=:id"
             ),
             {
                 "protocol": protocol,
@@ -159,6 +165,7 @@ def _m0015_provider_protocol_and_region(conn: Connection) -> None:
                 "workspace": workspace,
                 "state": 1 if state else 0,
                 "local": 1 if local else 0,
+                "data": json.dumps(payload, ensure_ascii=False),
                 "id": row["id"],
             },
         )
@@ -193,23 +200,28 @@ def _discovery_for(provider_type: str, payload: dict[str, Any]) -> str:
 
 #: Hosts that make a connection local. Matched on the parsed host, never as a substring of the URL:
 #: ``https://localhost.attacker.example`` contains "localhost" and is not loopback.
-_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"})
-
-
 def _looks_local(payload: dict[str, Any]) -> bool:
-    from urllib.parse import urlsplit
+    """Locality, decided by the one helper every other caller uses.
 
-    for key in ("base_url", "anthropic_base_url"):
-        url = _text(payload.get(key))
-        if not url:
-            continue
-        try:
-            host = (urlsplit(url).hostname or "").lower()
-        except ValueError:
-            continue
-        if host in _LOOPBACK:
-            return True
-    return False
+    This used to carry its own ``_LOOPBACK`` set, and that set contained ``0.0.0.0`` — which is
+    not loopback. It is the *unspecified* address, the wildcard a server binds to in order to
+    accept traffic from every interface, and it is the host a user is most likely to paste having
+    read ``Listening on 0.0.0.0:11434`` in a server log. So the one host that most strongly
+    suggests the service is reachable from off-box was being marked local and handed the
+    plaintext-HTTP exemption. The same set matched only ``127.0.0.1`` while the whole
+    ``127.0.0.0/8`` block is loopback.
+
+    A migration having a second, quietly different opinion about a security classification is the
+    problem here, not the particular entries. ``is_loopback`` is the authority.
+    """
+
+    from ..providers.spec import is_loopback
+
+    return any(
+        is_loopback(url)
+        for url in (_text(payload.get("base_url")), _text(payload.get("anthropic_base_url")))
+        if url
+    )
 
 
 # --------------------------------------------------------------------------- 0016

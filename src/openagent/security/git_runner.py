@@ -261,7 +261,8 @@ def _config_query(cwd: Path, args: Sequence[str]) -> list[str]:
     if result.returncode != 0:
         raise UnsafeGitFilterConfiguration(
             "unsafe or unresolvable content filter configuration: "
-            f"git config exited {result.returncode}: {_first_line(result.stderr)}"
+            f"git config exited {result.returncode}: "
+            f"{_first_line(getattr(result, 'stderr', ''))}"
         )
     return [record for record in (result.stdout or "").split("\0") if record]
 

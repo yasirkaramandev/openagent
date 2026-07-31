@@ -393,15 +393,28 @@ def _install_evil_filter(root: Path, marker: Path) -> None:
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
-    config = root / ".git" / "config"
-    with config.open("a", encoding="utf-8") as handle:
-        handle.write(
-            '[filter "evil"]\n'
-            f"\tclean = {script}\n"
-            f"\tsmudge = {script}\n"
-            f"\tprocess = {script}\n"
-            "\trequired = true\n"
+    # Set through `git config` rather than by appending text to .git/config.
+    #
+    # Hand-written config broke on Windows: a path there is `C:\Users\RUNNER~1\...`, and in git
+    # config syntax a backslash begins an escape sequence, so `\U` is invalid and git refused the
+    # whole file with `fatal: bad config line 9`. That surfaced in production code as
+    # UnsafeGitFilterConfiguration — a security refusal caused entirely by a malformed fixture.
+    #
+    # Letting git write its own config is also the more faithful setup: it is how a real attacker's
+    # repository would carry these values, correctly quoted for the platform it is on.
+    for key in ("clean", "smudge", "process"):
+        subprocess.run(
+            ["git", "config", f"filter.evil.{key}", str(script)],
+            cwd=root,
+            check=True,
+            capture_output=True,
         )
+    subprocess.run(
+        ["git", "config", "filter.evil.required", "true"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
 
 
 @requires_git

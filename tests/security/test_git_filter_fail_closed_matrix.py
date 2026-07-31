@@ -27,7 +27,9 @@ def test_config_query_classifies_absent_empty_and_failed_git(
     assert git_runner._config_query(tmp_path, ["--get", "missing"]) == []
 
     monkeypatch.setattr(
-        git_runner, "run_capture", lambda *_a, **_kw: SimpleNamespace(returncode=2, stdout="")
+        git_runner,
+        "run_capture",
+        lambda *_a, **_kw: SimpleNamespace(returncode=2, stdout="", stderr="fatal: broken"),
     )
     with pytest.raises(UnsafeGitFilterConfiguration):
         git_runner._config_query(tmp_path, ["--get", "broken"])
@@ -64,7 +66,10 @@ def test_ambiguous_filter_names_and_attribute_syntax_are_rejected(
     monkeypatch.setattr(
         git_runner,
         "_config_query",
-        lambda _cwd, args: ["filter.bad name.clean"] if "--name-only" in args else [],
+        # Keyed on --get-regexp, not --name-only: the query dropped --name-only when it turned
+        # out Git 2.55 does not accept that combination, and a stub asserting the old argv
+        # silently returns [] and stops testing the rejection it exists for.
+        lambda _cwd, args: ["filter.bad name.clean"] if "--get-regexp" in args else [],
     )
     with pytest.raises(UnsafeGitFilterConfiguration):
         git_runner._discover_filter_names(repo)
