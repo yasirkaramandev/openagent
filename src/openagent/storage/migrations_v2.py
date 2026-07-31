@@ -127,6 +127,25 @@ def _m0015_provider_protocol_and_region(conn: Connection) -> None:
             invalid.append(str(row["id"]))
             continue
         discovery = _discovery_for(str(row["provider_type"] or ""), payload)
+        region = _text(payload.get("region"))
+        workspace = _text(payload.get("workspace_id"))
+        # Never inferred as on. A row written before this column existed did not have server state
+        # enabled, whatever its provider is capable of.
+        state = payload.get("server_state_enabled") is True
+        local = _looks_local(payload)
+
+        # NOT mirrored into the JSON aggregate here, though §7.3 asks for that invariant.
+        #
+        # Attempting it fails the migration's own domain-validation gate: ProviderConnection is
+        # declared extra="forbid" and has no model_discovery / server_state_enabled / is_local /
+        # profile_version field, so writing them into `data` makes every provider row unparseable
+        # and the whole migration rolls back. (Confirmed against a real user database.)
+        #
+        # The invariant is therefore blocked on work this migration cannot do alone: the fields
+        # have to exist on the domain model, the repository encode/decode, and the service first.
+        # Until then the columns are authoritative for queries and `data` simply does not carry
+        # them — which is a documented gap, not a disagreement between two stored copies.
+
         conn.execute(
             text(
                 "UPDATE provider_connections SET protocol=:protocol, model_discovery=:discovery, "
@@ -136,12 +155,10 @@ def _m0015_provider_protocol_and_region(conn: Connection) -> None:
             {
                 "protocol": protocol,
                 "discovery": discovery,
-                "region": _text(payload.get("region")),
-                "workspace": _text(payload.get("workspace_id")),
-                # Never inferred as on. A row written before this column existed did not have server
-                # state enabled, whatever its provider is capable of.
-                "state": 1 if payload.get("server_state_enabled") is True else 0,
-                "local": 1 if _looks_local(payload) else 0,
+                "region": region,
+                "workspace": workspace,
+                "state": 1 if state else 0,
+                "local": 1 if local else 0,
                 "id": row["id"],
             },
         )
@@ -211,8 +228,23 @@ CREATE TABLE capability_evidence (
     provider_version VARCHAR,
     model_revision VARCHAR,
     credential_revision VARCHAR NOT NULL DEFAULT '',
+    -- The four columns below are what makes invalidation *targeted* rather than a blunt purge.
+    -- Evidence is only valid for the endpoint that produced it: the same model id behind a
+    -- different protocol, base URL, region or workspace is a different question, and answering it
+    -- from a cached row is how a capability the user does not have gets reported as supported.
+    -- Without these stored, "invalidate on base URL change" cannot be expressed as a query, so
+    -- the rule would exist in prose only.
+    protocol VARCHAR NOT NULL DEFAULT '',
+    -- The base URL is fingerprinted, not stored: it can carry a key in a query string or a
+    -- tenant name in a host, and this table is read by Doctor and printed.
+    base_url_fingerprint VARCHAR NOT NULL DEFAULT '',
+    region VARCHAR,
+    workspace_id VARCHAR,
     detail VARCHAR NOT NULL DEFAULT '',
-    UNIQUE (provider_id, model_id, capability, source)
+    -- Uniqueness includes protocol and endpoint identity for the same reason: two probes of one
+    -- model over two protocols are two facts, and collapsing them onto one row would let the
+    -- second silently overwrite the first.
+    UNIQUE (provider_id, model_id, capability, source, protocol, base_url_fingerprint)
 )
 """
 
@@ -327,6 +359,12 @@ _RESUME_COLUMNS = (
     ("resume_mode", "VARCHAR NOT NULL DEFAULT 'normalized_replay'"),
     ("remote_session_id", "VARCHAR"),
     ("remote_interaction_id", "VARCHAR"),
+    # Kept separate from remote_interaction_id rather than folded into it. Gemini's
+    # `previous_interaction_id` and the Responses family's `previous_response_id` are different
+    # fields with different lifetimes on different endpoints, and a provider can expose both.
+    # One column would force a resume to guess which field a stored id belongs in, and guessing
+    # wrong sends a valid-looking id the provider will reject.
+    ("remote_response_id", "VARCHAR"),
     ("continuation_path", "VARCHAR"),
     ("continuation_hash", "VARCHAR"),
     ("continuation_schema", "INTEGER"),
