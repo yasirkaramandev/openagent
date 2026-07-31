@@ -488,19 +488,19 @@ class TestMigration0016:
         from openagent.storage.migrations_v2 import observation_key
 
         def key(**overrides):
-            base = dict(
-                provider_id="p1",
-                model_id="m",
-                capability="tool_calling",
-                source="live_probe",
-                protocol="openai-chat",
-                base_url_fingerprint="fp",
-                credential_revision="revA",
-                region=None,
-                workspace_id=None,
-                probe_version=1,
-                model_revision=None,
-            )
+            base = {
+                "provider_id": "p1",
+                "model_id": "m",
+                "capability": "tool_calling",
+                "source": "live_probe",
+                "protocol": "openai-chat",
+                "base_url_fingerprint": "fp",
+                "credential_revision": "revA",
+                "region": None,
+                "workspace_id": None,
+                "probe_version": 1,
+                "model_revision": None,
+            }
             base.update(overrides)
             return observation_key(**base)
 
