@@ -33,8 +33,22 @@ from typing import Any
 #: interrupting one.
 STALE_AFTER = timedelta(hours=6)
 
-#: Where Antigravity's updater keeps its lock.
-ANTIGRAVITY_LOCK = Path.home() / ".gemini" / "antigravity-cli" / "updater" / "update.lock"
+#: Where Antigravity's updater keeps its lock, relative to the home directory.
+_ANTIGRAVITY_LOCK_PARTS = (".gemini", "antigravity-cli", "updater", "update.lock")
+
+
+def antigravity_lock_path() -> Path:
+    """Resolve the lock path *now* rather than at import.
+
+    Import-time resolution froze whichever home directory the first importing process happened to
+    have. That is wrong twice over: a test run that isolates ``HOME`` still read the developer's
+    real lock — so a stale one on any workstation that has ever run Antigravity failed the suite,
+    while CI stayed green — and a process that legitimately changes ``HOME`` kept consulting the
+    path it no longer uses.
+    """
+
+    return Path.home().joinpath(*_ANTIGRAVITY_LOCK_PARTS)
+
 
 #: Cap on how much of a foreign lock file is read. It is not our format and it may not be small.
 _MAX_LOCK_BYTES = 64 * 1024
@@ -128,7 +142,7 @@ def inspect_update_lock(
 ) -> UpdateLockReport:
     """Read a foreign updater lock without touching it."""
 
-    target = path or ANTIGRAVITY_LOCK
+    target = path or antigravity_lock_path()
     report = UpdateLockReport(path=target, present=False)
 
     try:

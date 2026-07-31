@@ -386,8 +386,11 @@ class TestStreaming:
         w = wire()
         events = [e async for e in w.events(req(stream=True, tools=[PING_TOOL]))]
         errors = [e for e in events if e.type == "error"]
+        # The stream never sent a finish reason, so the *interruption* is the accurate diagnosis and
+        # the half-written arguments are its symptom (spec §7.1). One error, not two to correlate —
+        # and it still names the tool, which is what makes this a report rather than a silent drop.
         assert len(errors) == 1
-        assert errors[0].error_type == ErrorType.INVALID_TOOL_ARGUMENTS.value
+        assert errors[0].error_type == ErrorType.STREAM_INTERRUPTED.value
         assert "ping" in (errors[0].error_message or "")
         assert not [e for e in events if e.type == "tool_call"]
 

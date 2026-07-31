@@ -21,7 +21,7 @@ from ...core.events import ModelEventType, NormalizedModelEvent, TokenUsage
 from ...core.events import ToolCall as EventToolCall
 from ...core.limits import RUNTIME_LIMITS
 from ..compat.profiles_v2 import CompatibilityProfile
-from ..streaming import AssembledTurn, FinishReason
+from ..streaming import AssembledTurn
 from ..streaming import ToolCall as AssembledToolCall
 from ..tool_schema import ToolSchemaNormalizationResult, normalize_tool_schemas
 
@@ -137,6 +137,25 @@ def tool_call_events(
     indistinguishable from a zero-argument one and executes it.
     """
 
+    # §7.1/§7.2 — before any individual call is judged, the *turn* has to have earned the right to
+    # run tools at all. A stream that stopped without a terminal event, or that contradicted itself
+    # about which call is which, yields no tool calls however well-formed the fragments look. This
+    # is deliberately not a per-call filter: identity contradictions are about the mapping between
+    # fragments and calls, so the call that did not collide is no more trustworthy than the one that
+    # did.
+    if not turn.is_terminal:
+        # The wire reports the interruption itself, with the transport-level detail it has and this
+        # function does not. Emitting a second error here would double-report one failure.
+        return
+    if turn.protocol_violations:
+        yield NormalizedModelEvent(
+            type=ModelEventType.ERROR,
+            error_type=ErrorType.PROTOCOL_MISMATCH.value,
+            error_message=(f"no tool call from this turn was executed: {turn.execution_refusal}"),
+            response_id=response_id,
+        )
+        return
+
     for call in turn.tool_calls:
         if not call.complete:
             yield NormalizedModelEvent(
@@ -189,6 +208,28 @@ def _argument_bytes(arguments: dict[str, Any]) -> int:
         return RUNTIME_LIMITS.tool_arguments_bytes + 1
 
 
+def interruption_event(turn: AssembledTurn, *, response_id: str | None) -> NormalizedModelEvent:
+    """The single error reported for a turn the provider never finished.
+
+    It names the tool calls it is discarding. The interruption is the accurate root cause — a call
+    whose arguments are half-written is a *symptom* of the stream stopping — but reporting only the
+    cause would leave the user unable to see what was nearly run, so both go in one event rather
+    than in two that would have to be correlated.
+    """
+
+    named = [call.name for call in turn.tool_calls if call.name]
+    detail = ""
+    if turn.tool_calls:
+        listed = ", ".join(named) if named else "unnamed"
+        detail = f"; {len(turn.tool_calls)} unexecuted tool call(s) were discarded ({listed})"
+    return NormalizedModelEvent(
+        type=ModelEventType.ERROR,
+        error_type=ErrorType.STREAM_INTERRUPTED.value,
+        error_message=(f"the provider stopped streaming without a terminal event{detail}"),
+        response_id=response_id,
+    )
+
+
 def interrupted(turn: AssembledTurn) -> bool:
     """Whether a turn ended without the provider saying why.
 
@@ -196,4 +237,4 @@ def interrupted(turn: AssembledTurn) -> bool:
     stopped. The remedy is to treat the turn as unfinished, not to diagnose connectivity.
     """
 
-    return turn.finish_reason in {FinishReason.INTERRUPTED, FinishReason.CANCELLED}
+    return not turn.is_terminal

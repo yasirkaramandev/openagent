@@ -73,6 +73,14 @@ def _sandbox_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep global state out of the real user dirs during tests."""
     monkeypatch.setenv("OPENAGENT_DATA_DIR", str(tmp_path / "xdg-data"))
     monkeypatch.setenv("OPENAGENT_CONFIG_DIR", str(tmp_path / "xdg-config"))
+    # HOME too, not just the OpenAgent dirs. Foreign tools keep state under the home directory —
+    # Antigravity's updater lock is the one that bit us — so a suite that leaves HOME alone reads
+    # the developer's real files and passes or fails according to what is on their machine. CI has
+    # a clean home and stayed green while a workstation with a stale lock failed.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     os.environ.pop("OPENAI_API_KEY", None)
     # Antigravity's editing bypass is opt-in; a stray env var on the dev machine must not silently
     # change what the tests are asserting (item 15).

@@ -34,7 +34,7 @@ from ..continuation import ContinuationEnvelope, ContinuationStrategy
 from ..error_mapping import ProviderErrorSignal, map_provider_error
 from ..streaming import AssembledTurn, StreamingTurnAssembler, Usage
 from ..transport import Transport, TransportError
-from .base import ToolPreparation, interrupted, prepare_tools, tool_call_events
+from .base import ToolPreparation, interrupted, interruption_event, prepare_tools, tool_call_events
 
 _PATH = "/v1/messages"
 
@@ -412,13 +412,8 @@ class AnthropicMessagesWire:
         usage_event = _usage_event(raw_usage, response_id)
         if usage_event is not None:
             yield usage_event
-        if interrupted(turn) and not turn.tool_calls:
-            yield NormalizedModelEvent(
-                type=ModelEventType.ERROR,
-                error_type=ErrorType.STREAM_INTERRUPTED.value,
-                error_message="the provider stopped streaming without a terminal event",
-                response_id=response_id,
-            )
+        if interrupted(turn):
+            yield interruption_event(turn, response_id=response_id)
             return
         yield NormalizedModelEvent(type=ModelEventType.DONE, response_id=response_id)
 

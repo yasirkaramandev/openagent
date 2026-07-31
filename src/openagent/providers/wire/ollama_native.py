@@ -31,7 +31,7 @@ from ..continuation import ContinuationEnvelope, ContinuationStrategy
 from ..error_mapping import ProviderErrorSignal, map_provider_error
 from ..streaming import AssembledTurn, StreamingTurnAssembler, Usage
 from ..transport import Transport, TransportError
-from .base import ToolPreparation, interrupted, prepare_tools, tool_call_events
+from .base import ToolPreparation, interrupted, interruption_event, prepare_tools, tool_call_events
 
 _PATH = "/api/chat"
 
@@ -300,12 +300,8 @@ class OllamaNativeWire:
         usage_event = _usage_event(final)
         if usage_event is not None:
             yield usage_event
-        if interrupted(turn) and not turn.tool_calls:
-            yield NormalizedModelEvent(
-                type=ModelEventType.ERROR,
-                error_type=ErrorType.STREAM_INTERRUPTED.value,
-                error_message="the local server stopped streaming without a done marker",
-            )
+        if interrupted(turn):
+            yield interruption_event(turn, response_id=None)
             return
         yield NormalizedModelEvent(type=ModelEventType.DONE)
 
