@@ -20,6 +20,7 @@ inherited`` is the case that would otherwise send an OpenAI key to Anthropic's C
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +52,27 @@ def all_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", UNRELATED_SECRET)
     monkeypatch.setenv("GITHUB_TOKEN", UNRELATED_SECRET)
     monkeypatch.setenv("STRIPE_SECRET_KEY", UNRELATED_SECRET)
+
+
+def write_probe_stub(directory: Path, payload: str) -> Path:
+    """A fake ``claude`` that prints ``payload`` on stdout, executable on this platform.
+
+    A ``#!/bin/sh`` script is not runnable on Windows, so a test using one there does not exercise
+    the probe at all — it exercises the *fallback*, and then asserts the probe's answer. That is a
+    test asserting something its own setup made impossible, and it looks like a product bug. The
+    stub is therefore written in the platform's own executable form.
+    """
+
+    if os.name == "nt":
+        stub = directory / "claude-stub.cmd"
+        # `@echo` with the JSON quoted for cmd.exe: `"` is not special there, but `>` and `|` are,
+        # and neither appears in these payloads.
+        stub.write_text(f"@echo off\r\necho {payload}\r\n", encoding="utf-8")
+        return stub
+    stub = directory / "claude-stub"
+    stub.write_text(f"#!/bin/sh\necho '{payload}'\n", encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
 
 
 # --------------------------------------------------------------------------- delivery
@@ -205,11 +227,7 @@ def test_cli_verdict_overrides_a_stale_credential_file(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     (tmp_path / ".claude.json").write_text('{"theme": "dark"}', encoding="utf-8")
 
-    fake_cli = tmp_path / "claude-stub"
-    fake_cli.write_text(
-        '#!/bin/sh\necho \'{"loggedIn": false, "authMethod": "none"}\'\n', encoding="utf-8"
-    )
-    fake_cli.chmod(0o755)
+    fake_cli = write_probe_stub(tmp_path, '{"loggedIn": false, "authMethod": "none"}')
 
     evidence = probe_claude_auth(str(fake_cli), build_child_environment("claude"))
 
@@ -368,14 +386,10 @@ def test_cli_reported_key_source_is_named_in_a_conflict(
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-canary")
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
 
-    fake_cli = tmp_path / "claude-stub"
-    fake_cli.write_text(
-        "#!/bin/sh\n"
-        'echo \'{"loggedIn": true, "authMethod": "api_key", '
-        '"apiKeySource": "ANTHROPIC_API_KEY"}\'\n',
-        encoding="utf-8",
+    fake_cli = write_probe_stub(
+        tmp_path,
+        '{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}',
     )
-    fake_cli.chmod(0o755)
 
     evidence = probe_claude_auth(str(fake_cli), build_child_environment("claude"))
 

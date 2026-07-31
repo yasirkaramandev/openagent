@@ -213,12 +213,27 @@ def _read_text_capped(path: Path, limit: int = _ATTR_READ_LIMIT) -> str:
 
 
 def _config_query(cwd: Path, args: Sequence[str]) -> list[str]:
-    """Run Git's read-only local config parser with includes, fixed argv and bounded output."""
+    """Run Git's read-only local config parser with includes, fixed argv and bounded output.
+
+    Always ``-z``. Two reasons, and the second is why this is not a style choice:
+
+    * A config *value* may contain a newline. Git accepts one, and line-based parsing then reads a
+      single value as two records — so a filter command could be split such that the dangerous
+      half is never seen by the name check below.
+    * ``--name-only`` is not accepted with ``--get-regexp`` by every Git this project supports.
+      Git 2.55 on Windows rejected the combination, which surfaced as
+      ``UnsafeGitFilterConfiguration`` — a *security* diagnosis for what was really an argv
+      portability problem, and one that fails closed hard enough to make a repository unusable.
+      ``-z`` is understood by every Git in range and gives the key back anyway.
+
+    Returns the raw NUL-separated records; callers decide whether a record is a bare value
+    (``--get-all``) or a ``key\\nvalue`` pair (``--get-regexp``).
+    """
 
     argv = ["git", "--no-pager", "-c", f"core.hooksPath={_empty_hooks_dir()}"]
     for setting in _GIT_SAFE_CONFIG:
         argv += ["-c", setting]
-    argv += ["config", "--local", "--includes", *args]
+    argv += ["config", "--local", "--includes", "-z", *args]
     try:
         result = run_capture(
             argv,
@@ -238,11 +253,30 @@ def _config_query(cwd: Path, args: Sequence[str]) -> list[str]:
         raise UnsafeGitFilterConfiguration(
             "unsafe or unresolvable content filter configuration"
         ) from exc
+    # 1 is git's documented "no key matched", which is an answer, not a failure. Any other
+    # non-zero code means the query itself did not run, and we must not read "no filters are
+    # configured" out of a command that never looked.
     if result.returncode == 1:
         return []
     if result.returncode != 0:
-        raise UnsafeGitFilterConfiguration("unsafe or unresolvable content filter configuration")
-    return [line for line in (result.stdout or "").splitlines() if line]
+        raise UnsafeGitFilterConfiguration(
+            "unsafe or unresolvable content filter configuration: "
+            f"git config exited {result.returncode}: "
+            f"{_first_line(getattr(result, 'stderr', ''))}"
+        )
+    return [record for record in (result.stdout or "").split("\0") if record]
+
+
+def _first_line(text: str | None, limit: int = 200) -> str:
+    """A bounded, single-line rendering of git's stderr, for diagnostics.
+
+    Only stderr is ever surfaced — never stdout, which carries config *values* and so may carry a
+    credential in a filter command or a URL.
+    """
+
+    if not text:
+        return "no stderr"
+    return text.strip().splitlines()[0][:limit] if text.strip() else "no stderr"
 
 
 def _git_dirs(cwd: Path) -> list[Path]:
@@ -348,15 +382,16 @@ def _discover_filter_names(cwd: Path) -> set[str]:
     """
 
     names: set[str] = set()
-    keys = _config_query(
+    # With ``-z`` each record is ``key\nvalue`` (or a bare key for a valueless entry), so the key
+    # is everything before the first newline. Taking it this way rather than with --name-only
+    # keeps the parse identical on every supported Git, and a newline inside a *value* can no
+    # longer be mistaken for a record boundary.
+    records = _config_query(
         cwd,
-        [
-            "--name-only",
-            "--get-regexp",
-            r"^filter\..*\.(clean|smudge|process|required)$",
-        ],
+        ["--get-regexp", r"^filter\..*\.(clean|smudge|process|required)$"],
     )
-    for key in keys:
+    for record in records:
+        key = record.split("\n", 1)[0]
         match = re.fullmatch(r"filter\.(.+)\.(clean|smudge|process|required)", key)
         if match is None or _SAFE_FILTER_NAME_RE.fullmatch(match.group(1)) is None:
             raise UnsafeGitFilterConfiguration(

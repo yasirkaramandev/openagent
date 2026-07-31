@@ -173,6 +173,21 @@ class CodexAdapter:
         )
 
     async def capabilities(self) -> CliCapabilities:
+        """What this CLI can do — or nothing, when it is not installed.
+
+        A capability is a claim about the binary on *this* machine. Reporting the documented answer
+        for a binary that is absent is the same mistake as reading a capability out of a provider's
+        documentation: it is true of the product and not of the installation, and the wizard would
+        offer a CLI that cannot run.
+        """
+
+        if not self.executable:
+            return CliCapabilities(
+                structured_events=False,
+                resumable=False,
+                edits_files=False,
+                runs_commands=False,
+            )
         return CliCapabilities(
             structured_events=True,
             resumable=True,

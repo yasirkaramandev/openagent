@@ -37,6 +37,19 @@ class _Stream:
                 raise httpx.ReadError("connection dropped mid-stream")
             yield line
 
+    async def aiter_bytes(self):
+        """The real transport reads bytes, because SSE framing is a sub-line problem.
+
+        A CRLF or a multi-byte character can straddle two network reads, and neither is recoverable
+        once httpx has already split the stream into lines. Each fake line is terminated *and*
+        blank-line-dispatched here, which is what a server actually puts on the wire.
+        """
+
+        for i, line in enumerate(self._lines):
+            if self._raise_after is not None and i >= self._raise_after:
+                raise httpx.ReadError("connection dropped mid-stream")
+            yield f"{line}\n\n".encode()
+
     @property
     def headers(self):
         return {}

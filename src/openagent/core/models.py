@@ -34,9 +34,43 @@ class RuntimeType(str, Enum):
 
 
 class Protocol(str, Enum):
+    """The wire protocol a request is spoken in — *not* the vendor it is spoken to.
+
+    These are separate axes and conflating them is what makes provider adapters multiply. DeepSeek,
+    Kimi and GLM are three vendors sharing one protocol; LM Studio speaks three depending on how it
+    is configured. A provider names *who*; this names *how*, and only the how decides which adapter
+    serializes the request (spec §6-§7).
+    """
+
     OPENAI_CHAT = "openai-chat"
     OPENAI_RESPONSES = "openai-responses"
     ANTHROPIC_MESSAGES = "anthropic-messages"
+    GEMINI_INTERACTIONS = "gemini-interactions"
+    OLLAMA_NATIVE_CHAT = "ollama-native-chat"
+    LMSTUDIO_NATIVE_CHAT = "lmstudio-native-chat"
+
+
+#: Historical alias. ``TransportProtocol`` is the spec's name for this enum; ``Protocol`` is the
+#: name already persisted in provider rows, so the enum keeps its identity and gains an alias
+#: rather than being renamed under existing data.
+TransportProtocol = Protocol
+
+
+class DiscoveryStrategy(str, Enum):
+    """How a provider's model catalog is obtained (spec §7).
+
+    ``MANUAL_ONLY`` is a first-class outcome, not a failure state: a provider with no listable
+    catalog is still usable by typing a model ID, and saying so is better than presenting an empty
+    list as though the provider had no models.
+    """
+
+    OPENAI_MODELS = "openai-models"
+    GEMINI_MODELS = "gemini-models"
+    OPENROUTER_CATALOG = "openrouter-catalog"
+    OLLAMA_TAGS_SHOW = "ollama-tags-show"
+    LMSTUDIO_NATIVE = "lmstudio-native"
+    CURATED_CATALOG = "curated-catalog"
+    MANUAL_ONLY = "manual-only"
 
 
 class RunStatus(str, Enum):
@@ -165,6 +199,34 @@ class ProviderConnection(BaseModel):
     #: from the secret: §22 forbids persisting the key or any hash of it. Raw legacy rows are
     #: backfilled by migrations; every newly constructed provider gets a non-empty generation.
     credential_revision: str = Field(default_factory=lambda: uuid4().hex)
+    #: How this connection's catalog is listed. Promoted from the JSON blob to a real field (and a
+    #: real column) because the provider list, Doctor and the wizard *filter* on it.
+    model_discovery: DiscoveryStrategy = DiscoveryStrategy.OPENAI_MODELS
+    #: Whether the provider is allowed to retain conversation state for resume. Off by default
+    #: everywhere, on every provider that supports it: turning it on sends the conversation to
+    #: someone else's storage, which is a privacy decision the user makes knowingly (spec §10.4).
+    server_state_enabled: bool = False
+    #: Which CompatibilityProfile shape produced this row's behaviour, so a profile change can be
+    #: reasoned about after the fact.
+    profile_version: str = "2"
+
+    @property
+    def is_local(self) -> bool:
+        """Whether this connection points at a service on this machine.
+
+        A **derived** property, never a stored input. It decides the loopback exemption from
+        requiring TLS, so a caller that could set it directly could turn off transport security for
+        a remote endpoint by asserting the endpoint is local — which is the whole protection.
+
+        Derived from the same :func:`~openagent.providers.spec.is_loopback` every other caller
+        uses, so ``0.0.0.0`` is correctly *not* local: it is the unspecified address a server binds
+        to in order to accept traffic from every interface, and it is the host a user is most
+        likely to paste after reading it in a server log.
+        """
+
+        from ..providers.spec import is_loopback
+
+        return any(is_loopback(url) for url in (self.base_url, self.anthropic_base_url) if url)
 
 
 class ModelProfile(BaseModel):
@@ -515,3 +577,39 @@ class Session(BaseModel):
     provider_session_id: str | None = None
     workspace: str = ""
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class CapabilityEvidenceRecord(BaseModel):
+    """One persisted capability observation, with everything needed to invalidate it (spec §8.2).
+
+    Separate from the in-memory ``CapabilityEvidence`` the ledger reasons about: that one carries
+    the *semantic* claim, this one adds the storage scope — which endpoint, which credential, which
+    probe definition produced it. Keeping them apart stops scope fields leaking into the ranking
+    logic and stops the ranking logic deciding what is worth persisting.
+
+    ``observed_at`` is nullable on purpose. A legacy row migrated from a v0.1 boolean genuinely
+    does not know when it was observed, and writing an empty string into a datetime field is not
+    "unknown" — it is a parse error deferred to whoever reads it next.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    provider_id: str
+    model_id: str
+    capability: str
+    status: str
+    source: str
+    observed_at: datetime | None = None
+    probe_version: int = 1
+    provider_version: str | None = None
+    model_revision: str | None = None
+    credential_revision: str = ""
+    #: Endpoint identity — evidence is only valid for the endpoint that produced it.
+    protocol: str = ""
+    #: A fingerprint, never the URL: a base URL can carry a key in a query string or a tenant in a
+    #: host, and this record is read by Doctor and printed.
+    base_url_fingerprint: str = ""
+    region: str | None = None
+    workspace_id: str | None = None
+    detail: str = ""

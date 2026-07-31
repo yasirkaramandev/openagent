@@ -45,6 +45,10 @@ SOURCE = "claude-cli"
 
 
 class ClaudeAdapter:
+    #: The registry key for this adapter. Present on every adapter so code that builds a discovery
+    #: result does not have to re-derive it from a literal at each call site.
+    cli_type = "claude"
+
     def __init__(self, executable: str | None = None, *, isolated: bool = False) -> None:
         self._explicit_executable = executable
         self.location: CliLocation = locate_cli_candidates("claude", explicit_path=executable)
@@ -111,6 +115,21 @@ class ClaudeAdapter:
         )
 
     async def capabilities(self) -> CliCapabilities:
+        """What this CLI can do — or nothing, when it is not installed.
+
+        A capability is a claim about the binary on *this* machine. Reporting the documented answer
+        for a binary that is absent is the same mistake as reading a capability out of a provider's
+        documentation: it is true of the product and not of the installation, and the wizard would
+        offer a CLI that cannot run.
+        """
+
+        if not self.executable:
+            return CliCapabilities(
+                structured_events=False,
+                resumable=False,
+                edits_files=False,
+                runs_commands=False,
+            )
         return CliCapabilities(
             structured_events=True,
             resumable=True,
@@ -134,6 +153,21 @@ class ClaudeAdapter:
         """
 
         context = context or CliModelDiscoveryContext()
+
+        # A model list for a CLI that is not installed is fabricated, whatever its source. The
+        # documented aliases describe the *product*; this method answers "what can this installation
+        # run", and with no binary the honest answer is nothing plus a reason (spec §25). Without
+        # this guard the wizard offers a model list for a CLI the user does not have, and the run
+        # fails later with `cli_not_found` — at which point the list looked authoritative.
+        if not self.executable:
+            self.last_model_discovery = CliModelDiscoveryResult(
+                cli_type=self.cli_type,
+                available=False,
+                method=self.model_discovery_method,
+                error="claude is not installed, so this machine cannot run any of its models",
+            )
+            return []
+
         plan = build_child_environment("claude")
         environment = context.environment or plan.as_child_env()
         # Keep the credential *types* apart: ANTHROPIC_API_KEY is the x-api-key credential for the

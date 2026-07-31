@@ -334,9 +334,28 @@ async def test_malformed_sse_is_safe(httpx_mock: HTTPXMock):
 
 
 async def test_connection_timeout_is_classified(httpx_mock: HTTPXMock):
+    """A connection that never opened is reported as unreachable, not as a slow answer.
+
+    Both are transient and both are retried, so this is about the *diagnosis*: "the endpoint did not
+    accept a connection" and "the endpoint accepted one and went quiet" send a user to different
+    places, and for a local provider the difference is "start your server" versus "wait".
+    """
+
     import httpx
 
     httpx_mock.add_exception(httpx.ConnectTimeout("timed out"))
+    transport = Transport(base_url=BASE, headers={}, max_retries=0, backoff_base=0.0)
+    result = await collect(adapter(transport=transport).stream_response(req()))
+    assert result.is_error
+    assert result.error_type == "network_unavailable"
+
+
+async def test_a_read_timeout_is_still_a_timeout(httpx_mock: HTTPXMock):
+    """The other side of the distinction above: the connection opened and the provider went silent."""
+
+    import httpx
+
+    httpx_mock.add_exception(httpx.ReadTimeout("timed out"))
     transport = Transport(base_url=BASE, headers={}, max_retries=0, backoff_base=0.0)
     result = await collect(adapter(transport=transport).stream_response(req()))
     assert result.is_error

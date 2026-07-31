@@ -54,6 +54,16 @@ class Paths:
     def journal_dir(self) -> Path:
         return self.data_dir / "journal"
 
+    @property
+    def sessions_dir(self) -> Path:
+        """Provider-native continuation artifacts, one directory per session (spec §8.4).
+
+        Global rather than per-project: a session's continuation belongs to the provider account it
+        was recorded against, and lives beside the database row that references it.
+        """
+
+        return self.data_dir / "sessions"
+
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / run_id
 
@@ -94,5 +104,6 @@ def ensure_dirs(paths: Paths) -> None:
         paths.worktrees_dir,
         paths.runtime_dir,
         paths.journal_dir,
+        paths.sessions_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)

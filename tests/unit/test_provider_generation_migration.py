@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, text
 
 from openagent.core.models import ProviderConnection
 from openagent.storage.db import Database
-from openagent.storage.migrations import LATEST_REVISION
+from openagent.storage.migrations import LATEST_REVISION, MIGRATIONS
 
 
 def _revision(path: Path) -> str:
@@ -65,8 +65,14 @@ def test_0014_backfills_credential_revision_without_changing_provider_identity(
 
     before_ids = {"provider_acme"}
     Database.open(db_path).engine.dispose()
-    assert LATEST_REVISION == "0014"
-    assert _revision(db_path) == "0014"
+    # 0017 now, not 0014: the v0.2 chain was spliced on once 0014 reached main. This assertion is
+    # about 0014 being *reachable*, not about it being last.
+    assert "0014" in {migration.revision for migration in MIGRATIONS}
+    assert LATEST_REVISION == "0017"
+    # A database opened from 0013 now runs all the way to the end of the chain, so it lands on
+    # 0017 rather than stopping at 0014. What this test is really about is what 0014 *did* on the
+    # way through — the columns and backfill asserted below — not where the walk stopped.
+    assert _revision(db_path) == "0017"
 
     engine = create_engine(f"sqlite:///{db_path}", future=True)
     try:

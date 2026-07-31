@@ -23,6 +23,7 @@ from ..core.events import EventType, NormalizedEvent
 from ..core.limits import RUNTIME_LIMITS
 from ..core.models import (
     AgentProfile,
+    CapabilityEvidenceRecord,
     CliInstallation,
     ModelProfile,
     Project,
@@ -34,6 +35,7 @@ from ..core.models import (
 )
 from . import db as t
 from .db import Database
+from .migrations_v2 import observation_key
 
 
 class DuplicateNameError(RuntimeError):
@@ -69,6 +71,22 @@ class ProviderInUseByAgentError(RuntimeError):
         self.provider_id = provider_id
         super().__init__(
             "this provider is still used by at least one agent; change or remove those agents first"
+        )
+
+
+class ProviderStorageMismatch(RuntimeError):
+    """A provider row's relational columns disagree with its JSON aggregate (spec §6.4).
+
+    Carries the field names and a record identifier, never the values: the payload holds base
+    URLs, extra headers and a credential reference.
+    """
+
+    def __init__(self, *, record_id: str, fields: tuple[str, ...]) -> None:
+        self.record_id = record_id
+        self.fields = fields
+        super().__init__(
+            f"provider_connections record {record_id} disagrees between its columns and its "
+            f"stored aggregate on: {', '.join(fields)}. Run `openagent doctor`."
         )
 
 
@@ -110,6 +128,117 @@ def _decode_provider(record_id: object, data: Any) -> ProviderConnection:
         ) from exc
 
 
+def _decode_provider_with_parity(row: Any, columns: Sequence[str]) -> ProviderConnection:
+    """Decode a provider row and refuse it if its columns disagree with its own ``data``.
+
+    The two encodings are written together by :func:`provider_storage_values`, so a disagreement
+    means something wrote one and not the other — an older binary, a hand-edited row, a migration
+    that stopped halfway. Picking a side silently is the dangerous option: the domain model is
+    rebuilt from ``data`` while queries filter on the columns, so "which connections are local" and
+    "is this connection local" could answer differently for the same row, and which answer a caller
+    got would depend on the path it happened to take.
+
+    The error names the fields and the record, never the values — a provider row carries base URLs,
+    headers and credential references.
+    """
+
+    mapping = dict(zip(columns, row, strict=True))
+    provider = _decode_provider(mapping.get("id"), mapping.get("data"))
+    stored = mapping.get("data") or {}
+
+    mismatched: list[str] = []
+    for field in _PROVIDER_PARITY_FIELDS:
+        if field not in mapping:
+            continue
+        relational = mapping[field]
+        aggregate = stored.get(field)
+        if field == "server_state_enabled":
+            if bool(relational) != bool(aggregate):
+                mismatched.append(field)
+            continue
+        if field == "credential_revision":
+            # Legacy rows may carry an empty relational value that migrations backfill; only a
+            # genuine disagreement between two present values is a mismatch.
+            if relational and aggregate and relational != aggregate:
+                mismatched.append(field)
+            continue
+        if (relational or None) != (aggregate or None):
+            mismatched.append(field)
+
+    if mismatched:
+        raise ProviderStorageMismatch(
+            record_id=str(mapping.get("id")), fields=tuple(sorted(mismatched))
+        )
+    return provider
+
+
+def provider_storage_values(provider: ProviderConnection) -> dict[str, object]:
+    """The one place a :class:`ProviderConnection` becomes columns.
+
+    Every write path — create, update, upsert, credential rotation — goes through this, so the
+    relational columns and the JSON aggregate are always produced from the same domain object in
+    the same statement. When each path spelled the column list out for itself, adding a field meant
+    finding all of them, and the one that was missed wrote a row whose columns disagreed with its
+    own ``data``.
+
+    ``is_local`` is computed here rather than read from the provider, because it is a derived
+    property: it decides the loopback exemption from requiring TLS, so it must follow the base URL
+    rather than anything a caller can set. It is not written into ``data`` at all — a second,
+    settable copy of that flag is exactly what should not exist.
+    """
+
+    from ..core.naming import normalize_name
+
+    return {
+        "name": provider.name,
+        "normalized_name": normalize_name(provider.name),
+        "provider_type": provider.provider_type,
+        "enabled": 1 if provider.enabled else 0,
+        "credential_revision": provider.credential_revision,
+        "protocol": provider.protocol.value
+        if hasattr(provider.protocol, "value")
+        else str(provider.protocol),
+        "model_discovery": provider.model_discovery.value
+        if hasattr(provider.model_discovery, "value")
+        else str(provider.model_discovery),
+        "region": provider.region,
+        "workspace_id": provider.workspace_id,
+        "server_state_enabled": 1 if provider.server_state_enabled else 0,
+        "is_local": 1 if provider.is_local else 0,
+        "profile_version": provider.profile_version,
+        "data": provider.model_dump(mode="json"),
+    }
+
+
+#: Relational columns that must agree with the JSON aggregate on read, and the ``data`` key each
+#: corresponds to. ``is_local`` is absent by design — it is derived, so there is nothing in ``data``
+#: for it to disagree with.
+#: Column order used by every provider read, so the row/column zip cannot drift.
+_PROVIDER_ROW_COLUMNS = (
+    "id",
+    "provider_type",
+    "protocol",
+    "model_discovery",
+    "region",
+    "workspace_id",
+    "server_state_enabled",
+    "profile_version",
+    "credential_revision",
+    "data",
+)
+
+_PROVIDER_PARITY_FIELDS = (
+    "provider_type",
+    "protocol",
+    "model_discovery",
+    "region",
+    "workspace_id",
+    "server_state_enabled",
+    "profile_version",
+    "credential_revision",
+)
+
+
 class ProviderRepository:
     """Insert-only creates and compare-and-swap updates.
 
@@ -141,21 +270,14 @@ class ProviderRepository:
         window is exactly what the 8-process race test exercises.
         """
 
-        from ..core.naming import normalize_name
-
         try:
             with self.db.engine.begin() as conn:
                 conn.execute(
                     insert(t.provider_connections).values(
                         id=provider.id,
-                        name=provider.name,
-                        normalized_name=normalize_name(provider.name),
-                        provider_type=provider.provider_type,
-                        enabled=1 if provider.enabled else 0,
                         state_revision=0,
                         updated_at=_now_iso(),
-                        credential_revision=provider.credential_revision,
-                        data=provider.model_dump(mode="json"),
+                        **provider_storage_values(provider),
                     )
                 )
         except IntegrityError as exc:
@@ -168,8 +290,6 @@ class ProviderRepository:
         ``expected_revision`` — meaning another process wrote in between and this copy is stale.
         """
 
-        from ..core.naming import normalize_name
-
         next_revision = expected_revision + 1
         try:
             with self.db.engine.begin() as conn:
@@ -180,14 +300,9 @@ class ProviderRepository:
                         t.provider_connections.c.state_revision == expected_revision,
                     )
                     .values(
-                        name=provider.name,
-                        normalized_name=normalize_name(provider.name),
-                        provider_type=provider.provider_type,
-                        enabled=1 if provider.enabled else 0,
                         state_revision=next_revision,
                         updated_at=_now_iso(),
-                        credential_revision=provider.credential_revision,
-                        data=provider.model_dump(mode="json"),
+                        **provider_storage_values(provider),
                     )
                 )
         except IntegrityError as exc:
@@ -225,17 +340,7 @@ class ProviderRepository:
         momentarily absent.
         """
 
-        from ..core.naming import normalize_name
-
-        values = {
-            "name": provider.name,
-            "normalized_name": normalize_name(provider.name),
-            "provider_type": provider.provider_type,
-            "enabled": 1 if provider.enabled else 0,
-            "updated_at": _now_iso(),
-            "credential_revision": provider.credential_revision,
-            "data": provider.model_dump(mode="json"),
-        }
+        values = {"updated_at": _now_iso(), **provider_storage_values(provider)}
         with self.db.engine.begin() as conn:
             existing = conn.execute(
                 select(t.provider_connections.c.state_revision).where(
@@ -258,32 +363,59 @@ class ProviderRepository:
     def get(self, provider_id: str) -> ProviderConnection | None:
         with self.db.engine.connect() as conn:
             row = conn.execute(
-                select(t.provider_connections.c.data).where(
-                    t.provider_connections.c.id == provider_id
-                )
+                select(
+                    t.provider_connections.c.id,
+                    t.provider_connections.c.provider_type,
+                    t.provider_connections.c.protocol,
+                    t.provider_connections.c.model_discovery,
+                    t.provider_connections.c.region,
+                    t.provider_connections.c.workspace_id,
+                    t.provider_connections.c.server_state_enabled,
+                    t.provider_connections.c.profile_version,
+                    t.provider_connections.c.credential_revision,
+                    t.provider_connections.c.data,
+                ).where(t.provider_connections.c.id == provider_id)
             ).first()
-        return _decode_provider(provider_id, row[0]) if row else None
+        return _decode_provider_with_parity(row, _PROVIDER_ROW_COLUMNS) if row else None
 
     def get_by_name(self, name: str) -> ProviderConnection | None:
         with self.db.engine.connect() as conn:
             row = conn.execute(
-                select(t.provider_connections.c.id, t.provider_connections.c.data).where(
-                    t.provider_connections.c.name == name
-                )
+                select(
+                    t.provider_connections.c.id,
+                    t.provider_connections.c.provider_type,
+                    t.provider_connections.c.protocol,
+                    t.provider_connections.c.model_discovery,
+                    t.provider_connections.c.region,
+                    t.provider_connections.c.workspace_id,
+                    t.provider_connections.c.server_state_enabled,
+                    t.provider_connections.c.profile_version,
+                    t.provider_connections.c.credential_revision,
+                    t.provider_connections.c.data,
+                ).where(t.provider_connections.c.name == name)
             ).first()
-        return _decode_provider(row[0], row[1]) if row else None
+        return _decode_provider_with_parity(row, _PROVIDER_ROW_COLUMNS) if row else None
 
     def list(self) -> Sequence[ProviderConnection]:
         with self.db.engine.connect() as conn:
             rows = conn.execute(
-                select(t.provider_connections.c.id, t.provider_connections.c.data).order_by(
-                    t.provider_connections.c.name
-                )
+                select(
+                    t.provider_connections.c.id,
+                    t.provider_connections.c.provider_type,
+                    t.provider_connections.c.protocol,
+                    t.provider_connections.c.model_discovery,
+                    t.provider_connections.c.region,
+                    t.provider_connections.c.workspace_id,
+                    t.provider_connections.c.server_state_enabled,
+                    t.provider_connections.c.profile_version,
+                    t.provider_connections.c.credential_revision,
+                    t.provider_connections.c.data,
+                ).order_by(t.provider_connections.c.name)
             ).all()
         # A single undecodable row raises a typed, redacted error naming that record rather than a
         # raw traceback; the good rows are unavailable until it is repaired, and doctor enumerates
         # every bad row (spec §7.3).
-        return [_decode_provider(r[0], r[1]) for r in rows]
+        return [_decode_provider_with_parity(r, _PROVIDER_ROW_COLUMNS) for r in rows]
 
     def decode_report(self) -> tuple[Sequence[ProviderConnection], Sequence[dict[str, object]]]:
         """Every decodable provider plus a redacted descriptor per undecodable row (spec §7.3).
@@ -297,19 +429,43 @@ class ProviderRepository:
         errors: list[dict[str, object]] = []
         with self.db.engine.connect() as conn:
             rows = conn.execute(
-                select(t.provider_connections.c.id, t.provider_connections.c.data).order_by(
-                    t.provider_connections.c.name
-                )
+                select(
+                    t.provider_connections.c.id,
+                    t.provider_connections.c.provider_type,
+                    t.provider_connections.c.protocol,
+                    t.provider_connections.c.model_discovery,
+                    t.provider_connections.c.region,
+                    t.provider_connections.c.workspace_id,
+                    t.provider_connections.c.server_state_enabled,
+                    t.provider_connections.c.profile_version,
+                    t.provider_connections.c.credential_revision,
+                    t.provider_connections.c.data,
+                ).order_by(t.provider_connections.c.name)
             ).all()
-        for record_id, data in rows:
+        for row in rows:
+            mapping = dict(zip(_PROVIDER_ROW_COLUMNS, row, strict=True))
+            record_id = mapping["id"]
             try:
-                providers.append(ProviderConnection.model_validate(data))
-            except ValidationError as exc:
+                providers.append(_decode_provider_with_parity(row, _PROVIDER_ROW_COLUMNS))
+            except DataValidationError as exc:
                 errors.append(
                     {
                         "table": "provider_connections",
                         "record_id": str(record_id),
-                        "error_count": exc.error_count(),
+                        "problem": "undecodable",
+                        "error_count": exc.error_count,
+                    }
+                )
+            except ProviderStorageMismatch as exc:
+                # A row whose columns and aggregate disagree is not corrupt JSON — it decodes
+                # fine, it just cannot be trusted. Doctor needs to tell those apart, because the
+                # repairs are different.
+                errors.append(
+                    {
+                        "table": "provider_connections",
+                        "record_id": str(record_id),
+                        "problem": "column/aggregate mismatch",
+                        "fields": list(exc.fields),
                     }
                 )
         return providers, errors
@@ -1637,3 +1793,231 @@ class Repositories:
         self.sessions = SessionRepository(database)
         self.event_index = EventIndexRepository(database)
         self.model_probes = ModelProbeRepository(database)
+        #: v0.2 capability authority. ``model_probes`` above stays as a compatibility cache for
+        #: older callers; it is no longer where a capability verdict comes from.
+        self.capability_evidence = CapabilityEvidenceRepository(database)
+
+
+class CapabilityEvidenceRepository:
+    """Append-only storage for capability observations (spec §8.5).
+
+    Append-only, not upsert. Two observations of the same model under different credentials, or
+    from different regions, are two facts — a destructive UNIQUE across the observation columns
+    would make them collide, and the loser would either be rejected or silently overwrite the
+    winner. Keeping both means invalidation is a *query* ("which rows still apply?") rather than a
+    delete, so the history that explains a verdict survives the verdict changing.
+
+    Nothing here decides which evidence wins. That is the resolver's job; this only stores and
+    filters.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    # ------------------------------------------------------------------ writing
+
+    def append(self, record: CapabilityEvidenceRecord) -> int:
+        """Store one observation. Returns its row id."""
+
+        return self.append_many([record])[0]
+
+    def append_many(self, records: Sequence[CapabilityEvidenceRecord]) -> list[int]:
+        if not records:
+            return []
+        ids: list[int] = []
+        with self.db.engine.begin() as conn:
+            for record in records:
+                result = conn.execute(
+                    insert(t.capability_evidence).values(**_evidence_values(record))
+                )
+                key = result.inserted_primary_key
+                if key is None:  # pragma: no cover - SQLite always returns one for AUTOINCREMENT
+                    raise RuntimeError("capability_evidence insert returned no primary key")
+                ids.append(int(key[0]))
+        return ids
+
+    # ------------------------------------------------------------------ reading
+
+    def get(self, record_id: int) -> CapabilityEvidenceRecord | None:
+        with self.db.engine.connect() as conn:
+            row = (
+                conn.execute(
+                    select(t.capability_evidence).where(t.capability_evidence.c.id == record_id)
+                )
+                .mappings()
+                .first()
+            )
+        return _decode_evidence(row) if row else None
+
+    def list_for_model(self, provider_id: str, model_id: str) -> list[CapabilityEvidenceRecord]:
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(t.capability_evidence)
+                    .where(
+                        t.capability_evidence.c.provider_id == provider_id,
+                        t.capability_evidence.c.model_id == model_id,
+                    )
+                    .order_by(t.capability_evidence.c.id)
+                )
+                .mappings()
+                .all()
+            )
+        return [_decode_evidence(row) for row in rows]
+
+    def list_for_provider(self, provider_id: str) -> list[CapabilityEvidenceRecord]:
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(t.capability_evidence)
+                    .where(t.capability_evidence.c.provider_id == provider_id)
+                    .order_by(t.capability_evidence.c.id)
+                )
+                .mappings()
+                .all()
+            )
+        return [_decode_evidence(row) for row in rows]
+
+    def list_valid(
+        self,
+        *,
+        provider_id: str,
+        model_id: str,
+        credential_revision: str,
+        protocol: str,
+        base_url_fingerprint: str,
+        region: str | None = None,
+        workspace_id: str | None = None,
+        probe_version: int | None = None,
+    ) -> list[CapabilityEvidenceRecord]:
+        """Only the rows whose scope still matches the endpoint being asked about (spec §8.6).
+
+        This is the whole point of storing endpoint identity. A row observed under a rotated
+        credential, a different protocol, or a different base URL described a different question,
+        and answering today's question with it is how a capability the user does not have gets
+        reported as supported.
+        """
+
+        table = t.capability_evidence
+        conditions = [
+            table.c.provider_id == provider_id,
+            table.c.model_id == model_id,
+            table.c.credential_revision == credential_revision,
+            table.c.protocol == protocol,
+            table.c.base_url_fingerprint == base_url_fingerprint,
+        ]
+        # region/workspace are scope only when the endpoint actually has them.
+        conditions.append(table.c.region.is_(None) if region is None else table.c.region == region)
+        conditions.append(
+            table.c.workspace_id.is_(None)
+            if workspace_id is None
+            else table.c.workspace_id == workspace_id
+        )
+        if probe_version is not None:
+            conditions.append(table.c.probe_version >= probe_version)
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(select(table).where(*conditions).order_by(table.c.id)).mappings().all()
+            )
+        return [_decode_evidence(row) for row in rows]
+
+    def decode_report(self) -> tuple[list[CapabilityEvidenceRecord], list[dict[str, object]]]:
+        """Every decodable row plus a redacted descriptor per undecodable one (spec §21).
+
+        Doctor has to survey a store that a strict read would refuse. Descriptors carry the record
+        id and the problem, never the payload.
+        """
+
+        good: list[CapabilityEvidenceRecord] = []
+        bad: list[dict[str, object]] = []
+        with self.db.engine.connect() as conn:
+            rows = (
+                conn.execute(select(t.capability_evidence).order_by(t.capability_evidence.c.id))
+                .mappings()
+                .all()
+            )
+        for row in rows:
+            try:
+                good.append(_decode_evidence(row))
+            except (ValidationError, ValueError) as exc:
+                bad.append(
+                    {
+                        "table": "capability_evidence",
+                        "record_id": str(row.get("id")),
+                        "problem": type(exc).__name__,
+                    }
+                )
+        return good, bad
+
+    # ------------------------------------------------------------------ invalidation
+
+    def delete_for_provider(self, provider_id: str) -> int:
+        with self.db.engine.begin() as conn:
+            result = conn.execute(
+                sa_delete(t.capability_evidence).where(
+                    t.capability_evidence.c.provider_id == provider_id
+                )
+            )
+        return int(result.rowcount or 0)
+
+    def count_superseded_by_credential(self, provider_id: str, credential_revision: str) -> int:
+        """How many rows a credential rotation has just made non-effective.
+
+        Rotation does not delete: the rows stay as audit history. They simply stop matching the
+        scope filter, which is what "invalidated" means here.
+        """
+
+        with self.db.engine.connect() as conn:
+            return int(
+                conn.execute(
+                    select(func.count())
+                    .select_from(t.capability_evidence)
+                    .where(
+                        t.capability_evidence.c.provider_id == provider_id,
+                        t.capability_evidence.c.credential_revision != credential_revision,
+                    )
+                ).scalar()
+                or 0
+            )
+
+
+def _evidence_values(record: CapabilityEvidenceRecord) -> dict[str, object]:
+    return {
+        "provider_id": record.provider_id,
+        "model_id": record.model_id,
+        "capability": record.capability,
+        "status": record.status,
+        "source": record.source,
+        # NULL, not "", when unknown — see CapabilityEvidenceRecord.observed_at.
+        "observed_at": record.observed_at.isoformat() if record.observed_at else None,
+        "probe_version": record.probe_version,
+        "provider_version": record.provider_version,
+        "model_revision": record.model_revision,
+        "credential_revision": record.credential_revision,
+        "protocol": record.protocol,
+        "base_url_fingerprint": record.base_url_fingerprint,
+        "region": record.region,
+        "workspace_id": record.workspace_id,
+        "detail": record.detail,
+        "observation_key": observation_key(
+            provider_id=record.provider_id,
+            model_id=record.model_id,
+            capability=record.capability,
+            source=record.source,
+            protocol=record.protocol,
+            base_url_fingerprint=record.base_url_fingerprint,
+            credential_revision=record.credential_revision,
+            region=record.region,
+            workspace_id=record.workspace_id,
+            probe_version=record.probe_version,
+            model_revision=record.model_revision,
+        ),
+    }
+
+
+def _decode_evidence(row: Any) -> CapabilityEvidenceRecord:
+    data = dict(row)
+    data.pop("observation_key", None)
+    observed = data.get("observed_at")
+    data["observed_at"] = datetime.fromisoformat(observed) if observed else None
+    return CapabilityEvidenceRecord.model_validate(data)

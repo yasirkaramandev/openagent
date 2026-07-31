@@ -1067,9 +1067,52 @@ MIGRATIONS: list[Migration] = [
     ),
 ]
 
+# The v0.2 revisions are appended here, at the bottom of the module that owns the chain, rather
+# than spliced in later by a helper. 0014 has reached main, so the reason for the hold is gone.
+#
+# Registration is explicit and has no import-time side effect in migrations_v2: that module
+# declares the fragment, this one decides the chain. LATEST_REVISION is then derived from the
+# finished list, which is the defect the old shape had — it was computed from MIGRATIONS[-1] at
+# import, so register_v2_migrations() mutating the list afterwards left LATEST_REVISION at 0014
+# and the three new revisions would never have been applied by Database.open().
+from .migrations_v2 import V2_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(V2_MIGRATIONS)
+
 LATEST_REVISION = MIGRATIONS[-1].revision
 LATEST_VERSION = MIGRATIONS[-1].version
 _BY_REVISION = {migration.revision: migration for migration in MIGRATIONS}
+
+
+def _validate_chain(migrations: list[Migration]) -> None:
+    """Refuse to import a chain with a hole, a duplicate, or a broken parent link.
+
+    This runs at import, before any database is opened, because every alternative place to notice
+    is too late: ``run_migrations`` walks the chain against a user's real data, and a hole there
+    is discovered by failing partway through a migration that has already written.
+
+    Cheap enough to be unconditional — it is a walk over ~17 tuples once per process.
+    """
+
+    seen: set[str] = set()
+    for index, migration in enumerate(migrations):
+        if migration.revision in seen:
+            raise RuntimeError(f"duplicate migration revision {migration.revision}")
+        seen.add(migration.revision)
+        expected = None if index == 0 else migrations[index - 1].revision
+        if migration.down_revision != expected:
+            raise RuntimeError(
+                f"migration chain hole: {migration.revision} declares parent "
+                f"{migration.down_revision!r}, but the previous link is {expected!r}"
+            )
+    if migrations and LATEST_REVISION != migrations[-1].revision:
+        raise RuntimeError(
+            f"LATEST_REVISION is {LATEST_REVISION!r} but the chain ends at "
+            f"{migrations[-1].revision!r}"
+        )
+
+
+_validate_chain(MIGRATIONS)
 
 #: The oldest OpenAgent whose **domain model** can safely parse the JSON aggregates this build
 #: writes. This is deliberately *not* the integer schema version: fields like

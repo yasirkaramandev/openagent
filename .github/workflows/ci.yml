@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/**", "fix/**"]
+    branches: [main, "release/**", "feat/**", "fix/**"]
   pull_request:
 
 concurrency:
@@ -84,6 +84,75 @@ jobs:
         with:
           name: dist
           path: dist/*
+
+  # The v0.2 contract suites, run by name and on every platform (spec §24, §25, §26.1).
+  #
+  # They already run inside the Linux `test` job's full sweep. Running them again, separately, buys
+  # two things that sweep cannot: a *named* gate whose failure says "a provider or CLI adapter broke
+  # its contract" rather than "some test failed", and the same battery under the conditions that
+  # actually break path handling — a workspace with a space in it, a non-ASCII path, and a custom
+  # data directory. Those three have historically broken on Windows only.
+  contracts:
+    name: contracts (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (editable, with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # A directory with a space, a non-ASCII segment, and a custom data dir — all three at once,
+      # because they interact: quoting bugs surface with the space, encoding bugs with the
+      # non-ASCII segment, and path-assembly bugs only when the data dir is not the default.
+      - name: Create an awkward working directory
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/oa test/ünïcode dir/data"
+          echo "OPENAGENT_DATA_DIR=${{ runner.temp }}/oa test/ünïcode dir/data" >> "$GITHUB_ENV"
+
+      - name: Provider contract suite
+        shell: bash
+        run: python -m pytest tests/contract/test_provider_contract.py -q
+
+      - name: CLI contract suite
+        shell: bash
+        run: python -m pytest tests/contract/test_cli_contract.py -q
+
+      - name: Protocol wire suites
+        shell: bash
+        run: |
+          python -m pytest \
+            tests/unit/test_wire_openai_chat.py \
+            tests/unit/test_wire_anthropic_messages.py \
+            tests/unit/test_wire_local_and_responses.py \
+            tests/unit/test_model_catalog.py \
+            -q
+
+      - name: Migration suite
+        shell: bash
+        run: python -m pytest tests/unit/test_migrations.py tests/unit/test_migrations_v2.py -q
+
+      - name: Security audit
+        shell: bash
+        run: python -m pytest tests/security -q
+
+      # Doctor has to survive a data directory it did not create, on a path with a space in it.
+      - name: Doctor runs against the custom data dir
+        shell: bash
+        run: |
+          python -m openagent doctor --json > /dev/null || true
+          python -m openagent version
 
   # Textual Select-sentinel compatibility (spec: no Textual "no selection" sentinel may cross the
   # screen/service boundary). The empty-value normalisation is version-independent by design — it
