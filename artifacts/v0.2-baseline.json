@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-08-01T11:46:00Z",
+  "repository": "yasirkaramandev/openagent",
+  "branch": "dev",
+  "authoritative_commit": "484e53102ccd72b6561a4e0988d6ec96cc0b2507",
+  "pr_14": {
+    "state": "OPEN",
+    "draft": true,
+    "head_branch": "release/v0.2-rc1",
+    "head_sha": "484e53102ccd72b6561a4e0988d6ec96cc0b2507",
+    "base_branch": "main"
+  },
+  "environment": {
+    "platform": "macOS",
+    "python": "3.10.18",
+    "isolated_virtual_environment": true,
+    "source_checkout": "detached authoritative commit"
+  },
+  "quality_gates": {
+    "ruff_format": "PASS",
+    "ruff_check": "PASS",
+    "mypy_src": "PASS",
+    "pytest": {
+      "status": "PASS",
+      "passed": 2905,
+      "skipped": 137,
+      "failed": 0,
+      "errors": 0,
+      "duration_seconds": 746.12
+    },
+    "coverage": {
+      "status": "FAIL",
+      "global_percent": 80.0,
+      "tui_branch_percent": 63.7,
+      "tui_recorded_floor_percent": 64.4,
+      "tui_target_percent": 75.0,
+      "reason": "openagent/tui branch coverage regressed 0.7 percentage points below the recorded floor"
+    },
+    "build": {
+      "status": "PASS",
+      "wheel": "openagent-0.1.6-py3-none-any.whl",
+      "sdist": "openagent-0.1.6.tar.gz"
+    }
+  },
+  "package_version": "0.1.6",
+  "notes": [
+    "Coverage was collected from a clean detached worktree at the authoritative commit.",
+    "A stale tracked coverage database from an older checkout was excluded from reporting.",
+    "No live credentials, credential values, HOME data, or live database content were read."
+  ]
+}
