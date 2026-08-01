@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openagent.local/schemas/example-run-event.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "sequence", "type", "data"],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 1},
+    "type": {"type": "string", "minLength": 1},
+    "data": {"type": "object"}
+  }
+}
+

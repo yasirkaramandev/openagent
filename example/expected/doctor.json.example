@@ -1,0 +1,19 @@
+{
+  "checks": [
+    {
+      "detail": "example workspace is importable and offline tests pass",
+      "name": "example.project",
+      "severity": "INFO",
+      "status": "ok"
+    }
+  ],
+  "exit_code": 0,
+  "schema_version": "openagent.doctor/v2",
+  "sections": [
+    {
+      "name": "example",
+      "severity": "INFO",
+      "status": "ok"
+    }
+  ]
+}

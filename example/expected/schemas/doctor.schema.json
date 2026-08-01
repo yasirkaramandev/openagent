@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openagent.local/schemas/example-doctor.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "checks", "sections", "exit_code"],
+  "properties": {
+    "schema_version": {"const": "openagent.doctor/v2"},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "severity", "detail"],
+        "properties": {
+          "name": {"type": "string"},
+          "status": {"enum": ["ok", "warn", "fail"]},
+          "severity": {"enum": ["INFO", "WARNING", "ERROR", "BLOCKER"]},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "severity"],
+        "properties": {
+          "name": {"type": "string"},
+          "status": {"enum": ["ok", "warn", "fail"]},
+          "severity": {"enum": ["INFO", "WARNING", "ERROR", "BLOCKER"]}
+        }
+      }
+    },
+    "exit_code": {"type": "integer", "minimum": 0, "maximum": 3}
+  }
+}

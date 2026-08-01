@@ -1,0 +1,8 @@
+            # SCENARIO_COMPLETION_GUARD_START
+            if current.completed:
+                # TRAINING BUG: an idempotent retry must not increment this counter.
+                state["completed_count"] += 1
+                self._save(state)
+                return current, True
+            # SCENARIO_COMPLETION_GUARD_END
+

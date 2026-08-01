@@ -1,0 +1,14 @@
+{
+  "changed_files": [
+    "app/repository.py"
+  ],
+  "continuation_mode": "native_session",
+  "resumed_from_turn": 1,
+  "run_id": "run_example_001",
+  "status": "completed",
+  "tests": {
+    "failed": 0,
+    "passed": 11
+  },
+  "turn": 2
+}

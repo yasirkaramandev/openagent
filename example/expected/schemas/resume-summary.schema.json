@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openagent.local/schemas/example-resume-summary.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "status",
+    "turn",
+    "resumed_from_turn",
+    "continuation_mode",
+    "changed_files",
+    "tests"
+  ],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "status": {"const": "completed"},
+    "turn": {"type": "integer", "minimum": 2},
+    "resumed_from_turn": {"type": "integer", "minimum": 1},
+    "continuation_mode": {
+      "enum": [
+        "native_session",
+        "server_interaction",
+        "client_native_replay",
+        "normalized_replay"
+      ]
+    },
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "tests": {
+      "type": "object",
+      "required": ["passed", "failed"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 1},
+        "failed": {"const": 0}
+      }
+    }
+  }
+}
+
